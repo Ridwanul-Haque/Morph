@@ -1,0 +1,62 @@
+{
+  "kind": "task",
+  "trained_on": "arm_A",
+  "train_seed_range": [
+    0,
+    10000
+  ],
+  "history": [
+    {
+      "iter": 0,
+      "source": "expert+noise",
+      "episodes": 150,
+      "success": 120,
+      "unstable": 0,
+      "samples": 40506
+    },
+    {
+      "iter": 1,
+      "beta": 0.5,
+      "final_loss": 0.012438792575473355,
+      "episodes": 60,
+      "success": 54,
+      "unstable": 0,
+      "samples": 70506
+    },
+    {
+      "iter": 2,
+      "beta": 0.25,
+      "final_loss": 0.0046858986492463416,
+      "episodes": 60,
+      "success": 54,
+      "unstable": 0,
+      "samples": 100506
+    },
+    {
+      "iter": 3,
+      "beta": 0.125,
+      "final_loss": 0.0027874743279188716,
+      "episodes": 60,
+      "success": 57,
+      "unstable": 0,
+      "samples": 130506
+    },
+    {
+      "iter": "final",
+      "final_loss": 0.0008085761430692127,
+      "samples": 130506
+    }
+  ],
+  "config": {
+    "n_expert": 150,
+    "n_iter": 3,
+    "n_per_iter": 60,
+    "epochs": 150,
+    "iter_epochs": 60,
+    "dart_noise": 0.1,
+    "hidden": 256,
+    "layers": 3
+  },
+  "wall_s": 361.4,
+  "torch": "2.14.0+cpu"
+}

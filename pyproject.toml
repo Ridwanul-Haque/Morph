@@ -1,0 +1,32 @@
+[project]
+name = "morph"
+version = "0.1.0"
+description = "Cross-embodiment transfer of demonstrated object-space task outcomes in MuJoCo, with NVIDIA Nemotron reasoning via Nebius Token Factory."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "mujoco==3.14.0",
+  "numpy==2.5.3",
+  "pydantic==2.13.5",
+  "httpx==0.28.1",
+  "imageio==2.37.4",
+  "pillow==12.3.0",
+  "imageio-ffmpeg==0.6.0",
+  "torch==2.14.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+morph = "morph.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["morph*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,123 @@
+{
+  "env": "Go1JoystickFlatTerrain",
+  "steps": 200000000,
+  "num_envs": 4096,
+  "wall_s": 1230.5,
+  "steps_per_s": 162529,
+  "gpu": "cuda:0",
+  "jax": "0.11.2",
+  "numpy_export_max_abs_err": 3.962167597348909e-07,
+  "network": {
+    "layers": [
+      [
+        48,
+        512
+      ],
+      [
+        512,
+        256
+      ],
+      [
+        256,
+        128
+      ],
+      [
+        128,
+        24
+      ]
+    ]
+  },
+  "curve": [
+    {
+      "step": 0,
+      "wall_s": 20.5,
+      "reward": 0.0011169835925102234,
+      "reward_std": 0.003231327049434185,
+      "episode_length": 31.2890625
+    },
+    {
+      "step": 19660800,
+      "wall_s": 172.3,
+      "reward": 18.375137329101562,
+      "reward_std": 5.101731300354004,
+      "episode_length": 1000.0
+    },
+    {
+      "step": 39321600,
+      "wall_s": 283.5,
+      "reward": 20.66177749633789,
+      "reward_std": 5.121530532836914,
+      "episode_length": 982.71875
+    },
+    {
+      "step": 58982400,
+      "wall_s": 388.6,
+      "reward": 26.613662719726562,
+      "reward_std": 3.7599925994873047,
+      "episode_length": 994.4140625
+    },
+    {
+      "step": 78643200,
+      "wall_s": 493.2,
+      "reward": 27.677257537841797,
+      "reward_std": 3.1135053634643555,
+      "episode_length": 995.5703125
+    },
+    {
+      "step": 98304000,
+      "wall_s": 595.3,
+      "reward": 27.734210968017578,
+      "reward_std": 4.104660987854004,
+      "episode_length": 985.28125
+    },
+    {
+      "step": 117964800,
+      "wall_s": 698.7,
+      "reward": 28.22538185119629,
+      "reward_std": 3.2801249027252197,
+      "episode_length": 992.9296875
+    },
+    {
+      "step": 137625600,
+      "wall_s": 802.8,
+      "reward": 28.85798454284668,
+      "reward_std": 2.437326669692993,
+      "episode_length": 997.859375
+    },
+    {
+      "step": 157286400,
+      "wall_s": 905.7,
+      "reward": 28.95484161376953,
+      "reward_std": 2.28483247756958,
+      "episode_length": 999.8203125
+    },
+    {
+      "step": 176947200,
+      "wall_s": 1014.5,
+      "reward": 28.939407348632812,
+      "reward_std": 3.3200204372406006,
+      "episode_length": 990.125
+    },
+    {
+      "step": 196608000,
+      "wall_s": 1122.4,
+      "reward": 28.90153694152832,
+      "reward_std": 2.88173246383667,
+      "episode_length": 993.609375
+    },
+    {
+      "step": 216268800,
+      "wall_s": 1229.8,
+      "reward": 28.928482055664062,
+      "reward_std": 2.294647693634033,
+      "episode_length": 999.8828125
+    }
+  ],
+  "env_config": {
+    "ctrl_dt": 0.02,
+    "sim_dt": 0.004,
+    "Kp": 35.0,
+    "Kd": 0.5,
+    "action_scale": 0.5
+  }
+}

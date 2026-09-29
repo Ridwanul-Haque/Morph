@@ -1,0 +1,62 @@
+{
+  "kind": "joint",
+  "trained_on": "franka_panda",
+  "train_seed_range": [
+    0,
+    10000
+  ],
+  "history": [
+    {
+      "iter": 0,
+      "source": "expert+noise",
+      "episodes": 150,
+      "success": 107,
+      "unstable": 0,
+      "samples": 59465
+    },
+    {
+      "iter": 1,
+      "beta": 0.5,
+      "final_loss": 0.011010471289545324,
+      "episodes": 60,
+      "success": 36,
+      "unstable": 0,
+      "samples": 89343
+    },
+    {
+      "iter": 2,
+      "beta": 0.25,
+      "final_loss": 0.0071100399625978776,
+      "episodes": 60,
+      "success": 37,
+      "unstable": 0,
+      "samples": 119178
+    },
+    {
+      "iter": 3,
+      "beta": 0.125,
+      "final_loss": 0.005227200700997802,
+      "episodes": 60,
+      "success": 39,
+      "unstable": 0,
+      "samples": 149146
+    },
+    {
+      "iter": "final",
+      "final_loss": 0.0025878552947324364,
+      "samples": 149146
+    }
+  ],
+  "config": {
+    "n_expert": 150,
+    "n_iter": 3,
+    "n_per_iter": 60,
+    "epochs": 150,
+    "iter_epochs": 60,
+    "dart_noise": 0.1,
+    "hidden": 256,
+    "layers": 3
+  },
+  "wall_s": 703.6,
+  "torch": "2.14.0+cpu"
+}
