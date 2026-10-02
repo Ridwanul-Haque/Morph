@@ -74,6 +74,39 @@ class StrategyChoice(BaseModel):
     expected_risks: list[str] = Field(default_factory=list, max_length=6)
 
 
+class RobotPlan(BaseModel):
+    what_is_it: str = Field(max_length=400)
+    size_and_reach: str = Field(max_length=400)
+    goal: str = Field(max_length=400)
+    plan_id: str
+    how: str = Field(max_length=1200)
+    learning_needed: bool
+    what_to_learn: str = Field(default="", max_length=800)
+    evidence_cited: list[str] = Field(default_factory=list, max_length=8)
+    risks: list[str] = Field(default_factory=list, max_length=6)
+
+
+class GoalReview(BaseModel):
+    ok: bool
+    problems: list[str] = Field(default_factory=list, max_length=6)
+
+
+class GoalProposal(BaseModel):
+    refusal: str = ""  # when not feasible: missing | contradiction | no_inside | other
+    conditions: list[dict] = Field(default_factory=list, max_length=8)
+    rationale: str = Field(max_length=1200)
+    ambiguities: list[str] = Field(default_factory=list, max_length=6)
+    feasible: bool = True
+    why_not: str = Field(default="", max_length=600)
+    warnings: list[str] = Field(default_factory=list, max_length=4)
+    suggestion: str = Field(default="", max_length=400)
+
+
+class SkillStepsProposal(BaseModel):
+    steps: list[dict] = Field(default_factory=list, max_length=8)
+    rationale: str = Field(default="", max_length=1200)
+
+
 class Diagnosis(BaseModel):
     failure_class: Literal["wrong_goal", "unreachable", "grasp_lost", "tipped_object", "insufficient_progress",
                            "yaw_not_controlled", "overshoot", "timeout", "robot_instability", "other"]
@@ -237,6 +270,167 @@ class ReasoningService:
             raise ReasoningError(rec.rejection_reasons[-1])
         rec.accepted = True
         return choice, rec
+
+    def plan_for_robot(self, context: dict) -> tuple[RobotPlan, InferenceRecord]:
+        system = (
+            "You are the planning module of Morph. A robot model Morph has never seen was loaded; its measured profile "
+            "(kinematic chains, gripper opening measured by driving it, reach sampled over joint space, mass, size) is "
+            "given, together with the task and a list of skill templates whose preconditions were checked in code. "
+            "Everything runs in MuJoCo simulation; keep_upright refers to the object, not the robot. "
+            "Answer in order: what the robot is, its size and reach, what the task needs, then choose plan_id: one "
+            "template id whose applicable flag is true and implemented is true, or 'learn_policy' if none fits but the "
+            "robot can learn, or 'unsupported' if nothing can work. Never pick a template with unmet preconditions. If "
+            "learning is needed, say concretely what must be learned (e.g. a gait first, then the push) and how the "
+            "task goal becomes the reward. Reply with ONLY one JSON object with keys: what_is_it, size_and_reach, goal, "
+            "plan_id, how, learning_needed, what_to_learn, evidence_cited, risks."
+        )
+        plan, rec = self._chat("plan_for_robot", system, json.dumps(context, indent=1, default=str), RobotPlan)
+        ok = {t["id"] for t in context["templates"] if t["applicable"] and t["implemented"]}
+        learn = next((t for t in context["templates"] if t["id"] == "learn_policy"), None)
+        if learn and learn["applicable"]:
+            ok.add("learn_policy")
+        if not any(t["applicable"] for t in context["templates"]):
+            ok.add("unsupported")
+        if plan.plan_id not in ok:
+            rec.accepted = False
+            rec.rejection_reasons.append(f"plan_id {plan.plan_id!r} not allowed here (allowed: {sorted(ok)})")
+            raise ReasoningError(rec.rejection_reasons[-1])
+        rec.accepted = True
+        return plan, rec
+
+    def review_goal(self, request: str, checklist: list[str], scene: dict) -> tuple[GoalReview, InferenceRecord]:
+        system = (
+            "You check the goal checklist another module wrote for a robot task, before anything runs. The robot "
+            "will be judged ONLY on this checklist. Read the operator's request and the checklist (in plain words). "
+            "Reply ok=false, with each problem in one short sentence, if: an item contradicts the request (e.g. "
+            "\"stays upright\" for \"knock it over\"); something the request clearly asks for is missing (including "
+            "how or when: \"from 1 m away\", \"without lifting it\", \"first ... then ...\"); an item adds a demand "
+            "the request doesn't make (e.g. lifting for \"on the floor\"); or a number is clearly off. Small, "
+            "reasonable tolerances are fine; don't nitpick wording. What a word means physically counts as asked for: "
+            "a throw means it is let go while moving fast (e.g. speed > 1 m/s) away from where it lands; a drop means let "
+            "go above it; gently means let go almost at rest; knocking over means it ends on its side. Otherwise ok=true with no problems. Reply with "
+            "ONLY one JSON object: {\"ok\": bool, \"problems\": [...]}."
+        )
+        user = json.dumps({"request": request, "checklist": checklist, "scene": scene}, indent=1, default=str)
+        return self._chat("review_goal", system, user, GoalReview)
+
+    def goal_from_request(self, description: str, scene: dict, demo: dict | None,
+                          feedback: dict | None = None) -> tuple[GoalProposal, InferenceRecord]:
+        system = (
+            "You are the goal module of Morph. Turn the operator's request (and/or what a demonstration measurably did "
+            "to the object) into checkable conditions on the object's final resting state. You get the scene's "
+            "measured geometry: the object's size, and for every fixture its footprint, height, the size of its top "
+            "face, its opening if it has one, and where it is. Reason physically from those numbers, not from names: "
+            "something can rest on a top face only if the face is at least about as wide as the object; something can "
+            "go inside only a fixture with an opening bigger than the object. Conditions (JSON objects): "
+            "{\"kind\": \"at_position\", \"x\": m, \"y\": m, \"tol\": m}, "
+            "{\"kind\": \"heading\", \"yaw_deg\": deg, \"tol\": deg} (0 = east/+x, 90 = north/+y), "
+            "{\"kind\": \"upright\", \"tol\": deg}, {\"kind\": \"on_top_of\", \"target\": fixture}, "
+            "{\"kind\": \"inside\", \"target\": fixture}, {\"kind\": \"touching\", \"target\": fixture}, "
+            "{\"kind\": \"near\", \"target\": fixture, \"tol\": m}, "
+            "{\"kind\": \"beside\", \"target\": fixture, \"side\": \"north|south|east|west\"}, "
+            "any relation above with \"negate\": true (\"take it out of the bin\" = inside bin negated, \"push it off "
+            "the shelf\" = on_top_of shelf negated), "
+            "{\"kind\": \"orientation\", \"up_face\": \"top|bottom|side\", \"tol\": deg} (bottom = upside down, side = "
+            "knocked over / lying on its side), "
+            "{\"kind\": \"height\", \"min_z\": m, \"hold\": bool} (its bottom at least min_z above the floor; hold true "
+            "if the robot may keep holding it, e.g. \"hold it up\"), "
+            "{\"kind\": \"away_from\", \"target\": fixture, \"tol\": m}, "
+            "{\"kind\": \"moved\", \"tol\": m, \"side\": \"north|south|east|west\" or null}, and for ANYTHING ELSE "
+            "{\"kind\": \"expression\", \"expr\": formula, \"text\": what it means in plain words}, where the formula "
+            "is a Python-like boolean over these measured quantities at the end: x, y, z (object centre, m), bottom, top "
+            "(m above the floor), tilt_deg, yaw_deg (0 = east), speed, vx, vy, vz (m/s), travelled (m from its start), start_x, "
+            "start_y, held (1 if the robot still holds it), dist_to('fixture') (m, edge to edge), robot_x, robot_y "
+            "(robot base), hand_dist (m from the robot's nearest part to the object); functions abs, min, max, sqrt, "
+            "hypot; operators + - * / < <= > >= == and or not. Examples: \"balance it on its corner\" -> "
+            "\"tilt_deg > 30 and speed < 0.02 and not held\"; \"put it between the bin and the wall\" -> an expression on x "
+            "and y from the fixtures' extents; \"bring it to the robot\" -> \"hand_dist < 0.15\". "
+            "Any condition can also say WHEN it must hold with \"when\": \"end\" (default: the final resting state), "
+            "\"release\" (at the moment the robot lets go of the object: throwing, dropping, tossing), \"always\" (at "
+            "every moment: keep it upright the whole way, never touch the wall) or \"ever\" (at some point: lift it "
+            "above 30 cm at least once). Any condition kind can have a when; the object can end up in only one "
+            "place, so other places on the way take when \"ever\". Requests about how it gets there are part of the goal, never "
+            "drop them: \"throw the parcel into the bin from 1 m north of the bin\" means inside bin (end) AND, at "
+            "release, the parcel is at least 1 m north of the bin, e.g. {\"kind\": \"expression\", \"when\": "
+            "\"release\", \"expr\": \"y > <bin's north edge> + 1.0\", \"text\": \"let go at least 1 m north of the "
+            "bin\"} with the number filled in from the bin's extent; \"drop it into the bin from 30 cm up\" means "
+            "inside bin AND at release bottom > <bin top> + 0.3. "
+            "Every request about the object (or where the robot ends up relative to it) can be written this way: "
+            "always produce conditions, preferring the specific kinds and using an expression only when none fits. "
+            "Use only fixture names from the scene. Keep only conditions the request or demo implies; add a heading "
+            "only if one is asked for or the demo clearly turned the object; add upright only when the request asks "
+            "for care (keep it upright, carefully, gently, don't tip it, fragile) or the demo kept it upright on purpose. "
+            "Interpret everyday phrasing the way a "
+            "person would: \"on the wall\" for a thin wall most likely means against it; \"on the bin\" usually means "
+            "in it; \"in the bin\" means resting on its floor within its walls, and it is completely normal for an "
+            "object to stick out above a container's walls (a tall bottle in a short box is still in the box), so "
+            "never reject or warn about inside for being taller than the walls. Respect explicit requests: "
+            "\"balance it on X\", \"on top of X\" or \"stand it on X\" means on_top_of X even when unlikely to work; "
+            "never substitute a different goal for what was explicitly asked. Say in ambiguities what you assumed. Set feasible "
+            "to false only when the request refers to something that is not in the scene (a fixture or a second "
+            "object that does not exist), asks for a solid block's inside, or contradicts itself; anything merely hard "
+            "or unusual is feasible (Morph will learn it). Explain why in why_not with the "
+            "measurements and put the closest workable request in suggestion, written as a plain sentence the operator could type (never JSON). If it is possible but unlikely to "
+            "work (balancing on a top narrower than the object), keep feasible true, write the conditions anyway, "
+            "and explain the risk in warnings. Warnings are only for real risks of failing, one short sentence each; leave the list empty when there is none (never say that something is fine or feasible there). If request and demo disagree, the request wins. When feasible is false, set refusal to "
+            "\"missing\" (names something not in the scene), \"contradiction\" or \"no_inside\" (the inside of a solid "
+            "thing); anything else is feasible. Common meanings: throw / toss / lob / fling (with or without a distance) = it "
+            "must fly: at release it moves fast (speed > 1.0) and is away from where it must land (e.g. dist_to of that "
+            "fixture > 0.25), plus the landing place at the end; a throw is never a placement. Knock it over / tip it "
+            "over / topple it = orientation side (lying on its side), never upright; stand it on its side = "
+            "orientation side; flip it = orientation bottom; sequences (\"first X, then Y\", "
+            "\"tap X then put it on Y\") = X with when \"ever\" and Y at the end; \"without lifting it\" = height of "
+            "the bottom kept near 0 the whole time (when \"always\"); \"on the floor\" adds nothing (that's where it "
+            "rests anyway) and never means lifting; \"near\", \"next to\", \"by\" with no distance given = near with "
+            "tol 0.1; in formulas z is the object's centre (half its height up when resting), so heights of where it "
+            "rests use bottom. Write only what the request asks for. Reply with ONLY one "
+            "JSON object with keys: conditions, rationale, ambiguities, feasible, refusal, why_not, suggestion, warnings."
+        )
+        payload = {"request": description or "(none: reproduce what the demonstration achieved)",
+                   "scene": scene, "demonstration": demo}
+        if feedback:
+            payload["fix_this"] = feedback  # your previous answer and what was wrong with it
+        user = json.dumps(payload, indent=1, default=str)
+        return self._chat("goal_from_request", system, user, GoalProposal)
+
+    def skill_steps(self, robot: dict, goal: list[str], scene: dict, scales: dict,
+                    fix: dict | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
+        system = (
+            "You are the motor-planning module of Morph. A robot must learn, in simulation, to reach a goal from "
+            "scratch. Write the steps a person would take without thinking about it, the way someone standing up "
+            "puts their feet under them, leans forward over them, pushes, then steadies themselves; or someone "
+            "drinking reaches while opening the hand, closes it firmly enough, lifts while keeping the cup upright. "
+            "But write them for THIS robot's body: use the parts it actually has (a gripper or a jaw closes on "
+            "things; an arm without a gripper can only push, drag or tip with its tool; legs can walk and a foot "
+            "can push while standing on the others; a body must stay level), and its size and reach. Include the "
+            "unconscious details that make the difference: which side to approach from, pushing low to slide and "
+            "high to tip, getting behind the object relative to where it has to go, a firm grip before lifting, "
+            "lifting clear of walls before moving across, moving slowly near the end, setting it down before letting "
+            "go, keeping balance. If the checklist says where it must be when the robot lets go and that is away from "
+            "where it must end up, it is a throw: plan the wind-up and swing, and make the release step require the "
+            "object to be moving fast towards the target at that moment (e.g. not held and speed > 1.5 and its velocity "
+            "pointing at the target), since it only lands there if it flies. 2 to 5 steps, in order, then the goal itself is checked after them (don't write it "
+            "as a step). Every step needs done_when: a boolean formula over these measured quantities, true exactly "
+            "when the step is done: x, y, z (object centre, m), bottom, top (m above the floor), tilt_deg, yaw_deg "
+            "(0 = east), speed, vx, vy, vz (its velocity, m/s), travelled (m from its start), start_x, start_y, held (1 while the robot holds it), "
+            "dist_to('fixture') (m, edge to edge), robot_x, robot_y, base_z, base_tilt_deg (the robot body: 0 = level), "
+            "hand_dist (m from the robot's nearest end part, e.g. fingertips or a foot, to the object's centre), "
+            "hand_x, hand_y, hand_z (that end part's position); functions abs, min, max, sqrt, hypot; operators "
+            "+ - * / < <= > >= == != and or not (Python syntax: never && || !, and only the names listed: the "
+            "object's position is x, y, z, not object_x). Use the scene's numbers (object size, fixture extents, the "
+            "target) and the realistic scales given (e.g. how close hand_dist gets when gripping: fingertips sit "
+            "either side, so it never reaches 0) to make thresholds concrete and reachable; a step's formula must be something the robot can make true "
+            "and that stays meaningful as the object moves (e.g. relative to x and y). keep (optional) is a formula "
+            "that should stay true during the step (\"tilt_deg < 20\" while carrying a cup; \"base_tilt_deg < 20\" "
+            "for a legged robot). Reply with ONLY one JSON object: {\"steps\": [{\"name\": short imperative, "
+            "\"how\": what this body does, in plain words, \"why\": the unconscious reason, \"body_parts\": [...], "
+            "\"done_when\": formula, \"keep\": formula or \"\"}], \"rationale\": one or two sentences}."
+        )
+        payload = {"robot": robot, "goal_checklist": goal, "scene": scene, "realistic_scales": scales}
+        if fix:
+            payload["fix_these"] = fix  # the previous answer and what Morph couldn't read in it
+        user = json.dumps(payload, indent=1, default=str)
+        return self._chat("skill_steps", system, user, SkillStepsProposal)
 
     def diagnose(self, failure_report: dict, revision_space: dict) -> tuple[Diagnosis, InferenceRecord]:
         system = (

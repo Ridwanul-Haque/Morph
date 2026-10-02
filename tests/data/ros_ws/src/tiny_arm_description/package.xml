@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>tiny_arm_description</name>
+  <version>0.0.1</version>
+  <description>Test robot for Morph's xacro import</description>
+  <maintainer email="test@example.com">test</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

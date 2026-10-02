@@ -45,6 +45,8 @@ class Goal(BaseModel):
     orientation_mode: Field_ = Field_(value="planar_yaw", provenance="default",
                                       note="planar_yaw | face_up_flip (flip = a different top face)")
     target_top_face: Field_ = Field_(value="+z", provenance="default")
+    support_z: Field_ = Field_(value=0.0, provenance="default",
+                               note="height of the surface the object must end up resting on (0 = floor)")
 
 
 class TaskSpec(BaseModel):
@@ -103,7 +105,8 @@ def evaluate(spec: TaskSpec, pose: BlockPose, speed: float, released: bool, half
     """Identical measured-final-pose test for every robot."""
     pos_err = math.hypot(pose.x - spec.gx, pose.y - spec.gy)
     yerr = yaw_error(pose.yaw, spec.gyaw)
-    on_floor = abs(pose.z - half_z) < 0.01
+    support = float(spec.goal.support_z.value)
+    on_floor = abs(pose.z - half_z - support) < 0.01  # resting on its target surface
     at_rest = speed < 0.02
     reasons = []
     if pos_err > float(spec.goal.pos_tol_m.value):
@@ -113,7 +116,8 @@ def evaluate(spec: TaskSpec, pose: BlockPose, speed: float, released: bool, half
     if spec.goal.keep_upright.value and pose.tilt > float(spec.goal.max_tilt_rad.value):
         reasons.append(f"block tilted {math.degrees(pose.tilt):.1f} deg")
     if not on_floor:
-        reasons.append(f"block not resting on floor (z={pose.z:.3f})")
+        where = "floor" if support == 0 else f"its target surface at {support * 100:.1f} cm"
+        reasons.append(f"block not resting on {where} (z={pose.z:.3f})")
     if not at_rest:
         reasons.append(f"block still moving ({speed:.3f})")
     if not released:

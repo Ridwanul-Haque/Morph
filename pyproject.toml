@@ -30,3 +30,6 @@ include = ["morph*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"morph.app" = ["static/*.html"]

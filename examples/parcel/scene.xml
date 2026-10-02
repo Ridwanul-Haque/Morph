@@ -1,0 +1,31 @@
+<mujoco model="parcel_cell">
+  <!-- A work cell: a parcel on the floor, a bin, a shelf and a wall. Coordinates in metres,
+       z up. Robots are added by Morph; this file only describes the things around them. -->
+  <worldbody>
+    <geom name="floor" type="plane" size="2 2 0.1"/>
+
+    <body name="parcel" pos="0.45 -0.18 0.03">
+      <freejoint/>
+      <geom type="box" size="0.025 0.025 0.03" mass="0.2" friction="0.6 0.005 0.0001" rgba="0.85 0.6 0.3 1"/>
+    </body>
+
+    <!-- 16 x 16 cm bin, 5 cm walls, 1 cm floor -->
+    <body name="bin" pos="0.42 0.18 0">
+      <geom type="box" size="0.08 0.08 0.005" pos="0 0 0.005" rgba="0.2 0.45 0.7 1"/>
+      <geom type="box" size="0.08 0.005 0.025" pos="0 0.075 0.025" rgba="0.2 0.45 0.7 1"/>
+      <geom type="box" size="0.08 0.005 0.025" pos="0 -0.075 0.025" rgba="0.2 0.45 0.7 1"/>
+      <geom type="box" size="0.005 0.07 0.025" pos="0.075 0 0.025" rgba="0.2 0.45 0.7 1"/>
+      <geom type="box" size="0.005 0.07 0.025" pos="-0.075 0 0.025" rgba="0.2 0.45 0.7 1"/>
+    </body>
+
+    <!-- 12 x 12 cm shelf, 5 cm high -->
+    <body name="shelf" pos="0.62 -0.02 0.025">
+      <geom type="box" size="0.06 0.06 0.025" rgba="0.45 0.45 0.5 1"/>
+    </body>
+
+    <!-- a wall along the east side -->
+    <body name="wall" pos="0.8 -0.1 0.04">
+      <geom type="box" size="0.005 0.2 0.04" rgba="0.6 0.6 0.6 1"/>
+    </body>
+  </worldbody>
+</mujoco>

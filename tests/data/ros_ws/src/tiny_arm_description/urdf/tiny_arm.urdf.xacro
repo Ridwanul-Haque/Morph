@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<robot name="tiny_xarm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="effort" default="40"/>
+  <xacro:property name="effort" value="$(arg effort)"/>
+  <xacro:include filename="$(find tiny_arm_description)/urdf/links.xacro"/>
+  <link name="base">
+    <visual><geometry><mesh filename="package://tiny_arm_description/meshes/base.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0.05"/><geometry><cylinder radius="0.06" length="0.1"/></geometry></collision>
+    <inertial><mass value="2.0"/><inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <xacro:box_link name="l1" sx="0.06" sy="0.06" sz="0.1"/>
+  <xacro:box_link name="l2" sx="0.06" sy="0.06" sz="0.3"/>
+  <xacro:box_link name="l3" sx="0.05" sy="0.05" sz="0.25"/>
+  <xacro:box_link name="l4" sx="0.04" sy="0.04" sz="0.1"/>
+  <xacro:rev name="j1" parent="base" child="l1" z="0.1" axis="0 0 1"/>
+  <xacro:rev name="j2" parent="l1" child="l2" z="0.1" axis="0 1 0"/>
+  <xacro:rev name="j3" parent="l2" child="l3" z="0.3" axis="0 1 0"/>
+  <xacro:rev name="j4" parent="l3" child="l4" z="0.25" axis="0 1 0"/>
+</robot>

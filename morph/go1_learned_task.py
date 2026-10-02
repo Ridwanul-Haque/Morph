@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .geometry import wrap_angle
-from .go1_task import PUSH_LEG, push_pose
+from .geometry import rot2
+from .go1_task import FOOT_IN_TRUNK, PUSH_LEG, push_pose
 from .push_planner import PushModel, plan_push
 from .robots.go1_control import Go1Controller
 from .robots.go1_learned import PUSH_KP, PUSH_KV, LearnedGo1
@@ -22,6 +23,7 @@ from .sim import PhysicalParams, SimulationUnstable
 from .task import TaskSpec, evaluate
 
 CLEAR_R = 0.55  # keep the trunk this far from the block centre while walking around it
+MAX_BALANCE_SHIFT = 0.08  # m; re-step the feet before a push that would need a bigger shift onto three legs
 
 
 @dataclass
@@ -39,10 +41,62 @@ class LearnedGo1Result:
     stop_reason: str = ""
 
 
-def _route(robot: LearnedGo1, target_xy: np.ndarray, block_xy: np.ndarray) -> list[np.ndarray]:
-    """Waypoints on a circle around the block if the straight path would pass too close to it."""
+class Footprint:
+    """The robot's outline on the floor vs the fixtures in a user's scene. Low fixtures only get in the
+    way of the feet (the body passes over them); ones taller than the belly block the whole body."""
+
+    def __init__(self, legs, obstacles, margin: float = 0.03):
+        xs = [abs(v[0]) for v in legs.nominal.values()]
+        ys = [abs(v[1]) for v in legs.nominal.values()]
+        self.feet = (max(xs) + 0.05, max(ys) + 0.04)  # where the feet go, with room to step
+        self.body = (max(xs) + 0.14, max(ys) + 0.06)  # feet plus body overhang
+        belly = legs.stand_height - 0.08
+        self.obs = [(np.asarray(lo[:2]) - margin, np.asarray(hi[:2]) + margin, self.body if hi[2] > belly else self.feet)
+                    for lo, hi in obstacles]
+
+    def clear(self, x: float, y: float, yaw: float) -> bool:
+        c, s = abs(math.cos(yaw)), abs(math.sin(yaw))
+        for lo, hi, (hl, hw) in self.obs:
+            ex, ey = c * hl + s * hw, s * hl + c * hw
+            if not (x + ex < lo[0] or x - ex > hi[0] or y + ey < lo[1] or y - ey > hi[1]):
+                return False
+        return True
+
+    def path_clear(self, a, b) -> bool:
+        d = np.asarray(b) - np.asarray(a)
+        yaw = math.atan2(d[1], d[0])
+        n = max(2, int(np.linalg.norm(d) / 0.05))
+        return all(self.clear(*(np.asarray(a) + d * k / n), yaw) for k in range(n + 1))
+
+    def detour(self, a, b) -> list:
+        """Straight if clear, else via one side point that makes both legs clear."""
+        if not self.obs or self.path_clear(a, b):
+            return [np.asarray(b)]
+        a, b = np.asarray(a), np.asarray(b)
+        d = b - a
+        perp = np.array([-d[1], d[0]]) / (np.linalg.norm(d) + 1e-9)
+        for off in (0.3, -0.3, 0.5, -0.5, 0.7, -0.7, 0.9, -0.9):
+            w = (a + b) / 2 + perp * off
+            if self.path_clear(a, w) and self.path_clear(w, b):
+                return [w, b]
+        return [b]
+
+
+def _route(robot: LearnedGo1, target_xy: np.ndarray, block_xy: np.ndarray, fp: Footprint | None = None) -> list[np.ndarray]:
+    """Waypoints on a circle around the block if the straight path would pass too close to it, and
+    around any fixtures in the way."""
     p, _, _ = robot.base()
-    a, b = p[:2], target_xy
+    pts = _route_block(p[:2], target_xy, block_xy)
+    if fp is None or not fp.obs:
+        return pts
+    out, cur = [], p[:2]
+    for w in pts:
+        out += fp.detour(cur, w)
+        cur = w
+    return out
+
+
+def _route_block(a, b, block_xy) -> list[np.ndarray]:
     ab = b - a
     t = float(np.clip(np.dot(block_xy - a, ab) / (np.dot(ab, ab) + 1e-9), 0, 1))
     if np.linalg.norm(a + t * ab - block_xy) > CLEAR_R * 0.9:
@@ -57,12 +111,43 @@ def _route(robot: LearnedGo1, target_xy: np.ndarray, block_xy: np.ndarray) -> li
 
 def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: int, base0=(0.0, -0.7, math.pi / 2),
                          max_pushes: int = 14, render_every: int = 0, camera: str = "track", log=print,
-                         robot: LearnedGo1 | None = None, on_tick=None) -> LearnedGo1Result:
+                         robot=None, on_tick=None, obstacles=None, done=None) -> LearnedGo1Result:
+    """Also runs any LearnedWalker (robots/learned_walker.py): its leg geometry is measured from the model.
+    obstacles: world AABBs (lo, hi) of fixtures the robot must not stand on or walk through.
+    done(): optional goal check (e.g. goal conditions measured in the scene), tested before each push."""
     t0 = time.time()
     rb = robot or LearnedGo1()
     rb.reset(seed, block0, params, base_xy_yaw=base0)
     rb.env.set_goal_marker(spec.gx, spec.gy, spec.gyaw)
-    qa = QuadrupedAdapter(model=rb.model, env=rb.env)
+    generic = hasattr(rb, "legs_adapter")
+    qa = rb.legs_adapter() if generic else QuadrupedAdapter(model=rb.model, env=rb.env)
+    fp = Footprint(qa.legs, obstacles) if obstacles else None
+    pose_ok = fp.clear if fp else None
+    # Push with the front-right foot; next to fixtures, also consider the front-left one (it stands on the
+    # other side of the push line, which is often the side that's clear).
+    legs = (PUSH_LEG, "FL") if fp else (PUSH_LEG,)
+    chosen: dict = {}
+
+    def leg_pose(leg, contact_xy, heading):
+        if generic:
+            return rb.push_pose(contact_xy, heading, leg)
+        if leg == PUSH_LEG:
+            return push_pose(contact_xy, heading)
+        u = np.array([math.cos(heading), math.sin(heading)])  # Go1: mirror its hand-tuned FR foot offset
+        base = np.array(contact_xy) - u * 0.05 - rot2(heading) @ (FOOT_IN_TRUNK * np.array([1.0, -1.0]))
+        return float(base[0]), float(base[1]), heading
+
+    def pose_fn(contact_xy, heading):
+        for leg in legs:
+            pose = leg_pose(leg, contact_xy, heading)
+            if pose_ok is None or pose_ok(*pose):
+                chosen[(round(contact_xy[0], 4), round(contact_xy[1], 4), round(heading, 4))] = leg
+                return pose
+        return leg_pose(legs[0], contact_xy, heading)
+
+    def leg_for(cand):
+        return chosen.get((round(cand.contact_xy[0], 4), round(cand.contact_xy[1], 4), round(cand.direction, 4)), PUSH_LEG)
+    push_geoms = {qa.legs.foot_geom[l] for l in legs}
     res = LearnedGo1Result(outcome=None)
     contacts = []
 
@@ -77,7 +162,7 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
                                    "push": len(res.pushes), "mode": "learned walk"})
     rb.on_tick = tick
     PUSH_H = 0.025  # contact low on the face: the 5x5x6 cm block tips if pushed above ~4 cm
-    pm = PushModel(push_height=PUSH_H)
+    pm = PushModel(block=rb.block, push_height=PUSH_H)
     h = rb.block.half_x
     offsets = (-0.6 * h, -0.3 * h, 0.0, 0.3 * h, 0.6 * h)  # keep the contact on the block face
     goal = (spec.gx, spec.gy, spec.gyaw)
@@ -89,16 +174,24 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
             if bp.tilt > math.radians(10):  # no push primitive can right a tipped block: stop and say so
                 res.stop_reason = f"block tipped over ({math.degrees(bp.tilt):.0f} deg); no recovery skill"
                 break
-            if math.hypot(bp.x - goal[0], bp.y - goal[1]) <= 0.9 * tol_p and abs(wrap_angle(bp.yaw - goal[2])) <= 0.9 * tol_y:
+            if done is not None and done():
+                res.stop_reason = "goal conditions met"
+                break
+            if done is None and math.hypot(bp.x - goal[0], bp.y - goal[1]) <= 0.9 * tol_p \
+                    and abs(wrap_angle(bp.yaw - goal[2])) <= 0.9 * tol_y:
                 res.stop_reason = "goal reached with margin"
                 break
             p, th, _ = rb.base()
-            best, _ = plan_push(pm, (bp.x, bp.y, bp.yaw), goal, robot_pose=(p[0], p[1], th), pose_fn=push_pose,
-                                offsets=offsets)
-            tx, ty, tth = push_pose(best.contact_xy, best.direction)
+            try:
+                best, _ = plan_push(pm, (bp.x, bp.y, bp.yaw), goal, robot_pose=(p[0], p[1], th), pose_fn=pose_fn,
+                                    pose_ok=pose_ok, offsets=offsets)
+            except ValueError:
+                res.stop_reason = "no push the robot can stand for without stepping on a fixture"
+                break
+            tx, ty, tth = pose_fn(best.contact_xy, best.direction)
             tw = time.time()
             ok = True
-            for wp in _route(rb, np.array([tx, ty]), np.array([bp.x, bp.y]))[:-1]:
+            for wp in _route(rb, np.array([tx, ty]), np.array([bp.x, bp.y]), fp)[:-1]:
                 ok &= rb.go_to(wp[0], wp[1], math.atan2(ty - wp[1], tx - wp[0]), tol=0.08, yaw_tol=0.6, timeout=10)
             ok &= rb.go_to(tx, ty, tth, tol=0.025, yaw_tol=0.05, timeout=15)
             for _retry in range(2):  # re-approach: pushing from >3 cm off the planned pose tipped the block
@@ -113,11 +206,18 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
             # re-plan from the (possibly nudged) block with the robot now in place
             bp2 = rb.env.block_pose()
             p, th, _ = rb.base()
-            best, _ = plan_push(pm, (bp2.x, bp2.y, bp2.yaw), goal, robot_pose=(p[0], p[1], th), pose_fn=push_pose,
-                                offsets=offsets, max_heading_change=math.radians(15))
+            try:
+                best, _ = plan_push(pm, (bp2.x, bp2.y, bp2.yaw), goal, robot_pose=(p[0], p[1], th), pose_fn=pose_fn,
+                                    pose_ok=pose_ok, offsets=offsets, max_heading_change=math.radians(15))
+            except ValueError:
+                res.stop_reason = "no push the robot can stand for without stepping on a fixture"
+                break
             # hand over to the three-leg foot push (stiffer gains)
-            rb._set_gains(PUSH_KP, PUSH_KV)
-            rb.mode = "push"
+            if generic:
+                rb.enter_push_mode()
+            else:
+                rb._set_gains(PUSH_KP, PUSH_KV)
+                rb.mode = "push"
             ctrl = Go1Controller(qa, render_every=render_every, camera=camera)
 
             def ptick(c, _i=i):
@@ -128,11 +228,20 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
                                            "push": _i, "mode": "foot push"})
             ctrl.on_tick = ptick
             before = rb.env.block_pose()
-            ev = ctrl.push(PUSH_LEG, np.array(best.contact_xy), best.direction, best.distance, push_height=PUSH_H)
+            # Re-step the feet under the body first if balancing on three of them as they stand would take a
+            # big body shift (pushing through an 8-13 cm shift tipped the Go2; the Go1 never needs more than
+            # 7 cm), or afterwards if the contact line turns out to be out of reach from this stance.
+            leg = leg_for(best)
+            squared = ctrl.balance_shift(leg) > MAX_BALANCE_SHIFT and ctrl.square_up() > 0
+            ev = ctrl.push(leg, np.array(best.contact_xy), best.direction, best.distance, push_height=PUSH_H)
+            if ev.get("skipped") and not squared and not ctrl.log.fell and ctrl.square_up():
+                ev = ctrl.push(leg, np.array(best.contact_xy), best.direction, best.distance, push_height=PUSH_H)
+                squared = True
+            ev["squared_up"] = squared
             res.frames.extend(ctrl.log.frames)
             contacts.extend((c["geom"] or c["body"], c["force_n"]) for c in ctrl.log.block_contacts)
             after = rb.env.block_pose()
-            rec = {"i": i, "plan": best.as_dict(), "reached_push_pose": bool(ok),
+            rec = {"i": i, "leg": leg, "plan": best.as_dict(), "reached_push_pose": bool(ok),
                    "base_error_cm": round(math.hypot(p[0] - tx, p[1] - ty) * 100, 1),
                    "block_before": before.as_dict(), "block_after": after.as_dict(),
                    "measured_move_cm": round(math.hypot(after.x - before.x, after.y - before.y) * 100, 2),
@@ -161,8 +270,8 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
         res.unstable, res.stop_reason = True, str(e)
     res.sim_time = float(rb.env.data.time)
     res.wall_s = round(time.time() - t0, 1)
-    res.unintended_contacts = sorted({g for g, _ in contacts if g != PUSH_LEG})
-    res.outcome = evaluate(spec, rb.env.block_pose(), rb.env.block_speed(), released=True)
+    res.unintended_contacts = sorted({g for g, _ in contacts if g not in push_geoms})
+    res.outcome = evaluate(spec, rb.env.block_pose(), rb.env.block_speed(), released=True, half_z=rb.block.half_z)
     if res.fell:
         res.outcome.success = False
         res.outcome.reasons.append("robot fell")

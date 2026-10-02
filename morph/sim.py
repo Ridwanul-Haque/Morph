@@ -170,11 +170,18 @@ class SimulationEnvironment:
         mujoco.mj_forward(self.model, self.data)
 
     # --------------------------------------------------------------- rendering
-    def render(self, camera: str = "overview", width: int = 640, height: int = 480) -> np.ndarray:
+    def render(self, camera: str = "overview", width: int = 640, height: int = 480, view: dict | None = None) -> np.ndarray:
+        """view: the user's own adjustment on top of the chosen camera (see apply_view)."""
         if self._renderer is None or self._renderer.width != width or self._renderer.height != height:
             if self._renderer is not None:
                 self._renderer.close()
             self._renderer = mujoco.Renderer(self.model, height, width)
+        self._renderer.update_scene(self.data, camera=self.camera(camera, view))
+        return self._renderer.render()
+
+    def camera(self, camera: str = "overview", view: dict | None = None):
+        """The camera to draw with: a scene camera's name, or a free camera (the tracking one, or any camera
+        the user has turned)."""
         if camera == "track":  # free camera framing the block, the goal marker and (optionally) the robot
             cam = mujoco.MjvCamera()
             pts = [self.data.qpos[self._bq:self._bq + 2].copy(), self.data.mocap_pos[self._goal_mocap][:2].copy()]
@@ -186,15 +193,83 @@ class SimulationEnvironment:
             cam.lookat[:] = [c[0] - 0.05, c[1], 0.12]
             cam.distance = max(1.1, 1.0 + 2.2 * spread)
             cam.azimuth, cam.elevation = self.track_azimuth, -28
-            self._renderer.update_scene(self.data, camera=cam)
-        else:
-            self._renderer.update_scene(self.data, camera=camera)
-        return self._renderer.render()
+            apply_view(cam, view)
+            remember(cam)
+            return cam
+        if view_adjusted(view):
+            cam = camera_as_free(self.model, self.data, camera)
+            apply_view(cam, view)
+            remember(cam)
+            return cam
+        if view is not None:  # so a first drag from this camera knows which way it faces
+            remember(camera_as_free(self.model, self.data, camera))
+        return camera
 
     def close(self) -> None:
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+
+
+DEFAULT_VIEW = {"az": 0.0, "el": 0.0, "zoom": 1.0, "pan": [0.0, 0.0, 0.0]}
+LAST_CAM = {"az": 150.0, "el": -28.0, "dist": 1.5}  # the last camera shown (for turning a pan into world units)
+
+
+def remember(cam: mujoco.MjvCamera) -> None:
+    LAST_CAM.update(az=float(cam.azimuth), el=float(cam.elevation), dist=float(cam.distance),
+                    lookat=[float(v) for v in cam.lookat])
+
+
+def nudge_view(view: dict, d: dict) -> dict:
+    """Add one drag / wheel step to the user's view. d: daz, del (degrees), zoom (factor), pan (dx, dy as
+    fractions of the viewer: the scene follows the mouse)."""
+    v = {"az": view["az"], "el": view["el"], "zoom": view["zoom"], "pan": list(view["pan"])}
+    v["az"] = (v["az"] + float(d.get("daz", 0)) + 180) % 360 - 180
+    base_el = LAST_CAM["el"] - view["el"]  # the chosen camera's own tilt
+    v["el"] = float(np.clip(v["el"] + float(d.get("del", 0)), -89 - base_el, -2 - base_el))
+    v["zoom"] = float(np.clip(v["zoom"] * float(d.get("zoom", 1)), 0.08, 8.0))
+    dx, dy = (float(x) for x in d.get("pan", (0, 0)))
+    if dx or dy:
+        az, el = np.radians(LAST_CAM["az"]), np.radians(LAST_CAM["el"])
+        f = np.array([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)])
+        r = np.array([np.sin(az), -np.cos(az), 0.0])
+        u = np.cross(r, f)
+        k = LAST_CAM["dist"] * 0.83  # the view's width at the look-at point (45 degree field of view)
+        v["pan"] = [float(x) for x in np.asarray(v["pan"]) - dx * k * r + dy * k * u]
+    return v
+
+
+def view_adjusted(view: dict | None) -> bool:
+    return bool(view) and (abs(view["az"]) > 1e-6 or abs(view["el"]) > 1e-6 or abs(view["zoom"] - 1) > 1e-6
+                           or any(abs(v) > 1e-6 for v in view["pan"]))
+
+
+def apply_view(cam: mujoco.MjvCamera, view: dict | None) -> None:
+    """The user's drag / zoom / pan on top of a free camera: turn it, tilt it, move closer, shift what
+    it looks at. The camera stays above the floor."""
+    if not view_adjusted(view):
+        return
+    cam.azimuth = cam.azimuth + view["az"]
+    cam.elevation = float(np.clip(cam.elevation + view["el"], -89.0, -2.0))
+    cam.distance = float(np.clip(cam.distance * view["zoom"], 0.15, 20.0))
+    cam.lookat[:] = np.asarray(cam.lookat) + np.asarray(view["pan"])
+
+
+def camera_as_free(m: mujoco.MjModel, d: mujoco.MjData, name: str) -> mujoco.MjvCamera:
+    """A scene camera (e.g. "overview", "top") as an orbit camera, so the user can turn it."""
+    cam = mujoco.MjvCamera()
+    try:
+        i = m.camera(name).id
+    except KeyError:
+        cam.lookat[:], cam.distance, cam.azimuth, cam.elevation = [0.4, 0.0, 0.1], 2.0, 150.0, -28.0
+        return cam
+    pos, fwd = d.cam_xpos[i].copy(), -d.cam_xmat[i].reshape(3, 3)[:, 2]
+    t = (0.1 - pos[2]) / fwd[2] if fwd[2] < -1e-3 else 1.5  # where it looks at the work height
+    cam.lookat[:] = pos + fwd * t
+    cam.distance = float(t)
+    cam.azimuth = float(np.degrees(np.arctan2(fwd[1], fwd[0])))
+    cam.elevation = float(np.degrees(np.arcsin(np.clip(fwd[2], -1, 1))))
+    return cam
 
 
 def settle(env: SimulationEnvironment, seconds: float, ctrl=None, ctrl_fn=None) -> None:

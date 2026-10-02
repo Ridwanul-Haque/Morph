@@ -1,0 +1,80 @@
+[
+  {
+    "test": "stand",
+    "cmd": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "fell": false,
+    "mean_vx": -0.0,
+    "mean_vy": 0.001,
+    "mean_wz": -0.001,
+    "max_tilt_deg": 1.1
+  },
+  {
+    "test": "forward 0.5",
+    "cmd": [
+      0.5,
+      0.0,
+      0.0
+    ],
+    "fell": false,
+    "mean_vx": 0.47,
+    "mean_vy": 0.02,
+    "mean_wz": 0.028,
+    "max_tilt_deg": 8.1
+  },
+  {
+    "test": "backward 0.3",
+    "cmd": [
+      -0.3,
+      0.0,
+      0.0
+    ],
+    "fell": false,
+    "mean_vx": -0.27,
+    "mean_vy": 0.012,
+    "mean_wz": -0.037,
+    "max_tilt_deg": 5.8
+  },
+  {
+    "test": "sideways 0.3",
+    "cmd": [
+      0.0,
+      0.3,
+      0.0
+    ],
+    "fell": false,
+    "mean_vx": 0.02,
+    "mean_vy": 0.261,
+    "mean_wz": 0.058,
+    "max_tilt_deg": 11.6
+  },
+  {
+    "test": "turn left 0.8",
+    "cmd": [
+      0.0,
+      0.0,
+      0.8
+    ],
+    "fell": false,
+    "mean_vx": 0.013,
+    "mean_vy": -0.003,
+    "mean_wz": 0.693,
+    "max_tilt_deg": 3.2
+  },
+  {
+    "test": "turn right 0.8",
+    "cmd": [
+      0.0,
+      0.0,
+      -0.8
+    ],
+    "fell": false,
+    "mean_vx": 0.007,
+    "mean_vy": -0.001,
+    "mean_wz": -0.693,
+    "max_tilt_deg": 2.5
+  }
+]

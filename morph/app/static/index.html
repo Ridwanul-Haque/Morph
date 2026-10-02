@@ -1,0 +1,990 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morph</title>
+<style>
+:root {
+  --bg: #0a0f1a; --bg2: #0e1524; --panel: #121b2d; --raise: #182338; --hover: #1d2a43;
+  --line: rgba(148, 163, 184, .12); --line2: rgba(148, 163, 184, .22);
+  --text: #e7edf6; --dim: #94a3b8; --faint: #64748b;
+  --accent: #6aa8ff; --accent2: #8b7bff; --ok: #34d399; --bad: #f87171; --warn: #fbbf24;
+  --okbg: rgba(52, 211, 153, .12); --badbg: rgba(248, 113, 113, .12); --warnbg: rgba(251, 191, 36, .12); --accbg: rgba(106, 168, 255, .12);
+  --r: 12px; --r2: 16px; --shadow: 0 8px 28px rgba(0, 0, 0, .35);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: radial-gradient(1200px 600px at 60% -10%, #13203a 0%, var(--bg) 60%); color: var(--text);
+  font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+button, select, input, textarea { font: inherit; color: var(--text); }
+a { color: var(--accent); }
+.hidden { display: none !important; }
+.muted { color: var(--dim); } .faint { color: var(--faint); } .small { font-size: 12.5px; } .tiny { font-size: 11.5px; }
+.mono { font-family: var(--mono); }
+
+/* ---------- header ---------- */
+header { height: 60px; display: flex; align-items: center; gap: 14px; padding: 0 20px; border-bottom: 1px solid var(--line);
+  background: rgba(10, 15, 26, .7); backdrop-filter: blur(8px); }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand b { font-size: 17px; letter-spacing: .02em; }
+.brand .tag { color: var(--dim); font-size: 13px; padding-left: 10px; border-left: 1px solid var(--line2); }
+.spacer { flex: 1; }
+.chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 99px;
+  background: var(--panel); border: 1px solid var(--line); color: var(--dim); font-size: 12.5px; cursor: default; white-space: nowrap; }
+.chip b { color: var(--text); font-weight: 600; }
+.chip.click { cursor: pointer; } .chip.click:hover { border-color: var(--line2); color: var(--text); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .15); }
+.dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+
+/* ---------- layout ---------- */
+main { display: grid; grid-template-columns: 370px minmax(0, 1fr) 390px; height: calc(100% - 60px); }
+.col { overflow-y: auto; padding: 18px; }
+.left { border-right: 1px solid var(--line); }
+.right { border-left: 1px solid var(--line); display: flex; flex-direction: column; padding: 0; }
+.center { display: flex; flex-direction: column; gap: 12px; padding: 18px; overflow: hidden; }
+
+/* ---------- step cards ---------- */
+.step { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 14px; margin-bottom: 14px; }
+.step.active { border-color: rgba(106, 168, 255, .35); }
+.stephead { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.num { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700;
+  background: var(--raise); color: var(--dim); border: 1px solid var(--line2); flex: none; }
+.step.done .num { background: var(--ok); color: #06281c; border-color: var(--ok); }
+.step.active .num { background: var(--accent); color: #07162e; border-color: var(--accent); }
+.stephead h3 { margin: 0; font-size: 15px; }
+.help { color: var(--dim); font-size: 12.5px; margin: 0 0 12px 34px; }
+
+select, input[type=text], input[type=number], textarea { background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px;
+  padding: 8px 10px; width: 100%; outline: none; transition: border-color .15s; }
+select:focus, input:focus, textarea:focus { border-color: var(--accent); }
+textarea { resize: vertical; min-height: 70px; line-height: 1.45; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > .grow { flex: 1; }
+
+button { background: var(--raise); border: 1px solid var(--line2); border-radius: 10px; padding: 8px 14px; cursor: pointer;
+  transition: background .15s, border-color .15s, transform .05s; }
+button:hover:not(:disabled) { background: var(--hover); border-color: rgba(148, 163, 184, .35); }
+button:active:not(:disabled) { transform: translateY(1px); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.primary { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: 0; color: #fff; font-weight: 650; }
+.primary:hover:not(:disabled) { filter: brightness(1.08); background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+.big { width: 100%; padding: 12px; font-size: 15px; border-radius: 12px; }
+.ghost { background: transparent; border-color: var(--line); }
+.danger { color: var(--bad); border-color: rgba(248, 113, 113, .4); background: transparent; }
+.icon { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; }
+.xs { padding: 3px 9px; font-size: 12px; border-radius: 8px; }
+
+/* scene items */
+.things { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+.things .note { grid-column: 1 / 3; }
+.thing { display: grid; grid-template-columns: 26px 1fr; gap: 8px; align-items: center; padding: 7px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); min-width: 0; }
+.thing > div { min-width: 0; } .thing .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.thing .ico { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; font-size: 14px; }
+.thing b { font-weight: 600; } .thing .sub { color: var(--dim); font-size: 12px; }
+.k-object .ico { background: rgba(251, 191, 36, .15); color: var(--warn); }
+.k-container .ico { background: rgba(106, 168, 255, .15); color: var(--accent); }
+.k-surface .ico { background: rgba(52, 211, 153, .15); color: var(--ok); }
+.k-obstacle .ico { background: rgba(248, 113, 113, .13); color: var(--bad); }
+
+/* robots */
+.filters { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.fchip { padding: 4px 10px; border-radius: 99px; font-size: 12px; background: var(--bg2); border: 1px solid var(--line); cursor: pointer; color: var(--dim); }
+.fchip.on { background: var(--accbg); border-color: rgba(106, 168, 255, .4); color: var(--text); }
+.robots { display: flex; flex-direction: column; gap: 6px; max-height: 250px; overflow-y: auto; padding-right: 2px; }
+.bot { display: grid; grid-template-columns: 32px 1fr auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 12px;
+  background: var(--bg2); border: 1px solid var(--line); cursor: pointer; transition: border-color .15s, background .15s; }
+.bot:hover { border-color: var(--line2); }
+.bot.sel { background: var(--accbg); border-color: rgba(106, 168, 255, .45); }
+.bot.absent { opacity: .45; cursor: not-allowed; }
+.bot .ico { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; background: var(--raise); color: var(--dim); }
+.bot.sel .ico { background: var(--accent); color: #07162e; }
+.bot .name { font-weight: 600; }
+.bot .st { font-size: 12px; }
+.st.ok { color: var(--ok); } .st.bad { color: var(--bad); } .st.warn { color: var(--warn); } .st.dim { color: var(--faint); }
+
+/* goal */
+.examples { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.ex { padding: 4px 10px; border-radius: 99px; font-size: 12px; background: var(--bg2); border: 1px dashed var(--line2); color: var(--dim); cursor: pointer; }
+.ex:hover { color: var(--text); border-color: var(--accent); }
+.drop { border: 1px dashed var(--line2); border-radius: 12px; padding: 10px; text-align: center; color: var(--dim); cursor: pointer; font-size: 12.5px; transition: border-color .15s, background .15s; }
+.drop:hover, .drop.drag { border-color: var(--accent); background: var(--accbg); }
+.drop.has { border-style: solid; border-color: rgba(106, 168, 255, .45); color: var(--text); }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.switch input { display: none; }
+.switch .tr { width: 34px; height: 20px; border-radius: 99px; background: var(--raise); border: 1px solid var(--line2); position: relative; transition: background .15s; flex: none; }
+.switch .tr::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--dim); transition: left .15s, background .15s; }
+.switch input:checked + .tr { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .tr::after { left: 16px; background: #fff; }
+.err { color: var(--bad); font-size: 12.5px; margin-top: 8px; }
+
+/* ---------- center ---------- */
+.progress { display: flex; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 10px 14px; }
+.pstep { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 13px; white-space: nowrap; }
+.pstep .pd { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line2); display: grid; place-items: center; font-size: 11px; }
+.pstep.on { color: var(--text); } .pstep.on .pd { border-color: var(--accent); background: var(--accbg); animation: glow 1.4s infinite; }
+.pstep.done { color: var(--dim); } .pstep.done .pd { border-color: var(--ok); background: var(--ok); color: #06281c; }
+@keyframes glow { 50% { box-shadow: 0 0 0 5px rgba(106, 168, 255, .15); } }
+.pline { flex: 1; height: 2px; background: var(--line2); margin: 0 10px; min-width: 16px; }
+.pline.done { background: var(--ok); }
+.progress .who { margin-left: 16px; padding-left: 14px; border-left: 1px solid var(--line2); color: var(--dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+
+.viewer { position: relative; flex: 1; min-height: 0; border-radius: var(--r2); overflow: hidden; background: #070b13; border: 1px solid var(--line); box-shadow: var(--shadow); }
+.viewer img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.steps .step { display: grid; grid-template-columns: 22px 1fr; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+.steps .step:first-of-type { border-top: 0; }
+.steps .n { width: 20px; height: 20px; border-radius: 50%; background: var(--raise); color: var(--dim); font-size: 11px; display: grid; place-items: center; }
+.steps .step.done .n { background: rgba(52,211,153,.18); color: var(--ok); }
+.steps .step.now .n { background: rgba(106,168,255,.2); color: var(--accent); box-shadow: 0 0 0 2px rgba(106,168,255,.35); }
+.steps .t { font-size: 13px; } .steps .h { font-size: 12px; color: var(--dim); margin-top: 2px; line-height: 1.4; }
+.steps .w { font-size: 11.5px; color: var(--faint); margin-top: 2px; font-style: italic; }
+.steps .f { font-size: 11px; color: var(--faint); margin-top: 3px; font-family: ui-monospace, monospace; word-break: break-word; }
+.cdetail { font-size: 12px; color: var(--dim); margin-top: 3px; line-height: 1.45; }
+.viewer { cursor: grab; touch-action: none; } .viewer.dragging { cursor: grabbing; }
+.viewer.placing { cursor: crosshair; outline: 2px solid var(--accent); outline-offset: -2px; }
+.viewer img { user-select: none; -webkit-user-drag: none; pointer-events: none; }
+#resetview.on { color: var(--accent); border-color: var(--accent); }
+.empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 30px; }
+.empty h2 { margin: 12px 0 6px; font-size: 20px; }
+.empty ol { text-align: left; color: var(--dim); margin: 14px auto 0; max-width: 420px; line-height: 1.9; }
+.hud { position: absolute; left: 14px; top: 14px; display: flex; gap: 8px; }
+.hud .pill { background: rgba(7, 11, 19, .75); backdrop-filter: blur(6px); border: 1px solid var(--line); padding: 5px 11px; border-radius: 99px; font-size: 12.5px; display: flex; gap: 7px; align-items: center; }
+.live { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); animation: blink 1.2s infinite; }
+@keyframes blink { 50% { opacity: .3; } }
+.hud.r { left: auto; right: 14px; }
+.cap { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); background: rgba(7, 11, 19, .8); backdrop-filter: blur(6px);
+  border: 1px solid var(--line); padding: 8px 16px; border-radius: 12px; font-size: 14px; max-width: 80%; text-align: center; }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.seg button { border: 0; background: transparent; padding: 5px 10px; border-radius: 7px; font-size: 12.5px; color: var(--dim); }
+.seg button.on { background: var(--raise); color: var(--text); }
+.tlabel { font-size: 12px; color: var(--faint); }
+@media (max-width: 1750px) { .toolbar .tlabel { display: none; } .toolbar { gap: 8px; } }
+.trainbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 14px; }
+.bar { height: 8px; background: var(--raise); border-radius: 99px; overflow: hidden; }
+.bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .4s; }
+canvas { width: 100%; height: 110px; display: block; }
+
+/* ---------- right: tabs ---------- */
+.tabs { display: flex; gap: 4px; padding: 12px 14px 0; border-bottom: 1px solid var(--line); }
+.tab { background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 10px; color: var(--dim); font-size: 13px; }
+.tab:hover:not(:disabled) { background: transparent; color: var(--text); }
+.tab.on { color: var(--text); border-bottom-color: var(--accent); }
+.pane { overflow-y: auto; padding: 16px; flex: 1; }
+.sec { margin-bottom: 18px; }
+.sec h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 650; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; }
+.cond { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; align-items: start; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.cond:last-child { border-bottom: 0; }
+.cmark { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 800; background: var(--raise); color: var(--faint); }
+.cmark.ok { background: var(--okbg); color: var(--ok); } .cmark.bad { background: var(--badbg); color: var(--bad); }
+.cond .meas { font-size: 12px; color: var(--dim); }
+.src { display: inline-block; font-size: 10.5px; padding: 0 7px; border-radius: 99px; background: var(--raise); color: var(--dim); margin-left: 6px; vertical-align: 1px; }
+.src.description { background: var(--accbg); color: var(--accent); } .src.demo { background: rgba(139, 123, 255, .15); color: #b3a8ff; }
+.x { background: none; border: 0; color: var(--faint); padding: 0 4px; font-size: 16px; line-height: 1; }
+.x:hover:not(:disabled) { color: var(--bad); background: none; }
+.note { font-size: 12.5px; color: var(--dim); margin-top: 8px; padding: 8px 10px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); }
+.res { padding: 12px; border-radius: var(--r); background: var(--panel); border: 1px solid var(--line); margin-bottom: 8px; }
+.res .top { display: flex; align-items: center; gap: 8px; }
+.res .top b { font-size: 14.5px; }
+.plan { font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--raise); color: var(--dim); white-space: nowrap; }
+.plan.grasp_place_topdown, .plan.legged_foot_push, .plan.mobile_push { background: var(--accbg); color: var(--accent); }
+.plan.unsupported { background: var(--badbg); color: var(--bad); } .plan.learned_skill { background: rgba(139, 123, 255, .15); color: #b3a8ff; } .plan.learn_policy { background: var(--warnbg); color: var(--warn); }
+.score { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sbar { height: 6px; background: var(--raise); border-radius: 99px; margin: 10px 0 8px; overflow: hidden; }
+.sbar div { height: 100%; background: var(--ok); width: 0; transition: width .4s; }
+.sqs { display: flex; gap: 5px; flex-wrap: wrap; }
+.sq { width: 20px; height: 20px; border-radius: 6px; background: var(--raise); border: 1px solid var(--line2); transition: transform .1s; }
+.sq.ok { background: var(--ok); border-color: var(--ok); } .sq.bad { background: var(--bad); border-color: var(--bad); }
+.sq.run { background: var(--accent); border-color: var(--accent); animation: blink 1s infinite; }
+.sq.click { cursor: pointer; } .sq.click:hover { transform: scale(1.15); }
+.why { font-size: 12.5px; color: var(--dim); margin-top: 8px; }
+.how { font-size: 12.5px; color: var(--dim); margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+.how.open { display: block; }
+dl.kv { display: grid; grid-template-columns: 90px 1fr; gap: 6px 10px; margin: 12px 0 0; font-size: 13px; }
+dl.kv dt { color: var(--faint); } dl.kv dd { margin: 0; }
+.tmpl { display: grid; grid-template-columns: 20px 1fr; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.tmpl .why2 { color: var(--faint); font-size: 12px; }
+.opt { display: block; padding: 12px; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--line2); cursor: pointer; margin-bottom: 8px; }
+.opt.on { border-color: var(--accent); background: var(--accbg); }
+.opt .t { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 4px; }
+.opt .price { margin-left: auto; font-variant-numeric: tabular-nums; }
+.gpus { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+.gpu { display: grid; grid-template-columns: 16px 1fr auto 56px; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 8px; font-size: 12.5px; cursor: pointer; }
+.gpu:hover { background: var(--hover); } .gpu.on { background: var(--raise); }
+.gpu .c { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; text-align: right; }
+.log { font-family: var(--mono); font-size: 11.5px; color: var(--dim); white-space: pre-wrap; line-height: 1.55; }
+.spin { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--faint); border-top-color: transparent; border-radius: 50%; animation: s .8s linear infinite; vertical-align: -2px; }
+@keyframes s { to { transform: rotate(360deg); } }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raise); border: 1px solid var(--line2); padding: 10px 16px; border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; z-index: 20; }
+.toast.bad { border-color: rgba(248, 113, 113, .5); }
+[data-tip] { position: relative; }
+[data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: max-content; max-width: 260px;
+  background: #1f2a40; border: 1px solid var(--line2); color: var(--text); padding: 7px 10px; border-radius: 8px; font-size: 12px; font-weight: 400; line-height: 1.4; white-space: normal; box-shadow: var(--shadow); text-transform: none; letter-spacing: 0; }
+header [data-tip]:hover::after { left: auto; right: 0; }
+::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: #243149; border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-arm" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 20h8M8 20v-4l5-7M13 9l4 3M17 12l2-2M17 12l1 3"/><circle cx="13" cy="9" r="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-leg" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 10h14l2 2M6 10l-2 5 2 4M11 10l1 5-1 4M16 10l-1 5 2 4"/></symbol>
+  <symbol id="i-other" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 3v3M12 18v3M3 12h3M18 12h3"/></symbol>
+  <symbol id="i-yours" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
+</svg>
+
+<header>
+  <div class="brand">
+    <svg width="28" height="28" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="#6aa8ff"/><stop offset="1" stop-color="#8b7bff"/></linearGradient></defs>
+      <rect width="32" height="32" rx="9" fill="url(#g)"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <b>Morph</b><span class="tag">describe a task once, any robot does it</span>
+  </div>
+  <span class="spacer"></span>
+  <span class="chip" data-tip="NVIDIA Nemotron (via Nebius) reads free-form goals and plans for each robot. Billed per token it reads and writes."><span class="dot" id="llmdot"></span><span id="llmtxt">Nemotron</span></span>
+  <span class="chip" data-tip="Where the live picture is drawn. On a GPU it can be sharp and smooth; on the CPU pick Fast quality under the viewer."><span class="dot" id="renderdot"></span><span id="rendertxt">Renderer</span></span>
+  <span class="chip click" onclick="showTab('compute')" data-tip="Where heavy learning (teaching a robot to walk) runs: this computer or a Nebius cloud GPU. Click to change."><span id="computetxt">Compute: this PC</span></span>
+  <a href="/api/report" download><button class="xs" id="reportbtn" disabled>Download report</button></a>
+</header>
+
+<main>
+<!-- ================================ LEFT: the task ================================ -->
+<div class="col left">
+  <div class="step" id="st1">
+    <div class="stephead"><span class="num">1</span><h3>Where it happens</h3></div>
+    <p class="help">A scene: the object to move and what's around it. Use the example or upload your own MuJoCo scene.</p>
+    <div class="row"><select id="scene" class="grow"></select><button onclick="pick('scenefile')" data-tip="A MuJoCo .xml with one free-moving object, plus any bins, shelves or walls.">Upload</button></div>
+    <input type="file" id="scenefile" accept=".xml" class="hidden" onchange="upload(this, 'scene')">
+    <div class="things" id="things"></div>
+  </div>
+
+  <div class="step" id="st2">
+    <div class="stephead"><span class="num">2</span><h3>Which robots should try</h3></div>
+    <p class="help">Pick one or more. Morph measures what each robot is and checks it against the goal: no setup needed.</p>
+    <div class="filters" id="filters"></div>
+    <div class="robots" id="robots"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="xs ghost" onclick="pick('robotfile')" data-tip="A MuJoCo .xml, a URDF, a xacro, or a .zip of the robot's description folder (the file plus its meshes).">+ Upload a robot</button>
+      <button class="xs ghost" onclick="addPath()">+ Robot on disk</button>
+    </div>
+    <input type="file" id="robotfile" accept=".xml,.urdf,.xacro,.zip" class="hidden" onchange="upload(this, 'robot')">
+  </div>
+
+  <div class="step" id="st3">
+    <div class="stephead"><span class="num">3</span><h3>What should happen</h3></div>
+    <p class="help">Say it in plain words, drop in a recording of it being done, or both.</p>
+    <textarea id="desc" placeholder="e.g. put the parcel into the bin facing west"></textarea>
+    <div class="examples" id="examples"></div>
+    <div id="demodrop" class="drop" onclick="pick('demofile')">Drop a demonstration here <span class="faint">(the object's recorded path: .npz / .csv / .json)</span></div>
+    <input type="file" id="demofile" accept=".npz,.csv,.json" class="hidden" onchange="upload(this, 'demo')">
+    <div class="row" style="margin-top:12px">
+      <label class="switch grow" data-tip="On: Nemotron understands free-form requests like 'tidy it away in the blue container' (about $0.001 each). Off: a built-in reader handles plain phrases.">
+        <input type="checkbox" id="usellm" checked><span class="tr"></span><span>Use Nemotron</span></label>
+      <button class="primary" id="interp" onclick="interpret()">Understand goal</button>
+    </div>
+    <div id="goalerr" class="err"></div>
+  </div>
+
+  <div class="step" id="st4">
+    <div class="stephead"><span class="num">4</span><h3>Run it</h3></div>
+    <p class="help">Each robot plans, sets itself up, then tries several times from slightly different starts.</p>
+    <div class="row" style="margin-bottom:10px">
+      <span class="grow small muted" data-tip="Each try starts the object a little differently (±2 cm, ±10°) with a different weight and friction.">Tries per robot</span>
+      <div class="seg" id="ntrials"></div>
+    </div>
+    <div class="row">
+      <button class="primary big" id="runbtn" onclick="run()" disabled>Run</button>
+      <button class="danger" id="stopbtn" onclick="stop()" disabled style="height:46px">Stop</button>
+    </div>
+    <div id="runhint" class="small faint" style="margin-top:8px"></div>
+    <div id="runerr" class="err"></div>
+  </div>
+</div>
+
+<!-- ================================ CENTER: live ================================ -->
+<div class="center">
+  <div class="progress">
+    <div class="pstep"><span class="pd">1</span>Plan</div><div class="pline"></div>
+    <div class="pstep"><span class="pd">2</span>Set up</div><div class="pline"></div>
+    <div class="pstep"><span class="pd">3</span>Try</div><div class="pline"></div>
+    <div class="pstep"><span class="pd">✓</span>Done</div>
+    <div class="who" id="who">Nothing running</div>
+  </div>
+
+  <div class="viewer" id="viewer">
+    <div class="empty" id="empty"><div>
+      <svg width="54" height="54" viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="#182338"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#6aa8ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <h2>The simulation plays here</h2>
+      <div class="muted">A preview of your scene and robots shows here; during a run you watch the physics live.</div>
+      <ol><li>Pick a scene</li><li>Pick the robots to try</li><li>Describe the goal and press <b>Understand goal</b></li><li>Press <b>Run</b></li></ol>
+    </div></div>
+    <img id="live" class="hidden" alt="live simulation">
+    <div class="hud hidden" id="hud"><span class="pill"><span class="live" id="livedot"></span><span id="hudtxt">LIVE</span></span></div>
+    <div class="hud r hidden" id="hudr"><span class="pill" id="hudr1"></span></div>
+    <div class="cap hidden" id="cap"></div>
+  </div>
+
+  <div class="toolbar">
+    <button class="icon" id="pausebtn" onclick="togglePause()" disabled data-tip="Pause / resume">❚❚</button>
+    <span class="tlabel">Speed</span><div class="seg" id="speed"></div>
+    <span class="tlabel">View</span><div class="seg" id="camera"></div>
+    <span class="tlabel" data-tip="Sharp draws at your screen's resolution (needs a GPU). Fast suits computers without one.">Quality</span><div class="seg" id="quality"></div>
+    <span class="spacer"></span>
+    <button class="icon" id="resetview" onclick="resetView()" data-tip="Reset view. Turn it yourself: drag to rotate, right-drag (or Shift-drag) to move, scroll to zoom, double-click to reset.">⟲</button>
+    <button class="icon" onclick="fullscreen()" data-tip="Full screen">⤢</button>
+  </div>
+
+  <div class="trainbox hidden" id="trainbox">
+    <div class="row"><b id="traintitle" class="grow">Learning to walk</b><span class="small muted" id="trainpct"></span></div>
+    <div class="bar" style="margin:10px 0"><div id="trainbar"></div></div>
+    <canvas id="curve" width="900" height="120"></canvas>
+    <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div>
+    <div id="trainsteps" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<!-- ================================ RIGHT: tabs ================================ -->
+<div class="col right">
+  <div class="tabs">
+    <button class="tab on" data-t="results" onclick="showTab('results')">Results</button>
+    <button class="tab" data-t="robot" onclick="showTab('robot')">Robot</button>
+    <button class="tab" data-t="compute" onclick="showTab('compute')">Compute &amp; cost</button>
+    <button class="tab" data-t="log" onclick="showTab('log')">Log</button>
+  </div>
+
+  <div class="pane" id="p-results">
+    <div class="sec"><h4>Goal checklist</h4>
+      <div class="card" id="checklist"><span class="muted small">The goal appears here as a checklist once you press <b>Understand goal</b>.</span></div>
+      <div id="goalnotes"></div>
+    </div>
+    <div class="sec"><h4>How each robot did</h4><div id="results"><span class="muted small">Results appear here during the run. Click a square to replay that try.</span></div></div>
+  </div>
+
+  <div class="pane hidden" id="p-robot">
+    <div id="cloudjob"></div>
+    <div id="profile"><span class="muted small">Click <b>ⓘ</b> next to a robot to see what Morph measured about it and why it chose its plan.</span></div>
+  </div>
+
+  <div class="pane hidden" id="p-compute">
+    <div class="sec"><h4>Teaching a robot to walk: where should it run?</h4>
+      <p class="small muted" style="margin-top:0">Only learning a new gait needs a big GPU. Setup and tries run on this computer's CPU in seconds.</p>
+      <div id="computeopts"></div>
+      <div class="note tiny" id="computenote"></div>
+    </div>
+    <div class="sec"><h4>Nemotron this session</h4><div class="card" id="llmcost"></div></div>
+    <div class="sec"><h4>Live view</h4><div class="card small" id="renderinfo"></div></div>
+  </div>
+
+  <div class="pane hidden" id="p-log"><div class="log" id="log">Nothing yet.</div></div>
+</div>
+</main>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const PLAN = {grasp_place_topdown: "Pick up and place", legged_foot_push: "Walk over and push", mobile_push: "Drive over and push",
+              learn_policy: "Needs to learn first", unsupported: "Can't do this goal", learned_skill: "Its learned skill"};
+const PLAN_LONG = {learned_skill: "Use the skill it learned for this goal", grasp_place_topdown: "Pick it up from above, carry it, set it down (gripper)",
+                   legged_foot_push: "Walk with a learned gait, then push with one foot while standing on three",
+                   mobile_push: "Drive its base against the object and push it",
+                   learn_policy: "Learn a new skill in simulation first (reinforcement learning on a GPU)"};
+const KIND = {object: ["◆", "the object to move"], container: ["▢", "a container: things go inside it"],
+              surface: ["▭", "a surface: things rest on top of it"], obstacle: ["▮", "an obstacle: things can be pushed against it"]};
+const SRC = {description: "your words", demo: "the demo", default: "added by Morph"};
+const SRC_TIP = {description: "Comes from what you typed.", demo: "Measured from the demonstration you gave.",
+  default: "Morph adds this on its own: you didn't say the object may be tipped over, so a result where it falls on its side doesn't count. Remove it with × if tipping is fine."};
+let S = {robots: [], sel: new Set(), filter: "All", demo: null, goal: null, scene: null, running: false, results: {}, order: [],
+         profiles: {}, curve: [], est: null, compute: {mode: "local", gpu: "H100"}, n: 5};
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+function pick(id) { $(id).click(); }
+function toast(msg, bad) { const t = $("toast"); t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); clearTimeout(t._h); t._h = setTimeout(() => t.classList.add("hidden"), 4500); }
+window.addEventListener("error", e => toast("Page error: " + e.message, true));
+window.addEventListener("unhandledrejection", e => toast((e.reason && e.reason.message) || String(e.reason), true));
+function seg(id, opts, cur, onpick) {
+  $(id).innerHTML = opts.map(([v, l, tip]) => `<button class="${String(v) === String(cur) ? "on" : ""}" ${tip ? `data-tip="${esc(tip)}"` : ""} data-v="${esc(v)}">${esc(l)}</button>`).join("");
+  $(id).querySelectorAll("button").forEach(b => b.onclick = () => { $(id).querySelectorAll("button").forEach(x => x.classList.remove("on")); b.classList.add("on"); onpick(b.dataset.v); });
+}
+function showTab(t) {
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.t === t));
+  ["results", "robot", "compute", "log"].forEach(x => $("p-" + x).classList.toggle("hidden", x !== t));
+  if (t === "compute") refreshCosts();
+}
+
+// ------------------------------------------------------------ boot
+async function boot() {
+  initOrbit();
+  const s = await api("/api/state");
+  $("llmdot").className = "dot " + (s.nemotron ? "ok" : "bad");
+  $("llmtxt").innerHTML = s.nemotron ? "Nemotron <b>connected</b>" : "Nemotron: <b>no API key</b>";
+  if (!s.nemotron) $("usellm").checked = false;
+  S.est = s.estimates; S.test = s.task_estimates; S.compute = s.compute;
+  orbit.moved = !!s.control.orbit_moved; $("resetview").classList.toggle("on", orbit.moved);
+  renderCompute(); setRenderer(s.renderer); renderLlm(s.llm_cost);
+  $("scene").innerHTML = s.projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.uploaded ? " (yours)" : ""}</option>`).join("");
+  S.robots = s.robots; renderFilters(); renderRobots();
+  seg("ntrials", [[1, "1"], [3, "3"], [5, "5"], [10, "10"]], S.n, v => { S.n = +v; steps(); });
+  seg("speed", [[0.5, "½×"], [1, "1×", "real time"], [2, "2×"], [4, "4×"], [8, "8×"], [0, "Max", "as fast as this computer can"]], s.control.speed, v => control({speed: +v}));
+  seg("camera", [["track", "Follow", "keeps the object and robot in frame"], ["overview", "Wide"], ["top", "Top"]], s.control.camera, v => control({camera: v}));
+  seg("quality", [["sharp", "Sharp"], ["balanced", "Balanced"], ["fast", "Fast"]], s.control.quality, v => control({quality: v}));
+  sendView(); window.addEventListener("resize", () => { clearTimeout(window._rv); window._rv = setTimeout(sendView, 250); });
+  if (s.projects.length) await loadScene($("scene").value);
+  events(); steps();
+}
+function previewSize() { const r = $("viewer").getBoundingClientRect(), k = Math.min(1, 1600 / (r.width * devicePixelRatio));
+  return [Math.round(r.width * devicePixelRatio * k), Math.round(r.height * devicePixelRatio * k)]; }
+function preview(robotIndex) {
+  if (S.running || !S.scene) return;
+  S.replay = null; S.viewMode = "preview";
+  const r = robotIndex === undefined ? null : S.robots[robotIndex];
+  S.previewRobot = robotIndex;
+  const [w, h] = previewSize();
+  $("empty").classList.add("hidden"); $("live").classList.remove("hidden"); $("hud").classList.remove("hidden"); $("hudr").classList.remove("hidden");
+  $("hudtxt").textContent = "PREVIEW"; $("livedot").style.background = "var(--accent)"; $("livedot").style.animation = "none";
+  $("hudr1").textContent = r ? `${r.name} in ${S.scene.name}` : `${S.scene.name} scene`;
+  const pp = r && S.profiles[r.path], fixed = r && (pp ? pp.base === "fixed" : r.group === "Arms");
+  caption(r ? (fixed ? `${r.name}, placed behind the work area. When you run, Morph finds its exact mount by experiment.`
+              : `${r.name}, standing back from the ${S.scene.summary.object.name}. When you run, it walks or drives into position.`)
+            : S.goal ? "The green marker shows where the goal puts the object." : "Your scene. Pick a robot to see it here.");
+  // Load off-screen and only show it if it's still the latest request: the first picture of a robot takes ~1 s,
+  // and a slow earlier one must not replace a newer choice.
+  const tok = S.pvTok = (S.pvTok || 0) + 1;
+  $("hudtxt").innerHTML = `<span class="spin"></span> PREVIEW`;
+  const img = new Image();
+  img.onload = () => { if (tok === S.pvTok && !S.running && !S.replay) { $("live").src = img.src; $("hudtxt").textContent = "PREVIEW"; } };
+  img.onerror = () => { if (tok === S.pvTok) $("hudtxt").textContent = "PREVIEW (couldn't draw this robot)"; };
+  img.src = previewUrl(r, w, h);
+}
+function previewUrl(r, w, h, draft) {
+  return `/api/preview.jpg?${r ? "robot=" + encodeURIComponent(r.path) + "&" : ""}w=${w}&h=${h}&t=${S.goal ? "g" + JSON.stringify(S.goal.conditions).length : ""}&v=${orbit.ver}&p=${S.placeVer || 0}${draft ? "&draft=1" : ""}${S.orbitStep ? "&orbit=" + encodeURIComponent(JSON.stringify(S.orbitStep)) : ""}`;
+}
+function refreshPreview(draft) {  // the preview again (new view or new robot spot); resolves when it's shown
+  if (S.viewMode !== "preview" || S.running) return Promise.resolve();
+  const r = S.previewRobot === undefined ? null : S.robots[S.previewRobot], [w, h] = previewSize();
+  return new Promise(ok => { const img = new Image(); img.onload = () => { if (S.viewMode === "preview") $("live").src = img.src; ok(); };
+    img.onerror = ok; img.src = previewUrl(r, w, h, draft); });
+}
+
+// ---- turning the view yourself: drag = turn, right-drag or shift-drag = move, wheel = zoom, double-click = reset.
+// While dragging, quick half-size pictures; one sharp one when you let go.
+const orbit = {pending: null, busy: false, ver: 0, drag: null, moved: false, sharpDue: false};
+function orbitSend(d) {
+  if (S.viewMode === "replay") { toast("Replays are recorded from one angle. Go back to live to turn the view."); return; }
+  if (!S.viewMode) return;
+  const p = orbit.pending || {daz: 0, del: 0, zoom: 1, pan: [0, 0]};
+  p.daz += d.daz || 0; p.del += d.del || 0; p.zoom *= d.zoom || 1;
+  if (d.pan) { p.pan[0] += d.pan[0]; p.pan[1] += d.pan[1]; }
+  orbit.pending = p; orbit.sharpDue = true; orbitFlush();
+}
+async function orbitFlush(reset) {
+  if (orbit.busy || (!orbit.pending && !reset)) return;
+  const d = orbit.pending; orbit.pending = null; orbit.busy = true;
+  const draft = !reset && !!(orbit.drag || orbit.wheeling);
+  try {
+    if (S.viewMode === "preview" && !S.running && !reset) {  // one round trip: the turn travels with the picture request
+      orbit.ver++; S.orbitStep = d; await refreshPreview(draft); S.orbitStep = null;
+    } else {
+      await api("/api/control", reset ? {orbit_reset: true, live: S.viewMode === "live"} : {orbit: d, live: S.viewMode === "live", draft});
+      orbit.ver++; await refreshPreview(draft);
+    }
+    orbit.moved = !reset; $("resetview").classList.toggle("on", orbit.moved);
+    if (!draft) orbit.sharpDue = false;
+  } catch (e) { /* the next drag step tries again */ }
+  finally { orbit.busy = false; if (orbit.pending) orbitFlush(); else if (orbit.sharpDue && !orbit.drag && !orbit.wheeling) sharpen(); }
+}
+function sharpen() {  // after the drag: the same view, drawn properly
+  orbit.sharpDue = false;
+  if (S.viewMode === "preview") refreshPreview(false);
+  else if (S.viewMode === "live" && !S.running) api("/api/control", {orbit: {}, live: true}).catch(() => {});
+}
+function resetView() { orbit.pending = null; if (orbit.busy) setTimeout(resetView, 60); else orbitFlush(true); }
+
+// ---- putting the robot where you want it (Robot tab: "Place on the view")
+const place = {busy: false, pending: null};
+function placeMode(on) {
+  S.placing = on ? S.profiled : null;
+  $("viewer").classList.toggle("placing", !!on);
+  if (on) { if (S.viewMode !== "preview") preview(S.profiled);
+    caption(`Click or drag on the floor to put ${S.robots[S.profiled].name} there. Scroll to turn it. Press Esc or "Done" when it's right.`); }
+  else caption("Placed. Runs and learning use this spot.");
+  const b = document.getElementById("placebtn"); if (b) b.textContent = on ? "Done placing" : "Place on the view";
+}
+function imgPoint(e) {  // where on the picture (0..1 across and down) the pointer is
+  const img = $("live"), r = img.getBoundingClientRect(), nw = img.naturalWidth || 16, nh = img.naturalHeight || 10;
+  const k = Math.min(r.width / nw, r.height / nh), ox = (r.width - nw * k) / 2, oy = (r.height - nh * k) / 2;
+  return {u: (e.clientX - r.left - ox) / (nw * k), v: (e.clientY - r.top - oy) / (nh * k), aspect: nw / nh};
+}
+async function placeSend(body, draft) {
+  if (place.busy) { place.pending = [body, draft]; return; }
+  place.busy = true;
+  try { S.placement = await api("/api/placement", {path: S.robots[S.placing].path, ...body}); S.placeVer = (S.placeVer || 0) + 1;
+        await refreshPreview(draft); showPlacement(); }
+  catch (e) { toast(e.message, true); }
+  finally { place.busy = false; if (place.pending) { const [b, d] = place.pending; place.pending = null; placeSend(b, d); }
+            else if (!draft) refreshPreview(false); }
+}
+function showPlacement() {
+  const p = S.placement; if (!p) return;
+  ["px", "py", "pyaw"].forEach((id, k) => { const el = document.getElementById(id); if (el) el.value = [p.x, p.y, p.yaw_deg][k]; });
+  const t = document.getElementById("placetxt"); if (t) t.textContent = p.custom ? "· where you put it" : "· Morph's choice";
+}
+function initOrbit() {
+  const v = $("viewer");
+  v.addEventListener("contextmenu", e => e.preventDefault());
+  v.addEventListener("pointerdown", e => {
+    if (e.target.closest("a, button")) return;
+    try { v.setPointerCapture(e.pointerId); } catch (err) { /* drag still works inside the viewer */ }
+    if (S.placing != null && e.button === 0 && !e.shiftKey) { orbit.drag = {place: true}; placeSend(imgPoint(e), true); return; }
+    orbit.drag = {x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey || e.button === 1};
+    v.classList.add("dragging");
+  });
+  v.addEventListener("pointermove", e => {
+    const g = orbit.drag; if (!g) return;
+    if (g.place) { placeSend(imgPoint(e), true); return; }
+    const dx = e.clientX - g.x, dy = e.clientY - g.y, r = v.getBoundingClientRect();
+    g.x = e.clientX; g.y = e.clientY;
+    if (g.pan) orbitSend({pan: [dx / r.width, dy / r.height]});
+    else orbitSend({daz: -dx * 0.35, del: dy * 0.25});
+  });
+  const end = e => { const was = orbit.drag; orbit.drag = null; v.classList.remove("dragging");
+    if (was && was.place) placeSend(imgPoint(e), false); else if (orbit.sharpDue && !orbit.busy) sharpen(); };
+  v.addEventListener("pointerup", end); v.addEventListener("pointercancel", end);
+  v.addEventListener("wheel", e => {
+    e.preventDefault();
+    if (S.placing != null && S.placement) {  // turn it; ticks that arrive while one is on its way add up
+      S.placement.yaw_deg += e.deltaY > 0 ? -10 : 10;
+      placeSend({yaw_deg: S.placement.yaw_deg}, false); return; }
+    orbit.wheeling = true; clearTimeout(orbit.wheelEnd);
+    orbit.wheelEnd = setTimeout(() => { orbit.wheeling = false; if (orbit.sharpDue && !orbit.busy) sharpen(); }, 250);
+    orbitSend({zoom: Math.exp(Math.max(-60, Math.min(60, e.deltaY)) * 0.0015)});
+  }, {passive: false});
+  v.addEventListener("dblclick", e => { if (S.placing == null) resetView(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && S.placing != null) placeMode(false); });
+}
+function sendView() { const r = $("viewer").getBoundingClientRect(); control({view: {w: Math.round(r.width), h: Math.round(r.height), dpr: window.devicePixelRatio || 1}}); }
+$("scene").onchange = () => loadScene($("scene").value);
+function steps() {
+  const done = [!!S.scene, S.sel.size > 0, !!S.goal, false], active = done.indexOf(false);
+  ["st1", "st2", "st3", "st4"].forEach((id, i) => { $(id).classList.toggle("done", done[i]); $(id).classList.toggle("active", i === active && !S.running); });
+  $("runbtn").disabled = S.running || !S.goal || S.sel.size === 0;
+  $("runbtn").textContent = S.running ? "Running…" : "Run";
+  $("runhint").textContent = S.running ? "" : !S.goal ? "Understand the goal first (step 3)." : S.sel.size === 0 ? "Pick at least one robot (step 2)." :
+    `${S.sel.size} robot${S.sel.size > 1 ? "s" : ""} × ${S.n} ${S.n > 1 ? "tries" : "try"}. Arms take seconds per try; legged robots about a minute at 4×.`;
+}
+
+async function loadScene(path) {
+  try {
+    const s = await api("/api/scene", {path});
+    S.scene = s; const o = s.summary.object;
+    $("things").innerHTML = thing("object", o.name, `${o.size_cm.join(" × ")} cm · ${o.mass_kg} kg`) +
+      s.fixtures.map(f => thing(f.kind, f.name, fixSub(f))).join("") +
+      (s.summary.notes.length ? `<div class="note tiny">${s.summary.notes.map(esc).join("<br>")}</div>` : "");
+    examples(s);
+    if (s.description && !$("desc").value) $("desc").value = s.description;
+    S.goal = null; S.profiles = {}; renderGoal(); renderRobots(); steps(); preview();
+  } catch (e) { $("things").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+function thing(kind, name, sub) {
+  return `<div class="thing k-${kind}" data-tip="${esc(name)}: ${esc(KIND[kind][1])}. ${esc(sub)}"><span class="ico">${KIND[kind][0]}</span>
+    <div><b>${esc(name)}</b> <span class="faint tiny">${kind}</span><div class="sub">${esc(sub)}</div></div></div>`;
+}
+function fixSub(f) {
+  const m = f.text.match(/(\d+) x (\d+) cm, top at ([\d.]+) cm/), op = f.text.match(/opening (\d+ x \d+) cm/);
+  return m ? `${m[1]} × ${m[2]} cm, ${m[3]} cm tall` + (op ? ` · opening ${op[1].replace(" x ", " × ")} cm` : "") : f.text;
+}
+function examples(s) {
+  const f = s.fixtures, o = s.summary.object.name, ex = [];
+  const c = f.find(x => x.kind === "container"), su = f.find(x => x.kind === "surface"), ob = f.find(x => x.kind === "obstacle");
+  if (c) ex.push(`put the ${o} into the ${c.name}`);
+  if (su) ex.push(`put the ${o} on the ${su.name} facing north`);
+  if (ob) ex.push(`push the ${o} against the ${ob.name}`);
+  ex.push(`turn the ${o} to face west`);
+  $("examples").innerHTML = `<span class="tiny faint" style="align-self:center">Try:</span>` + ex.map(e => `<span class="ex" onclick="$('desc').value = this.textContent">${esc(e)}</span>`).join("");
+}
+
+// ------------------------------------------------------------ robots
+function renderFilters() {
+  const groups = ["All", ...new Set(S.robots.map(r => r.group))];
+  $("filters").innerHTML = groups.map(g => `<span class="fchip ${g === S.filter ? "on" : ""}" onclick="S.filter='${esc(g)}';renderFilters();renderRobots()">${esc(g)}</span>`).join("");
+}
+function status(r) {
+  const p = S.profiles[r.path];
+  if (!r.present) return ["dim", "not downloaded (scripts/fetch_assets.sh --extra)"];
+  if (!S.goal) return ["dim", {Arms: "robot arm", Legged: "legged robot", Yours: "your model"}[r.group] || "robot"];
+  if (!p) return S.sel.has(r.path) ? ["dim", "checking against the goal…"] : ["dim", "select to check it against the goal"];
+  if (p.plan === "unsupported") return ["bad", p.why_not || "can't do this goal"];
+  if (p.learned) return ["ok", "ready: its learned skill"];
+  if (p.plan === "learn_policy") return ["warn", p.legs === 4 ? "needs to learn to walk first (ⓘ)" : "no ready-made skill: it can learn this (ⓘ)"];
+  return ["ok", "ready: " + PLAN[p.plan].toLowerCase()];
+}
+function renderRobots() {
+  const list = S.robots.map((r, i) => [r, i]).filter(([r]) => S.filter === "All" || r.group === S.filter);
+  $("robots").innerHTML = list.map(([r, i]) => {
+    const [cls, txt] = status(r);
+    const ic = {Arms: "i-arm", Legged: "i-leg", Yours: "i-yours"}[r.group] || "i-other";
+    return `<div class="bot ${S.sel.has(r.path) ? "sel" : ""} ${r.present ? "" : "absent"}" onclick="toggleBot(${i})">
+      <span class="ico"><svg width="18" height="18"><use href="#${ic}"/></svg></span>
+      <div><div class="name">${esc(r.name)}</div><div class="st ${cls}">${esc(txt)}</div></div>
+      <button class="xs ghost" ${r.present ? "" : "disabled"} onclick="event.stopPropagation(); profile(${i})" data-tip="What Morph measured about this robot">ⓘ</button></div>`;
+  }).join("") || `<span class="muted small">No robots in this group.</span>`;
+}
+function toggleBot(i) {
+  const r = S.robots[i]; if (!r.present || S.running) return;
+  S.sel.has(r.path) ? S.sel.delete(r.path) : S.sel.add(r.path);
+  if (S.sel.has(r.path) && S.goal && !S.profiles[r.path]) fetchProfile(r.path);
+  renderRobots(); steps();
+  if (S.sel.has(r.path)) preview(i); else if (S.previewRobot === i) preview();
+}
+async function fetchProfile(path) {
+  try { S.profiles[path] = await api("/api/profile", {path}); renderRobots(); return S.profiles[path]; }
+  catch (e) { toast(e.message, true); }
+}
+async function placeTyped() {
+  const v = id => parseFloat(document.getElementById(id).value);
+  S.placing = S.placing ?? S.profiled; const keep = S.placing;
+  await placeSend({x: v("px"), y: v("py"), yaw_deg: v("pyaw")}, false); if (keep !== S.placing) return;
+  if (!$("viewer").classList.contains("placing")) S.placing = null;
+}
+async function placeReset() {
+  S.placing = S.profiled; await placeSend({reset: true}, false);
+  if (!$("viewer").classList.contains("placing")) S.placing = null;
+}
+async function profile(i) {
+  const r = S.robots[i]; showTab("robot"); S.profiled = i; preview(i);
+  $("profile").innerHTML = `<div class="card"><span class="spin"></span> <span class="muted small">Measuring ${esc(r.name)}: joints, reach, gripper opening…</span></div>`;
+  const p = await fetchProfile(r.path); if (!p) return;
+  api("/api/placement", {path: r.path, query: true}).then(pl => { S.placement = pl; showPlacement(); }).catch(() => {});
+  const grip = p.gripper === "none" ? "none" : `${p.gripper.replaceAll("_", " ")}${p.opening_cm ? `, opens ${p.opening_cm} cm` : ""}`;
+  const noGait = p.legs === 4 && p.templates.some(t => t.id === "legged_foot_push" && t.missing.some(m => m.includes("no walking policy")));
+  const e = S.est, c = S.compute, g = e && e.cloud[c.gpu];
+  $("profile").innerHTML = `<div class="card"><div class="row"><span style="width:38px;height:38px;border-radius:10px;background:var(--raise);display:grid;place-items:center;color:var(--accent)"><svg width="20" height="20"><use href="#${r.group === "Legged" ? "i-leg" : r.group === "Arms" ? "i-arm" : "i-other"}"/></svg></span>
+      <div class="grow"><b style="font-size:16px">${esc(r.name)}</b><div class="small muted">${esc(p.kind.replaceAll("_", " "))}</div></div></div>
+    ${p.import_notes && p.import_notes.length ? `<div class="note tiny">${p.import_notes.map(esc).join("<br>")}</div>` : ""}
+    <dl class="kv"><dt>Size</dt><dd>${p.size_m.height} m tall · ${p.size_m.length} × ${p.size_m.width} m</dd>
+      <dt>Weight</dt><dd>${p.mass_kg} kg · ${p.dof} joints</dd><dt>Reach</dt><dd>${p.reach_m ? p.reach_m + " m" : "n/a (no arm)"}</dd>
+      <dt>Gripper</dt><dd>${esc(grip)}</dd><dt>Legs</dt><dd>${p.legs || "none"}</dd><dt>Can</dt><dd>${esc(p.abilities.join(", ") || "nothing yet")}</dd></dl></div>
+    <div class="sec" style="margin-top:14px"><h4>Where it stands <span class="faint tiny" id="placetxt" style="text-transform:none;letter-spacing:0"></span></h4><div class="card small">
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <label class="tiny muted">x <input id="px" type="number" step="0.05" style="width:70px" onchange="placeTyped()"> m</label>
+        <label class="tiny muted">y <input id="py" type="number" step="0.05" style="width:70px" onchange="placeTyped()"> m</label>
+        <label class="tiny muted">facing <input id="pyaw" type="number" step="15" style="width:64px" onchange="placeTyped()">°</label></div>
+      <div class="row" style="margin-top:8px;gap:8px"><button class="xs" id="placebtn" onclick="placeMode(S.placing == null)">Place on the view</button>
+        <button class="xs ghost" onclick="placeReset()">Let Morph choose</button></div>
+      <div class="tiny faint" style="margin-top:6px">${p.base === "fixed" ? "Where the arm is bolted down and which way it faces." : "Where it starts and which way it faces."}
+        Runs and learning use this spot (0° faces east, 90° north).</div></div></div>
+    <div class="sec" style="margin-top:14px"><h4>${S.goal ? "Plan for this goal" : "What it could do"}</h4><div class="card">
+      <span class="plan ${p.plan}">${esc(PLAN[p.plan])}</span>
+      ${p.why_not ? `<div class="why">${esc(p.why_not)}</div>` : ""}
+      <div style="margin-top:10px">${p.templates.map(t => `<div class="tmpl"><span class="st ${t.ok ? "ok" : "dim"}">${t.ok ? "✓" : "✕"}</span>
+        <div><div>${esc(PLAN_LONG[t.id] || t.id)}</div>${t.ok ? "" : `<div class="why2">${esc(t.missing.join("; "))}</div>`}</div></div>`).join("")}</div></div></div>
+    ${p.learned ? `<div class="sec"><h4>Learned skill</h4><div class="card small">
+      <div><span class="st ok">✓</span> ${esc(r.name)} has a skill it learned for this goal. Runs use it automatically.</div>
+      <div class="row" style="margin-top:10px"><a href="/api/export?task=${encodeURIComponent(p.learned)}" download><button class="primary">Export the policy (.zip)</button></a>
+      <span class="tiny faint grow">network weights, the model, a runner script, and a ROS 2 package (a node for your robot plus a simulated stand-in to try it)</span></div></div></div>` : ""}
+    ${S.goal && !p.learned && !noGait && (p.plan === "learn_policy" || readyFailed(r)) ? learnCard(r, i, readyFailed(r)) : ""}
+    ${noGait ? `<div class="sec"><h4>Teach it to walk</h4><div class="card small">
+      <div class="muted">${esc(r.name)} has no walking skill yet. Morph can train one in simulation (300M practice steps), then use it for pushing goals.</div>
+      <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
+        : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your own Nebius account.`}
+        <a href="#" onclick="showTab('compute');return false">Change</a></div>
+      <button class="primary" onclick="train(${i})">${c.mode === "local" ? "Train on this computer" : "Prepare cloud job"}</button></div></div>` : ""}`;
+}
+function readyFailed(r) {  // the ready-made skill ran here but couldn't be set up, or mostly failed
+  const R = S.results[r.path.split("/").pop().replace(/(\.urdf)?\.(xml|urdf|xacro)$/, "")]; if (!R) return false;
+  const done = R.trials.filter(t => t && t !== "run");
+  return R.skip || (done.length > 0 && done.filter(t => t.success).length / done.length < 0.5);
+}
+function learnCard(r, i, failed) {
+  const e = S.test, c = S.compute; if (!e) return "";
+  const g = e.cloud[c.gpu];
+  return `<div class="sec"><h4>Learn this task</h4><div class="card small">
+    <div class="muted">${failed ? `Morph's ready-made skill didn't work for ${esc(r.name)} here` : `None of Morph's ready-made skills fit ${esc(r.name)} for this goal`}, so it can learn one: it practises in
+      simulation thousands of times at once, scored by the goal checklist (${(e.steps / 1e6).toFixed(0)}M practice steps), then tries it here.
+      Pushing things into place usually learns well; picking up and lifting from scratch is much harder and may not succeed.</div>
+    <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
+      : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your Nebius account.`}
+      <a href="#" onclick="showTab('compute');return false">Change</a></div>
+    <label class="tiny muted" style="display:block;margin-bottom:10px" data-tip="Every practice copy gets slightly different physics: floor and parcel friction, parcel weight, motor strength, a one-step control delay, and sensor noise. The policy can't rely on one exact simulation, so it copes better with a different setup or a real robot. Learning takes a little longer.">
+      Physics variation <select id="randomize" style="margin-left:6px">
+        <option value="light" selected>Light (recommended)</option><option value="full">Strong (for real robots)</option>
+        <option value="off">Off (exact simulation)</option></select></label>
+    <div id="stepsbox" style="margin-bottom:10px">${S.planned && S.planned.path === r.path ? stepsHtml(S.planned, 0, false)
+      : `<button class="xs" onclick="planSteps(${i})" data-tip="${$("usellm").checked ? "Nemotron" : "Morph"} writes the steps a person would take without thinking, for this robot's body (which parts it uses, from which side, what to keep steady). The learner is rewarded for reaching each step in order. Costs about $0.002 with Nemotron.">Plan the steps first</button>
+         <span class="tiny faint">or Morph plans them when you start</span>`}</div>
+    <button class="primary" onclick="learn(${i})">${c.mode === "local" ? "Learn on this computer" : "Prepare cloud job"}</button>
+    <div class="tiny faint" style="margin-top:8px">When it's done you can export the learned policy to use outside Morph.</div></div></div>`;
+}
+async function learn(i) {
+  const rs = document.getElementById("randomize");
+  try { await api("/api/learn", {path: S.robots[i].path, randomize: rs ? rs.value : "light", llm: $("usellm").checked}); }
+  catch (e) { toast(e.message, true); }
+}
+async function planSteps(i) {
+  $("stepsbox").innerHTML = `<span class="spin"></span> <span class="muted small">${$("usellm").checked ? "Nemotron is" : "Morph is"} working out how ${esc(S.robots[i].name)} should go about it…</span>`;
+  try { S.planned = {...await api("/api/steps", {path: S.robots[i].path, llm: $("usellm").checked}), path: S.robots[i].path};
+        $("stepsbox").innerHTML = stepsHtml(S.planned, 0, false); refreshCosts(); }
+  catch (e) { $("stepsbox").innerHTML = ""; toast(e.message, true); }
+}
+function stepsHtml(v, reached, live) {  // the steps to go about it; live: ticked off as practice runs reach them
+  if (!v || !v.steps || !v.steps.length) return "";
+  const from = (v.from || "").startsWith("nemotron") ? "Nemotron" : "Morph's own rules";
+  return `<div class="steps"><div class="tiny muted" style="margin-bottom:6px">How ${esc(v.robot)} will go about it <span class="faint">(planned by ${from})</span></div>
+    ${v.steps.map((st, k) => { const last = k === v.steps.length - 1, done = live && k < reached, now = live && k === reached;
+      return `<div class="step ${done ? "done" : ""} ${now ? "now" : ""}"><span class="n">${done ? "✓" : k + 1}</span><div>
+        <div class="t">${esc(st.name)}${(st.body_parts || []).length ? ` <span class="faint tiny">· ${esc(st.body_parts.join(", "))}</span>` : ""}</div>
+        ${st.how ? `<div class="h">${esc(st.how)}</div>` : ""}${st.why && !last ? `<div class="w">why: ${esc(st.why)}</div>` : ""}
+        ${!last ? `<div class="f" data-tip="How Morph tells this step is done (measured every moment of a practice run)">done when ${esc(st.done_when)}${st.keep ? ` · keep ${esc(st.keep)}` : ""}</div>` : ""}</div></div>`; }).join("")}
+    ${v.rationale ? `<div class="tiny faint" style="margin-top:4px">${esc(v.rationale)}</div>` : ""}</div>`;
+}
+async function addPath() {
+  const p = prompt("Full path to a robot file on this computer (MuJoCo .xml, URDF .urdf or xacro .xacro; meshes and ROS packages are found next to it):");
+  if (!p) return;
+  try { S.robots = (await api("/api/robot_path", {path: p})).robots; renderFilters(); renderRobots(); toast("Added " + p.split("/").pop()); } catch (e) { toast(e.message, true); }
+}
+async function upload(input, kind) {
+  const f = input.files[0]; if (!f) return;
+  const r = await fetch(`/api/upload?kind=${kind}&name=${encodeURIComponent(f.name)}`, {method: "POST", body: f});
+  const j = await r.json(); input.value = "";
+  if (j.error) { toast(j.error, true); return; }
+  if (kind === "scene") { $("scene").innerHTML = j.projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.uploaded ? " (yours)" : ""}</option>`).join(""); $("scene").value = j.path; loadScene(j.path); }
+  if (kind === "robot") { S.robots = j.robots; S.sel.add(j.path); renderFilters(); renderRobots(); steps(); }
+  if (kind === "demo") { S.demo = j.path; $("demodrop").innerHTML = `Demonstration: <b>${esc(f.name)}</b> <span class="faint">(click to change)</span>`; $("demodrop").classList.add("has"); }
+}
+["dragenter", "dragover", "dragleave", "drop"].forEach(ev => $("demodrop").addEventListener(ev, e => {
+  e.preventDefault(); $("demodrop").classList.toggle("drag", ev === "dragenter" || ev === "dragover");
+  if (ev === "drop" && e.dataTransfer.files.length) { const dt = new DataTransfer(); dt.items.add(e.dataTransfer.files[0]); $("demofile").files = dt.files; upload($("demofile"), "demo"); }
+}));
+
+// ------------------------------------------------------------ goal
+async function interpret() {
+  $("goalerr").textContent = ""; $("interp").disabled = true; showTab("results");
+  $("checklist").innerHTML = `<span class="spin"></span> <span class="muted small">${$("usellm").checked ? "Nemotron is reading the goal…" : "Reading the goal…"}</span>`;
+  try {
+    S.goal = await api("/api/goal", {description: $("desc").value, demo: S.demo, llm: $("usellm").checked});
+    S.planned = null;
+    renderGoal(); S.profiles = {}; renderRobots();
+    for (const p of S.sel) fetchProfile(p);
+    refreshCosts(); preview(S.previewRobot);
+  } catch (e) { $("goalerr").textContent = e.message; S.goal = null; renderGoal(); }
+  $("interp").disabled = false; steps();
+}
+function renderGoal(results) {
+  const g = S.goal;
+  if (!g) { $("checklist").innerHTML = `<span class="muted small">The goal appears here as a checklist once you press <b>Understand goal</b>.</span>`; $("goalnotes").innerHTML = ""; return; }
+  $("checklist").innerHTML = g.conditions.map((c, i) => {
+    const r = results && results[i];
+    const mark = !r ? `<span class="cmark">•</span>` : r.ok ? `<span class="cmark ok">✓</span>` : `<span class="cmark bad">✕</span>`;
+    return `<div class="cond">${mark}<div>${esc(c.text)}<span class="src ${c.source}" data-tip="${esc(SRC_TIP[c.source] || "")}">${esc(SRC[c.source] || c.source)}</span>
+      ${c.detail ? `<div class="cdetail">${esc(c.detail)}</div>` : ""}
+      ${r ? `<div class="meas">measured: ${esc(r.measured)}</div>` : ""}</div>
+      ${S.running ? "<span></span>" : `<button class="x" title="remove this condition" onclick="removeCond(${i})">×</button>`}</div>`;
+  }).join("");
+  const d = g.demo, from = g.from.replace(/nemotron \(([\d.]+)s\)/, "Nemotron ($1 s)").replace("rules", "built-in reader").replace("measured", "measured from the demo");
+  $("goalnotes").innerHTML = (g.warnings || []).map(w => `<div class="note" style="border-color:rgba(251,191,36,.45);color:var(--warn)">⚠ ${esc(w)}</div>`).join("") +
+    (g.checked_when ? `<div class="tiny muted" style="margin-top:6px">${esc(g.checked_when)}</div>` : "") +
+    `<div class="tiny faint" style="margin-top:6px">Understood by: ${esc(from)}</div>` +
+    (d ? `<div class="note">The demo moved the object ${d.moved_cm} cm, turned it ${d.turned_deg}°, lifted it ${d.max_height_cm} cm, and it ended ${esc(d.end_relations.join(", ") || "on the floor")}.</div>` : "") +
+    g.notes.map(n => `<div class="note">${esc(n)}</div>`).join("");
+}
+async function removeCond(i) {
+  const conds = S.goal.conditions.filter((_, k) => k !== i).map(({text, ...c}) => c);
+  try { S.goal = await api("/api/conditions", {conditions: conds}); renderGoal(); S.profiles = {}; S.planned = null; for (const p of S.sel) fetchProfile(p); }
+  catch (e) { $("goalerr").textContent = e.message; }
+}
+
+// ------------------------------------------------------------ run
+async function run() {
+  $("runerr").textContent = "";
+  const robots = S.robots.filter(r => S.sel.has(r.path)).map(r => r.path);
+  S.results = {}; S.order = []; $("log").textContent = "";
+  robots.forEach(p => { const k = p.split("/").pop().replace(".xml", ""); S.results[k] = {trials: Array(S.n).fill(null), plan: null}; S.order.push(k); });
+  renderResults(); showTab("results");
+  try { await api("/api/run", {robots, n: S.n, llm: $("usellm").checked}); setRunning(true); showLive(); }
+  catch (e) { $("runerr").textContent = e.message; }
+}
+async function train(i) {
+  try { await api("/api/train", {path: S.robots[i].path}); } catch (e) { toast(e.message, true); }
+}
+async function stop() { await api("/api/stop", {}); }
+async function control(c) { const r = await api("/api/control", c); $("pausebtn").textContent = r.paused ? "▶" : "❚❚"; return r; }
+function togglePause() { control({paused: $("pausebtn").textContent === "❚❚"}); }
+function fullscreen() { $("viewer").requestFullscreen && $("viewer").requestFullscreen(); }
+document.addEventListener("fullscreenchange", () => setTimeout(sendView, 300));
+function setRunning(on) { S.running = on; $("stopbtn").disabled = !on; $("pausebtn").disabled = !on; steps(); renderGoal(S.lastConds); }
+function showLive() {
+  S.replay = null; S.viewMode = "live"; S.pvTok = (S.pvTok || 0) + 1;  // cancel any preview still loading
+  $("empty").classList.add("hidden"); $("live").classList.remove("hidden");
+  ["hud", "hudr"].forEach(x => $(x).classList.remove("hidden"));
+  $("hudtxt").textContent = "LIVE"; $("livedot").style.background = "var(--bad)"; $("livedot").style.animation = "";
+  $("live").src = "/api/stream.mjpg?" + Date.now();
+}
+function replay(robot, i) {
+  S.replay = {robot, i}; S.viewMode = "replay"; S.pvTok = (S.pvTok || 0) + 1;
+  $("empty").classList.add("hidden"); $("live").classList.remove("hidden"); $("hud").classList.remove("hidden");
+  $("live").src = `/api/replay.mjpg?robot=${encodeURIComponent(robot)}&i=${i}&t=${Date.now()}`;
+  $("hudtxt").innerHTML = `REPLAY · ${esc(robot)}, try ${i + 1} <a href="#" onclick="showLive();return false" style="margin-left:6px">back to live</a>`;
+  $("livedot").style.background = "var(--accent2)";
+  const t = S.results[robot].trials[i];
+  if (t) { renderGoal(t.conditions); caption(t.success ? "This try succeeded" : "Why it failed: " + t.reasons.join("; ")); }
+}
+function renderResults() {
+  $("results").innerHTML = S.order.length ? S.order.map(k => {
+    const R = S.results[k], ts = R.trials, ok = ts.filter(t => t && t !== "run" && t.success).length;
+    return `<div class="res"><div class="top"><b>${esc(k)}</b>${R.plan ? `<span class="plan ${R.plan}">${esc(PLAN[R.plan])}</span>` : `<span class="plan">waiting</span>`}
+      <span class="score">${R.skip ? `<span class="muted">n/a</span>` : `${ok}/${ts.length}`}</span></div>
+      ${R.skip ? `<div class="why">${esc(R.why || "")}</div>` : `<div class="sbar"><div style="width:${100 * ok / ts.length}%"></div></div>
+      <div class="sqs">${ts.map((t, i) => { const can = t && t !== "run" && t.replay;
+        return `<div class="sq ${t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad"} ${can ? "click" : ""}"
+          title="try ${i + 1}${t && t.reasons ? (t.success ? ": success" : ": " + esc(t.reasons.join("; "))) : ""}${can ? " (click to replay)" : ""}" ${can ? `onclick="replay('${esc(k)}', ${i})"` : ""}></div>`; }).join("")}</div>`}
+      ${R.how ? `<div class="how" onclick="this.classList.toggle('open')" title="click to expand">${esc(R.how)}</div>` : ""}
+      ${R.moveit ? `<div class="row" style="margin-top:8px"><a href="/api/export_moveit?name=${encodeURIComponent(R.moveit)}" download><button class="xs">Export for MoveIt 2 (.zip)</button></a>
+        <span class="tiny faint grow" data-tip="The arm configurations that worked here (above the object, grasp, lift, above the goal, place, release) in the arm's base frame, the scene's fixtures as collision boxes, and a moveit_py script that plans and runs them with your robot's MoveIt config. Checked in simulation only.">the sequence that worked, as a moveit_py script</span></div>` : ""}</div>`;
+  }).join("") : `<span class="muted small">Results appear here during the run. Click a square to replay that try.</span>`;
+}
+function progress(stage, who) {
+  const order = ["plan", "setup", "trials", "done"], k = order.indexOf(stage);
+  document.querySelectorAll(".pstep").forEach((el, i) => { el.classList.toggle("done", i < k || stage === "done"); el.classList.toggle("on", i === k && stage !== "done"); });
+  document.querySelectorAll(".pline").forEach((el, i) => el.classList.toggle("done", i < k || stage === "done"));
+  if (who !== undefined) $("who").textContent = who;
+}
+let cur = {robot: "", i: 0, n: 0};
+function caption(t) { $("cap").classList.remove("hidden"); $("cap").textContent = t; }
+function hudr() { $("hudr1").textContent = cur.n ? `${cur.robot} · try ${cur.i + 1} of ${cur.n}` : cur.robot; }
+const CAPTIONS = {"moving over the object": "Moving over the object", "lowering to grasp": "Lowering to grab it", "closing the gripper": "Closing the gripper",
+  "opening the gripper": "Opening the gripper", "backing off to try again": "Backing off to try again", lifting: "Lifting", carrying: "Carrying it",
+  "setting it down": "Setting it down", "letting go": "Letting go", "walking (learned gait)": "Walking into position (learned gait)", "pushing with one foot": "Pushing with one foot"};
+
+function events() {
+  const es = new EventSource("/api/events");
+  es.onmessage = m => {
+    const e = JSON.parse(m.data);
+    switch (e.type) {
+      case "run_start": setRunning(true); break;
+      case "robot_start": if (!S.results[e.robot]) { S.results[e.robot] = {trials: Array(5).fill(null), plan: "learned_skill", how: "the skill it just learned"}; S.order.push(e.robot); renderResults(); }
+        cur = {robot: e.robot, i: 0, n: 0}; hudr(); progress("plan", `${e.robot}: choosing a plan`); caption("Measuring the robot and choosing a plan"); break;
+      case "plan": if (S.results[e.robot]) { S.results[e.robot].plan = e.plan_id; S.results[e.robot].how = e.planner === "rule" ? (PLAN_LONG[e.plan_id] || e.how) : e.how; renderResults(); } progress("plan", `${e.robot}: ${PLAN[e.plan_id] || e.plan_id}`); break;
+      case "stage":
+        if (e.stage === "setup") { progress("setup", `${e.robot}: setting itself up`); caption("Setting up by experiment: where to mount, how high to carry, how hard to grip"); }
+        else { progress("trials", `${e.robot}: trying`); caption("Ready: " + e.text); }
+        break;
+      case "caption": {
+        const m = e.text.match(/^setting up: trying mount ([+-][\d.]+) m: carry height ([\d.]+) m, reachable task area (\d+)%/);
+        caption(m ? `Testing a mount ${m[1]} m back: reaches ${m[3]}% of the task area` : (CAPTIONS[e.text] || e.text)); break;
+      }
+      case "trial_start": cur = {robot: e.robot, i: e.i, n: e.n}; hudr(); if (S.results[e.robot]) { S.results[e.robot].trials[e.i] = "run"; renderResults(); } break;
+      case "trial":
+        if (S.results[e.robot]) { S.results[e.robot].trials[e.i] = e; renderResults(); }
+        S.lastConds = e.conditions; renderGoal(e.conditions);
+        caption(e.success ? `Try ${e.i + 1}: success` : `Try ${e.i + 1} failed: ${e.reasons[0] || ""}`);
+        break;
+      case "robot_done": if (e.n === 0 && S.results[e.robot]) { S.results[e.robot].skip = true; S.results[e.robot].why = e.why_not; renderResults(); } break;
+      case "log": $("log").textContent = ($("log").textContent === "Nothing yet." ? "" : $("log").textContent) + (e.robot ? `[${e.robot}] ` : "") + e.text + "\n"; break;
+      case "done": setRunning(false); $("reportbtn").disabled = false;
+        $("hudtxt").textContent = "FINISHED"; $("livedot").style.background = "var(--ok)"; $("livedot").style.animation = "none";
+        $("hudr1").textContent = e.summary.map(s => `${s.robot} ${s.n ? `${s.success}/${s.n}` : "n/a"}`).join(" · ");
+        progress("done", e.summary.map(s => `${s.robot} ${s.n ? `${s.success}/${s.n}` : "n/a"}`).join(" · "));
+        (e.summary || []).forEach(x => { if (x.moveit && S.results[x.robot]) S.results[x.robot].moveit = x.moveit; }); renderResults();
+        caption("Done. Click any square on the right to replay a try."); refreshCosts(); break;
+      case "stopped": setRunning(false); progress("plan", "Stopped"); caption("Stopped"); break;
+      case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
+      case "training_start": $("trainbox").classList.remove("hidden"); S.curve = []; S.trainSteps = e.steps;
+        $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
+          : "Score per practice run: higher means it walks and follows directions better.";
+        if (e.kind !== "task") $("trainsteps").innerHTML = "";
+        $("traintitle").textContent = e.kind === "task" ? `${e.robot} is learning the task (on this computer)` : `Teaching ${e.robot} to walk (on this computer)`;
+        $("trainpct").textContent = "starting: compiling the simulation for the GPU (a couple of minutes)…"; setRunning(true);
+        S.results = {}; S.order = []; renderResults();
+        if (e.kind === "task") { showLive(); cur = {robot: e.robot, i: 0, n: 0}; $("hudr1").textContent = `${e.robot} · learning`;
+          caption("Getting ready to practise. The first practice run appears after the first checkpoint (a few minutes)."); }
+        break;
+      case "practice": {
+        $("hudr1").textContent = `${e.robot} · practice after ${(e.step / 1e6).toFixed(0)}M steps`;
+        const far = e.steps_total ? ` · got through ${e.steps_reached} of ${e.steps_total} steps` : "";
+        caption(e.blew_up ? `Practice after ${(e.step / 1e6).toFixed(0)}M steps: still flailing (knocked the object away)`
+          : `Practice after ${(e.step / 1e6).toFixed(0)}M steps: ended ${e.dist_cm} cm from the target${e.tilt_deg > 10 ? ", tipped over" : ""}${far}`);
+        if (S.skillSteps && e.steps_total) { S.bestStep = Math.max(S.bestStep || 0, e.steps_reached);
+          $("trainsteps").innerHTML = stepsHtml(S.skillSteps, S.bestStep, true); }
+        break; }
+      case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true); break;
+      case "training_retry": toast(`Out of GPU memory: retrying with ${e.envs} practice copies at once`); break;
+      case "training": S.curve.push(e); drawCurve(); break;
+      case "training_done": $("trainpct").textContent = !e.ok ? `Training failed: ${e.why || "see Log"}` : e.kind === "task" ? "Learned. Now trying it…" : "Done: plans now use this gait";
+        if (e.kind !== "task" || !e.ok) setRunning(false); S.profiles = {}; renderRobots(); break;
+      case "robot_start_learn": break;
+      case "learn_done":
+        S.profiles = {}; renderRobots();
+        toast(`${e.robot}: learned skill succeeded ${e.success}/${e.n} tries. Export it from the Robot tab.`);
+        S.lastLearn = e.folder;
+        $("results").insertAdjacentHTML("beforeend", `<div class="res"><b>Learned skill</b> <span class="muted small">${esc(e.folder)}</span>
+          <div class="row" style="margin-top:8px"><a href="/api/export?task=${encodeURIComponent(e.folder)}" download><button class="primary xs">Export policy (.zip)</button></a></div></div>`);
+        break;
+      case "cloud_job": showCloudJob(e); break;
+    }
+  };
+}
+function drawCurve() {
+  const c = $("curve"), g = c.getContext("2d"), pts = S.curve, last = pts[pts.length - 1];
+  $("trainbar").style.width = Math.min(100, 100 * last.step / S.trainSteps) + "%";
+  $("trainpct").textContent = `${(last.step / 1e6).toFixed(0)}M of ${(S.trainSteps / 1e6).toFixed(0)}M steps · ${Math.round(last.wall_s / 60)} min · score ${last.reward.toFixed(1)}`;
+  g.clearRect(0, 0, c.width, c.height);
+  const maxR = Math.max(1, ...pts.map(p => p.reward)), W = c.width, H = c.height;
+  g.strokeStyle = "rgba(148,163,184,.2)"; g.beginPath(); g.moveTo(0, H - 1); g.lineTo(W, H - 1); g.stroke();
+  const grd = g.createLinearGradient(0, 0, W, 0); grd.addColorStop(0, "#6aa8ff"); grd.addColorStop(1, "#8b7bff");
+  g.strokeStyle = grd; g.lineWidth = 3; g.beginPath();
+  pts.forEach((p, i) => { const x = W * p.step / S.trainSteps, y = H - 8 - (H - 16) * p.reward / maxR; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.stroke();
+}
+
+// ------------------------------------------------------------ compute + costs
+function renderCompute() {
+  const e = S.est, c = S.compute; if (!e) return;
+  $("computetxt").innerHTML = c.mode === "local" ? "Compute: <b>this PC</b>" : `Compute: <b>Nebius ${esc(c.gpu)}</b> ~$${e.cloud[c.gpu].cost.toFixed(2)}/gait`;
+  $("computeopts").innerHTML = `
+    <div class="opt ${c.mode === "local" ? "on" : ""}" onclick="setCompute({mode:'local'})">
+      <div class="t">${c.mode === "local" ? "●" : "○"} This computer<span class="price">no bill</span></div>
+      <div class="small muted">${esc(e.local.gpu)} · about <b>${e.local.minutes} min</b> per gait (${esc(e.local.basis)})
+        · electricity about <b>$${(e.local.electricity || 0).toFixed(2)}</b> <span class="faint" data-tip="The GPU at its power limit plus ~100 W for the rest of the computer, at $${e.local.kwh_price}/kWh (set MORPH_KWH_PRICE to your rate)">(${e.local.kwh} kWh)</span></div></div>
+    <div class="opt ${c.mode === "cloud" ? "on" : ""}" onclick="setCompute({mode:'cloud'})">
+      <div class="t">${c.mode === "cloud" ? "●" : "○"} Nebius AI Cloud GPU<span class="price">~$${e.cloud[c.gpu].cost.toFixed(2)} per gait</span></div>
+      <div class="small muted">Faster GPUs, billed per minute while the VM runs. Morph prepares the job and you start it with your own Nebius account, so nothing is ever charged without you.</div>
+      <div class="gpus">${Object.entries(e.cloud).map(([k, g]) => `<div class="gpu ${k === c.gpu ? "on" : ""}" onclick="event.stopPropagation(); setCompute({mode:'cloud', gpu:'${esc(k)}'})">
+        <span>${k === c.gpu && c.mode === "cloud" ? "●" : "○"}</span><span>${esc(g.label)} <span class="faint">$${g.price_per_hour.toFixed(2)}/h</span></span>
+        <span class="faint">~${g.minutes} min</span><span class="c">$${g.cost.toFixed(2)}</span></div>`).join("")}</div></div>`;
+  $("computenote").innerHTML = `Per gait (${(e.steps / 1e6).toFixed(0)}M practice steps). Nebius on-demand prices, checked ${esc(e.prices_checked)} (<a href="${esc(e.price_url)}" target="_blank">nebius.com/prices</a>). ${esc(e.note)}.`;
+}
+async function setCompute(c) { S.compute = await api("/api/compute", c); renderCompute(); if (S.profiled !== undefined && !$("p-robot").classList.contains("hidden")) profile(S.profiled); }
+function showCloudJob(e) {
+  showTab("robot");
+  $("cloudjob").innerHTML = `<div class="card" style="border-color:rgba(106,168,255,.45);margin-bottom:12px">
+    <b>Cloud job ready: ${esc(e.robot)}</b><div class="small muted" style="margin:6px 0">${esc(e.gpu)} · about ${e.estimate.minutes} min · about <b>$${e.estimate.cost.toFixed(2)}</b></div>
+    <ol class="small" style="margin:6px 0 8px 18px;padding:0">${e.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>
+    <div class="tiny faint mono" style="word-break:break-all">${esc(e.folder)}</div></div>`;
+  toast("Cloud job prepared. Nothing was started or charged.");
+}
+function setRenderer(name) {
+  const cpu = name && /llvmpipe|softpipe|swrast/i.test(name), gpu = name && name.replace(/^D3D12 \(|\)$/g, "");
+  $("renderdot").className = "dot " + (!name ? "" : cpu ? "warn" : "ok");
+  $("rendertxt").innerHTML = !name ? "Renderer: <b>starts with a run</b>" : cpu ? "Rendering on <b>CPU</b>" : "Rendering on <b>GPU</b>";
+  $("renderinfo").innerHTML = !name ? `<span class="muted">Starts with the first run.</span>` : cpu
+    ? `Drawing on the <b>CPU</b> (${esc(name)}). Choose <b>Fast</b> quality for a smoother picture.`
+    : `Drawing on <b>${esc(gpu)}</b>. <b>Sharp</b> renders at your screen's real resolution (up to 1920×1200), about 25 ms a frame.`;
+}
+function renderLlm(c) {
+  $("llmcost").innerHTML = !c || !c.calls ? `<span class="muted small">No Nemotron calls yet. Each goal or plan costs about $0.001.</span>` :
+    `<b style="font-size:22px">$${c.cost.toFixed(4)}</b><div class="small muted">${c.calls} call${c.calls > 1 ? "s" : ""} · ${c.input_tokens.toLocaleString()} tokens in / ${c.output_tokens.toLocaleString()} out</div>
+     <div class="tiny faint" style="margin-top:6px">$0.30 per 1M input and $0.90 per 1M output tokens (Nebius Token Factory, Nemotron 3 Super).</div>`;
+  if (c && c.calls) $("llmtxt").innerHTML = `Nemotron <b>$${c.cost.toFixed(3)}</b>`;
+}
+async function refreshCosts() { try { const c = await api("/api/costs"); renderLlm(c.llm_cost); setRenderer(c.renderer); } catch (e) {} }
+setInterval(() => { if (S.running) refreshCosts(); }, 8000);
+boot();
+</script>
+</body>
+</html>

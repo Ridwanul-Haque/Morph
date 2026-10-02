@@ -1,0 +1,218 @@
+{
+  "robot": "go2",
+  "model": "third_party/mujoco_menagerie/unitree_go2/go2.xml",
+  "setup": {
+    "model_path": "third_party/mujoco_menagerie/unitree_go2/go2.xml",
+    "name": "go2",
+    "torso": "base",
+    "joints": [
+      "FL_hip_joint",
+      "FL_thigh_joint",
+      "FL_calf_joint",
+      "FR_hip_joint",
+      "FR_thigh_joint",
+      "FR_calf_joint",
+      "RL_hip_joint",
+      "RL_thigh_joint",
+      "RL_calf_joint",
+      "RR_hip_joint",
+      "RR_thigh_joint",
+      "RR_calf_joint"
+    ],
+    "feet": [
+      {
+        "body": "FL_calf",
+        "geom": "FL",
+        "geom_id": 19,
+        "pos": [
+          -0.002,
+          0.0,
+          -0.213
+        ],
+        "radius": 0.022
+      },
+      {
+        "body": "FR_calf",
+        "geom": "FR",
+        "geom_id": 31,
+        "pos": [
+          -0.002,
+          0.0,
+          -0.213
+        ],
+        "radius": 0.022
+      },
+      {
+        "body": "RL_calf",
+        "geom": "RL",
+        "geom_id": 43,
+        "pos": [
+          -0.002,
+          0.0,
+          -0.213
+        ],
+        "radius": 0.022
+      },
+      {
+        "body": "RR_calf",
+        "geom": "RR",
+        "geom_id": 55,
+        "pos": [
+          -0.002,
+          0.0,
+          -0.213
+        ],
+        "radius": 0.022
+      }
+    ],
+    "default_pose": [
+      0.0,
+      0.9,
+      -1.8,
+      0.0,
+      0.9,
+      -1.8,
+      0.0,
+      0.9,
+      -1.8,
+      0.0,
+      0.9,
+      -1.8
+    ],
+    "stand_height": 0.27,
+    "kp": 49.874398358655874,
+    "kd": 0.7124914051236554,
+    "action_scale": 0.5,
+    "torque_limits": [
+      23.7,
+      23.7,
+      45.43,
+      23.7,
+      23.7,
+      45.43,
+      23.7,
+      23.7,
+      45.43,
+      23.7,
+      23.7,
+      45.43
+    ],
+    "notes": [
+      "4 feet from introspection: FL_calf, FR_calf, RL_calf, RR_calf",
+      "servo gains scaled x1.42 from the Go1's by weight x leg length (15.2 kg, 0.51 m legs)",
+      "standing pose from the model's keyframe"
+    ]
+  },
+  "steps": 300000000,
+  "num_envs": 4096,
+  "wall_s": 1941.6,
+  "steps_per_s": 154509,
+  "gpu": "cuda:0",
+  "network": {
+    "layers": [
+      [
+        48,
+        512
+      ],
+      [
+        512,
+        256
+      ],
+      [
+        256,
+        128
+      ],
+      [
+        128,
+        24
+      ]
+    ]
+  },
+  "curve": [
+    {
+      "step": 0,
+      "wall_s": 19.3,
+      "reward": 0.0017462049145251513,
+      "episode_length": 138.109375,
+      "tracking_lin_vel": 24.998348236083984
+    },
+    {
+      "step": 27852800,
+      "wall_s": 239.7,
+      "reward": 19.08146858215332,
+      "episode_length": 968.90625,
+      "tracking_lin_vel": 392.9273681640625
+    },
+    {
+      "step": 55705600,
+      "wall_s": 420.0,
+      "reward": 20.903541564941406,
+      "episode_length": 970.328125,
+      "tracking_lin_vel": 432.82080078125
+    },
+    {
+      "step": 83558400,
+      "wall_s": 592.9,
+      "reward": 21.352581024169922,
+      "episode_length": 998.2734375,
+      "tracking_lin_vel": 421.49969482421875
+    },
+    {
+      "step": 111411200,
+      "wall_s": 763.0,
+      "reward": 22.31773567199707,
+      "episode_length": 995.1796875,
+      "tracking_lin_vel": 459.078369140625
+    },
+    {
+      "step": 139264000,
+      "wall_s": 933.0,
+      "reward": 22.924362182617188,
+      "episode_length": 994.8515625,
+      "tracking_lin_vel": 513.6273193359375
+    },
+    {
+      "step": 167116800,
+      "wall_s": 1102.5,
+      "reward": 22.424501419067383,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 546.84326171875
+    },
+    {
+      "step": 194969600,
+      "wall_s": 1270.6,
+      "reward": 23.720775604248047,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 665.88623046875
+    },
+    {
+      "step": 222822400,
+      "wall_s": 1438.4,
+      "reward": 25.310558319091797,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 778.658447265625
+    },
+    {
+      "step": 250675200,
+      "wall_s": 1607.4,
+      "reward": 25.905582427978516,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 855.0042114257812
+    },
+    {
+      "step": 278528000,
+      "wall_s": 1773.3,
+      "reward": 25.589874267578125,
+      "episode_length": 993.7890625,
+      "tracking_lin_vel": 846.9686279296875
+    },
+    {
+      "step": 306380800,
+      "wall_s": 1941.1,
+      "reward": 27.291982650756836,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 915.02880859375
+    }
+  ],
+  "obs": "local_linvel(3) gyro(3) gravity(3) q-default(n) qd(n) last_action(n) command(3)"
+}

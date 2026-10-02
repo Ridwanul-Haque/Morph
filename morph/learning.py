@@ -78,11 +78,13 @@ class Policy(nn.Module):
         return np.concatenate([a, [grip]]).astype(np.float32)
 
 
-def fit(policy: Policy, X: np.ndarray, Y: np.ndarray, epochs: int = 40, lr: float = 1e-3, seed: int = 0) -> list[float]:
+def fit(policy: Policy, X: np.ndarray, Y: np.ndarray, epochs: int = 40, lr: float = 1e-3, seed: int = 0,
+        renorm: bool = True) -> list[float]:
     torch.manual_seed(seed)
     X_t, Y_t = torch.as_tensor(X), torch.as_tensor(Y)
-    policy.mu.copy_(X_t.mean(0))
-    policy.sd.copy_(X_t.std(0) + 1e-3)
+    if renorm:  # fine-tuning keeps the pretrained normalisation so the old weights still mean the same thing
+        policy.mu.copy_(X_t.mean(0))
+        policy.sd.copy_(X_t.std(0) + 1e-3)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     n = len(X_t)
@@ -187,6 +189,29 @@ def train_dagger(kind: str, out_dir: Path, n_expert: int = 150, n_iter: int = 3,
             "wall_s": round(time.time() - t0, 1), "torch": torch.__version__}
     (out_dir / f"policy_{kind}.json").write_text(json.dumps(meta, indent=2))
     return policy, meta
+
+
+def adapt_policy(arm: ArmAdapter, base: Policy, seeds, n_iter: int = 3, n_per_iter: int = 25, epochs: int = 60,
+                 log=print) -> tuple[Policy, list]:
+    """Fine-tune a transferred task-space policy on a new body with DAgger: the transferred policy drives,
+    the skill layer (parameterised by this arm's own carry height etc.) labels every visited state.
+    Used when trials show the transferred policy's assumptions don't hold for the new body."""
+    policy = Policy(base.net[0].in_features, base.n_act)
+    policy.load_state_dict(base.state_dict())
+    seeds = iter(seeds)
+    X, Y, history = [], [], []
+    t0 = time.time()
+    for it in range(n_iter):
+        beta = 0.5 ** (it + 1)
+        Xn, Yn, st = collect(arm, "task", [next(seeds) for _ in range(n_per_iter)], policy, beta, noise=0.0)
+        X += Xn
+        Y += Yn
+        losses = fit(policy, np.array(X, np.float32), np.array(Y, np.float32), epochs=epochs, lr=3e-4, seed=it,
+                     renorm=False)
+        history.append({"iter": it + 1, "beta": beta, **st, "samples": len(X), "loss": losses[-1]})
+        log(f"  adapt iter {it + 1}: rollouts (beta={beta:.2f}) success {st['success']}/{st['episodes']}, "
+            f"{len(X)} samples, loss {losses[-1]:.4f}, {time.time() - t0:.0f}s")
+    return policy, history
 
 
 def load_policy(path: Path) -> Policy:

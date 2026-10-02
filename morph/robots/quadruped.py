@@ -69,9 +69,10 @@ class QuadrupedAdapter:
     kind = "legged"
 
     def __init__(self, block: BlockSpec | None = None, control_dt: float = 0.02, model: mujoco.MjModel | None = None,
-                 env: SimulationEnvironment | None = None):
-        """Default: Menagerie Go1 scene. Pass `model`/`env` to drive an existing Go1 scene (same joint,
-        site and actuator names), e.g. the learned-walking model; the caller manages the gains then."""
+                 env: SimulationEnvironment | None = None, legs=None, torso: str = "trunk"):
+        """Default: Menagerie Go1 scene. Pass `model`/`env` to drive an existing scene, e.g. a learned-walking
+        model; the caller manages the gains then. Pass `legs` (robots/legs.py) and `torso` for a robot
+        other than the Go1."""
         self.block = block or BlockSpec()
         if model is None:
             self.model = build_quadruped_model(self.block)
@@ -86,12 +87,17 @@ class QuadrupedAdapter:
         else:
             self.model, self.env = model, env
         m = self.model
-        self.trunk = m.body("trunk").id
+        self.trunk = m.body(torso).id
         self._free_q = m.jnt_qposadr[m.body_jntadr[self.trunk]]
         self._free_v = m.jnt_dofadr[m.body_jntadr[self.trunk]]
-        self._leg_q = np.array([m.joint(f"{l}_{j}_joint").qposadr[0] for l in LEGS for j in ("hip", "thigh", "calf")])
-        self.foot_geom = {l: m.geom(l).id for l in LEGS}
-        self.foot_site = {l: m.site(l).id for l in LEGS}
+        if legs is None:
+            from .legs import go1_geometry
+            legs = go1_geometry()
+            self._leg_q = np.array([m.joint(f"{l}_{j}_joint").qposadr[0] for l in LEGS for j in ("hip", "thigh", "calf")])
+        self.legs = legs
+        self.foot_geom = {l: m.geom(legs.foot_geom[l]).id for l in legs.legs}
+        self.foot_site = {l: m.site(legs.foot_site[l]).id for l in legs.legs}
+        self._foot_bodies = {m.body(m.geom_bodyid[g]).name for g in self.foot_geom.values()}
         self._robot_bodies = {b for b in range(m.nbody) if self._is_robot_body(b)}
         self.env.track_extra = lambda: self.env.data.qpos[self._free_q:self._free_q + 2]
 
@@ -169,11 +175,11 @@ class QuadrupedAdapter:
         return out
 
     def fallen(self) -> bool:
-        """Trunk low/tilted, or trunk/hip/thigh on the floor. The lower calf capsule ends 1 cm
-        above the foot sphere and may brush the floor while standing; that is not a fall."""
+        """Trunk low/tilted, or trunk/hip/thigh on the floor. The lower leg (the body carrying the foot)
+        ends just above the foot and may brush the floor while standing; that is not a fall."""
         b = self.base()
-        body_hits = [n for n in self.robot_floor_contacts() if not n.endswith("_calf")]
-        return b.pos[2] < 0.15 or b.tilt > math.radians(35) or bool(body_hits)
+        body_hits = [n for n in self.robot_floor_contacts() if n not in self._foot_bodies]
+        return b.pos[2] < 0.15 / 0.27 * self.legs.stand_height or b.tilt > math.radians(35) or bool(body_hits)
 
     # ---------------------------------------------------------------- control
     def ctrl_from_feet(self, feet: dict[str, np.ndarray]) -> np.ndarray | None:

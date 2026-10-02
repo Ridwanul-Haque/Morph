@@ -17,14 +17,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..geometry import rot2, wrap_angle
-from .quadruped import HIP, LEGS, L_ABD, SIDE, STAND_HEIGHT, QuadrupedAdapter, leg_ik
+from .quadruped import QuadrupedAdapter
 
 CRAWL_ORDER = ("RL", "FL", "RR", "FR")
 RIGHT_TURN_ORDER = ("RR", "FR", "RL", "FL")
-# Menagerie's softened foot contact rests with the sphere centre ~1 cm above the
-# floor (measured), not at its 2.3 cm radius; stance/landing targets use this.
-FOOT_Z = 0.006
-NOMINAL = {l: np.array([HIP[l][0], HIP[l][1] + L_ABD * SIDE[l]]) for l in LEGS}  # trunk frame xy
 
 
 def smooth(a: float) -> float:
@@ -47,15 +43,19 @@ class MotionLog:
 
 
 class Go1Controller:
-    def __init__(self, qa: QuadrupedAdapter, height: float = STAND_HEIGHT, render_every: int = 0,
+    def __init__(self, qa: QuadrupedAdapter, height: float | None = None, render_every: int = 0,
                  camera: str = "overview", on_tick=None):
+        """`qa.legs` (robots/legs.py) supplies the leg geometry: hand-written for the Go1, measured for
+        other quadrupeds. Go1 FOOT_Z: the softened foot contact rests with the sphere centre ~1 cm above
+        the floor (measured), not at its 2.3 cm radius; stance/landing targets use that."""
         self.qa = qa
+        self.g = g = qa.legs
         self.env = qa.env
-        self.h = height
+        self.h = g.stand_height if height is None else height
         b = qa.base()
         self.des = np.array([b.pos[0], b.pos[1], b.yaw])
-        self.feet_w = {l: qa.foot_world(l)[:2].copy() for l in LEGS}  # planted xy
-        self.feet_z = {l: FOOT_Z for l in LEGS}
+        self.feet_w = {l: qa.foot_world(l)[:2].copy() for l in g.legs}  # planted xy
+        self.feet_z = {l: g.foot_z for l in g.legs}
         # Chosen by a parameter sweep over margin, stance width, shift time and lead.
         self.max_lead = 0.04
         self.max_yaw_lead = 0.08
@@ -92,19 +92,19 @@ class Go1Controller:
     def _tick(self, swing: dict[str, np.ndarray] | None = None, stance_legs: list[str] | None = None) -> None:
         feet = {}
         frame = self._command_frame()
-        for l in LEGS:
+        for l in self.g.legs:
             if swing and l in swing:
                 p = swing[l]
                 feet[l] = self._trunk_frame(p[:2], p[2], frame)
             else:
                 feet[l] = self._trunk_frame(self.feet_w[l], self.feet_z[l], frame)
         ctrl = self.env.data.ctrl.copy()
-        for i, l in enumerate(LEGS):  # per-leg fallback: an unreachable target freezes only that leg
-            q = leg_ik(l, feet[l])
+        for l in self.g.legs:  # per-leg fallback: an unreachable target freezes only that leg
+            q = self.g.ik(l, feet[l])
             if q is None:
                 self.log.ik_failures += 1
             else:
-                ctrl[3 * i:3 * i + 3] = q
+                ctrl[self.g.ctrl_idx[l]] = q
         step = self.env.advance(ctrl)
         L = self.log
         L.ticks += 1
@@ -167,7 +167,7 @@ class Go1Controller:
     def _swing(self, leg: str, target_xy: np.ndarray, seconds: float = 0.5, height: float = 0.06,
                stance: list[str] | None = None) -> None:
         p0 = np.array([*self.feet_w[leg], self.feet_z[leg]])
-        p1 = np.array([target_xy[0], target_xy[1], FOOT_Z])
+        p1 = np.array([target_xy[0], target_xy[1], self.g.foot_z])
         n = max(1, int(seconds / self.env.control_dt))
         for k in range(1, n + 1):
             a = smooth(k / n)
@@ -178,12 +178,12 @@ class Go1Controller:
         for _ in range(4):
             self._tick(swing={leg: p1}, stance_legs=stance)
         self.feet_w[leg] = self.qa.foot_world(leg)[:2].copy()  # measured touchdown point
-        self.feet_z[leg] = FOOT_Z
+        self.feet_z[leg] = self.g.foot_z
         self.log.touchdowns.append({"leg": leg, "loaded": self._foot_loaded(leg)})
 
     # ----------------------------------------------------------- walking
     def nominal_foot(self, leg: str, base: np.ndarray) -> np.ndarray:
-        return base[:2] + rot2(base[2]) @ (NOMINAL[leg] + np.array([0.0, SIDE[leg] * self.width]))
+        return base[:2] + rot2(base[2]) @ (self.g.nominal[leg] + np.array([0.0, self.g.side[leg] * self.width]))
 
     def _shift_until_margin(self, stance: list[str], margin: float, timeout: float = 2.0, speed: float = 0.08) -> bool:
         """Move the desired trunk towards the support target until the measured CoM margin holds."""
@@ -204,13 +204,13 @@ class Go1Controller:
         return False
 
     def _step_leg(self, leg: str, target_xy: np.ndarray) -> bool:
-        stance = [l for l in LEGS if l != leg]
+        stance = [l for l in self.g.legs if l != leg]
         for margin in (self.margin, self.margin * 0.7):
             if self._shift_until_margin(stance, margin):
                 self._swing(leg, target_xy, seconds=self.swing_s, stance=stance)
                 return True
             self.log.aborted_steps += 1
-            centre = np.mean([self.feet_w[l] for l in LEGS], axis=0) - rot2(self.des[2]) @ np.mean(list(NOMINAL.values()), axis=0)
+            centre = np.mean([self.feet_w[l] for l in self.g.legs], axis=0) - rot2(self.des[2]) @ np.mean(list(self.g.nominal.values()), axis=0)
             self._shift_to(centre, self.des[2], 0.4, None)  # back to four-foot centre, then retry
         return False
 
@@ -265,6 +265,27 @@ class Go1Controller:
             self._shift_to(nxt[:2], nxt[2], 0.3, None)
         return False
 
+    def balance_shift(self, leg: str) -> float:
+        """How far (m) the body must move to balance on the other three feet as they are planted now."""
+        stance = [l for l in self.g.legs if l != leg]
+        return float(np.linalg.norm(self._support_target(stance, margin=0.05) - self.des[:2]))
+
+    def square_up(self, tol: float = 0.04) -> int:
+        """Step any foot more than `tol` from its standing spot back under the body, one at a time.
+        A learned gait can stop mid-stride (the Go2 stopped with a front foot 13 cm back and the rear feet
+        splayed; balancing on three of those feet carried the body so far back that the pushing foot
+        couldn't reach). Only worth it when the push is otherwise impossible: re-stepping a stance that
+        was fine cost the Go1 balance for nothing (2 falls in 16)."""
+        moved = 0
+        for leg in self.g.legs:
+            tgt = self.nominal_foot(leg, self.des)
+            if np.linalg.norm(tgt - self.feet_w[leg]) > tol:
+                self._step_leg(leg, tgt)
+                moved += 1
+                if self.log.fell:
+                    break
+        return moved
+
     # ----------------------------------------------------------- pushing
     def push(self, leg: str, contact_xy: np.ndarray, direction: float, distance: float, push_height: float = 0.035,
              speed: float = 0.06) -> dict:
@@ -272,22 +293,27 @@ class Go1Controller:
 
         Returns contact evidence. The contact must happen through collision: nothing is attached.
         """
-        stance = [l for l in LEGS if l != leg]
+        stance = [l for l in self.g.legs if l != leg]
         u = np.array([math.cos(direction), math.sin(direction)])
         start_contacts = len(self.log.block_contacts)
-        # Reach check from where the body actually stands: a foot target beyond the leg's reach freezes the
-        # leg against the object and then jumps when it becomes reachable again (this flipped narrow blocks).
-        frame = self._command_frame()
-        reach = lambda xy: leg_ik(leg, self._trunk_frame(np.asarray(xy), push_height, frame)) is not None  # noqa: E731
+        # The contact line must be in the leg's reach from where the body stands now AND from where it will
+        # stand after shifting over the three stance feet: a foot target beyond reach freezes the leg against
+        # the object and then jumps when it becomes reachable again (this flipped narrow blocks; the Go2 hit
+        # it when a big balance shift carried the body back). Checking only after the shift let through
+        # pushes that tipped the Go1 (3 falls in 16).
+        tgt = self._support_target(stance, margin=0.05)
+        frames = [self._command_frame(), (tgt, float(self.des[2]))]
+        reach = lambda xy: all(self.g.ik(leg, self._trunk_frame(np.asarray(xy), push_height, f)) is not None  # noqa: E731
+                               for f in frames)
         pre_ok = reach(np.asarray(contact_xy) - u * 0.05)
         full = distance
         while distance > 0.015 and not reach(np.asarray(contact_xy) + u * distance):
             distance -= 0.01
-        if not pre_ok or not reach(np.asarray(contact_xy) + u * distance):
+        if pre_ok and reach(np.asarray(contact_xy) + u * distance):
+            self._shift_to(tgt, self.des[2], 0.8, stance)
+        else:
             return {"foot_contact_ticks": 0, "max_force_n": 0.0, "other_contacts": [], "skipped": "contact line out of reach",
                     "planned_distance": full, "executed_distance": 0.0}
-        tgt = self._support_target(stance, margin=0.05)
-        self._shift_to(tgt, self.des[2], 0.8, stance)
         p0 = np.array([*self.feet_w[leg], self.feet_z[leg]])
         pre = contact_xy - u * 0.05
         seq = []
@@ -324,10 +350,11 @@ class Go1Controller:
                 break
         # put the foot back at its nominal place
         self._swing(leg, self.nominal_foot(leg, self.des), stance=stance)
-        centre = np.mean([self.feet_w[l] for l in LEGS], axis=0) - rot2(self.des[2]) @ np.mean(list(NOMINAL.values()), axis=0)
+        centre = np.mean([self.feet_w[l] for l in self.g.legs], axis=0) - rot2(self.des[2]) @ np.mean(list(self.g.nominal.values()), axis=0)
         self._shift_to(centre, self.des[2], 0.3, None)
         cs = self.log.block_contacts[start_contacts:]
-        foot = [c for c in cs if c["geom"] == leg]
+        fg = self.g.foot_geom[leg]
+        foot = [c for c in cs if c["geom"] == fg]
         return {"foot_contact_ticks": len({c["t"] for c in foot}), "max_force_n": max([c["force_n"] for c in foot], default=0.0),
-                "other_contacts": sorted({c["body"] for c in cs if c["geom"] != leg}),
+                "other_contacts": sorted({c["body"] for c in cs if c["geom"] != fg}),
                 "planned_distance": full, "executed_distance": round(distance, 3)}

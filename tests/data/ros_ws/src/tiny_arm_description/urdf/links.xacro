@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="box_link" params="name sx sy sz mass:=0.6">
+    <link name="${name}">
+      <visual><origin xyz="0 0 ${sz/2}"/><geometry><box size="${sx} ${sy} ${sz}"/></geometry></visual>
+      <collision><origin xyz="0 0 ${sz/2}"/><geometry><box size="${sx} ${sy} ${sz}"/></geometry></collision>
+      <inertial><origin xyz="0 0 ${sz/2}"/><mass value="${mass}"/><inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/></inertial>
+    </link>
+  </xacro:macro>
+  <xacro:macro name="rev" params="name parent child z axis">
+    <joint name="${name}" type="revolute"><parent link="${parent}"/><child link="${child}"/><origin xyz="0 0 ${z}"/>
+      <axis xyz="${axis}"/><limit lower="-3.1" upper="3.1" effort="${effort}" velocity="3"/></joint>
+  </xacro:macro>
+</robot>

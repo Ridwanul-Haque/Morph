@@ -41,7 +41,7 @@ class PushModel:
         xml = f"""<mujoco><option timestep="{TIMESTEP}" integrator="implicitfast" cone="elliptic" impratio="10"/>
 <worldbody><geom name="floor" type="plane" size="0 0 0.05" friction="{FLOOR_FRICTION} 0.005 0.0001"/>
 <body name="goal" mocap="true"/>
-{_block_xml(BlockSpec(block.half_x, block.half_y, block.half_z, mass, friction))}
+{_block_xml(BlockSpec(block.half_x, block.half_y, block.half_z, mass, friction, fixtures_xml=block.fixtures_xml))}
 <body name="pusher" mocap="true" pos="5 5 {push_height}"><geom type="sphere" size="{FOOT_R}" friction="0.8 0.02 0.01"/></body>
 </worldbody></mujoco>"""
         self.m = mujoco.MjModel.from_xml_string(xml)
@@ -86,8 +86,10 @@ class PushModel:
 def plan_push(model: PushModel, block: tuple[float, float, float], goal: tuple[float, float, float],
               robot_pose: tuple | None = None, pose_fn=None, yaw_weight: float = 0.12, offsets=(-0.03, -0.015, 0.0, 0.015, 0.03),
               distances=(0.04, 0.08, 0.14), yaw_matters: bool = True,
-              max_heading_change: float | None = None) -> tuple[PushCandidate, list[PushCandidate]]:
-    """Evaluate all candidates with the planning model; return the best and the full ranked list."""
+              max_heading_change: float | None = None, pose_ok=None) -> tuple[PushCandidate, list[PushCandidate]]:
+    """Evaluate all candidates with the planning model; return the best and the full ranked list.
+    pose_ok(x, y, yaw): optional check that the robot can stand at a candidate's push pose (e.g. not on
+    top of a fixture in a user's scene)."""
     bx, by, byaw = block
     cands = []
     for face in range(4):
@@ -100,6 +102,8 @@ def plan_push(model: PushModel, block: tuple[float, float, float], goal: tuple[f
             if max_heading_change is not None and robot_pose is not None and \
                     abs(wrap_angle(heading - robot_pose[2])) > max_heading_change:
                 continue  # keep repositioning within what the gait does reliably
+            if pose_ok is not None and pose_fn is not None and not pose_ok(*pose_fn((float(c0[0]), float(c0[1])), heading)):
+                continue
             for dist in distances:
                 cand = PushCandidate(face, off, dist, heading, (float(c0[0]), float(c0[1])))
                 px, py, pyaw = model.predict(bx, by, byaw, cand)
@@ -113,7 +117,7 @@ def plan_push(model: PushModel, block: tuple[float, float, float], goal: tuple[f
                 cand.cost = pos + yaw_weight * yerr + reposition
                 cands.append(cand)
     if not cands and max_heading_change is not None:  # nothing within the heading window: relax it
-        return plan_push(model, block, goal, robot_pose, pose_fn, yaw_weight, offsets, distances, yaw_matters, None)
+        return plan_push(model, block, goal, robot_pose, pose_fn, yaw_weight, offsets, distances, yaw_matters, None, pose_ok)
     if not cands:
         raise ValueError("no feasible push candidate")
     cands.sort(key=lambda c: c.cost)

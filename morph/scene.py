@@ -33,9 +33,12 @@ class BlockSpec:
     half_z: float = 0.03
     mass: float = 0.2
     friction: float = 0.6
+    # Static things from a user's scene (bins, platforms, walls), as world-frame MJCF bodies. They go
+    # wherever the block goes, so every robot's scene and the push planner's model contain them.
+    fixtures_xml: str = ""
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        return {k: v for k, v in asdict(self).items() if k != "fixtures_xml"}
 
 
 @dataclass(frozen=True)
@@ -100,7 +103,7 @@ def _block_xml(block: BlockSpec) -> str:
       <geom type="box" size="0.0006 {hy * 0.9} {hz * 0.9}" pos="{hx + 0.0006} 0 0"
             contype="0" conaffinity="0" mass="0" rgba="0.8 0.1 0.1 1"/>
       <site name="block_center" pos="0 0 0" size="0.005"/>
-    </body>"""
+    </body>{block.fixtures_xml}"""
 
 
 def _goal_xml() -> str:

@@ -1,0 +1,18 @@
+# A small work cell: a parcel, a bin, a shelf and a wall (scene.xml). Say what should happen to the
+# parcel in words, show it with a recording, or both:
+#
+#   morph do examples/parcel                                         # the [task] below
+#   morph do examples/parcel "put the parcel on the shelf facing north"
+#   morph do examples/parcel --demo examples/parcel/demo_panda.npz --robot <model.xml>
+#
+# demo_panda.npz is the parcel's path when a Panda put it in the bin, turned to face west. It holds
+# only the object's poses, so any robot can be asked to reproduce it.
+
+[project]
+name = "parcel"
+scene = "scene.xml"
+object = "parcel"
+robot = "../../third_party/mujoco_menagerie/franka_emika_panda/panda.xml"
+
+[task]
+description = "put the parcel into the bin"

@@ -40,9 +40,12 @@ class MenagerieArmConfig:
     aperture_closed: float
     home_q: tuple
     base_pos: tuple = (0.0, 0.0, 0.0)
+    base_yaw: float = 0.0  # which way the base is turned (radians); 0 = as in the model file
     gripper_gain_scale: float = 1.0  # stiffer gripper servo (force limit unchanged)
     color_note: str = ""
     notes: list = field(default_factory=list)
+    tcp_quat: tuple = (1.0, 0.0, 0.0, 0.0)  # tool frame in tcp_body: +z approach, +y finger closing axis
+    lead_scale: tuple = (5.0, 7.0)  # servo speed calibration (position, yaw)
 
 
 PANDA = MenagerieArmConfig(
@@ -75,6 +78,7 @@ MENAGERIE_ARMS = {"franka_panda": PANDA, "ufactory_xarm7": XARM7}
 
 
 def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujoco.MjModel:
+    from ..introspect import floor_offset  # the base rests on the floor whatever the file's origin
     path = MENAGERIE / cfg.xml
     if not path.exists():
         raise FileNotFoundError(f"{path} missing; run scripts/fetch_assets.sh")
@@ -83,7 +87,8 @@ def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujo
     for body in robot.bodies:  # real arm controllers compensate gravity; do the same here
         body.gravcomp = 1.0
     tcp = robot.body(cfg.tcp_body)
-    tcp.add_site(name="tcp", pos=list(cfg.tcp_pos), size=[0.006, 0, 0], rgba=[1, 0, 0, 1], group=4)
+    tcp.add_site(name="tcp", pos=list(cfg.tcp_pos), quat=list(cfg.tcp_quat), size=[0.006, 0, 0], rgba=[1, 0, 0, 1],
+                 group=4)
     scene = mujoco.MjSpec.from_string(f"""<mujoco model="morph_{cfg.name}">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{TIMESTEP}" integrator="implicit" cone="elliptic" impratio="10" noslip_iterations="4"/>
@@ -95,7 +100,8 @@ def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujo
     <camera name="top" pos="0.45 0.0 1.5" xyaxes="1 0 0 0 1 0"/>
     {_goal_xml()}
     {_block_xml(block)}
-    <frame name="mount" pos="{cfg.base_pos[0]} {cfg.base_pos[1]} {cfg.base_pos[2]}"/>
+    <frame name="mount" pos="{cfg.base_pos[0]} {cfg.base_pos[1]} {cfg.base_pos[2] + floor_offset(path)}"
+           quat="{math.cos(cfg.base_yaw / 2)} 0 0 {math.sin(cfg.base_yaw / 2)}"/>
   </worldbody>
 </mujoco>""")
     scene.worldbody.frames[0].attach_body(robot.body(cfg.root_body), "", "")
@@ -157,7 +163,7 @@ class MenagerieArmAdapter:
         self.q_lo, self.q_hi = self._lo, self._hi
         # Measured: Menagerie joint servos move ~17% of a position lead and ~10-16% of a yaw lead per
         # 20 ms tick (vs ~100% for our generated arms); scale the lead so a task-space action means the same speed.
-        self.lead_scale = (5.0, 7.0)
+        self.lead_scale = tuple(cfg.lead_scale)
         self._fingers_q = [m.joint(j).qposadr[0] for j in ("finger_joint1", "finger_joint2")] \
             if cfg.name == "franka_panda" else []
 
@@ -200,6 +206,20 @@ class MenagerieArmAdapter:
         ok = np.linalg.norm(tcp - d.site_xpos[self._site]) < 2e-3 and \
             np.linalg.norm(_rotvec(Rd @ d.site_xmat[self._site].reshape(3, 3).T)) < 2e-2
         return q if ok else None
+
+    def ik_reconfigure(self, tcp: np.ndarray, hand_yaw: float, tries: int = 12) -> np.ndarray | None:
+        """IK from scattered starting postures, for when the arm's current posture can't reach the
+        pose continuously (e.g. a 6-DOF wrist that needs to swap elbow/wrist branches mid-carry).
+        Returns the solution nearest the current joints."""
+        if getattr(self, "_seeds", None) is None:  # fixed seeds, so consecutive ticks agree on a posture
+            rng = np.random.default_rng(0)
+            self._seeds = [rng.uniform(self._lo, self._hi) for _ in range(tries)]
+        q_now, best = self.q(), None
+        for q0 in [self.home_q] + self._seeds:
+            q = self.ik(tcp, hand_yaw, q0=q0, iters=120)
+            if q is not None and (best is None or np.linalg.norm(q - q_now) < np.linalg.norm(best - q_now)):
+                best = q
+        return best
 
     # --------------------------------------------------------------- state io
     def q(self) -> np.ndarray:
@@ -251,26 +271,45 @@ class MenagerieArmAdapter:
         key = (round(block_xy[0], 2), round(block_xy[1], 2), round(block_yaw, 1), round(goal_xy[0], 2),
                round(goal_xy[1], 2), round(delta, 1))
         if key in self._axis_cache:
-            return self._axis_cache[key]
+            best, self.turn_dir = self._axis_cache[key]
+            return best
         from ..arm_skills import TRAVEL_Z
+        tz = getattr(self, "travel_z", TRAVEL_Z)
         best, best_cost = None, 1e9
         for k in range(4):
             h0 = block_yaw + k * math.pi / 2
-            q_a = self.ik(np.array([block_xy[0], block_xy[1], TRAVEL_Z]), h0, q0=self.home_q)
-            q_b = self.ik(np.array([goal_xy[0], goal_xy[1], TRAVEL_Z]), h0 + delta, q0=q_a if q_a is not None else self.home_q)
+            q_a = self.ik(np.array([block_xy[0], block_xy[1], tz]), h0, q0=self.home_q)
+            q_b = self.ik(np.array([goal_xy[0], goal_xy[1], tz]), h0 + delta, q0=q_a if q_a is not None else self.home_q)
             if q_a is None or q_b is None:
                 continue
-            cost = abs(wrap_angle(h0 - hand_yaw)) + 0.3 * float(np.max(np.abs(q_b - q_a)))
+            # a pose parked on a joint stop leaves no room to finish the turn if the block slips a bit
+            margin = min(np.min(q - self._lo) for q in (q_a, q_b)), min(np.min(self._hi - q) for q in (q_a, q_b))
+            cost = abs(wrap_angle(h0 - hand_yaw)) + 0.3 * float(np.max(np.abs(q_b - q_a))) + (2.0 if min(margin) < 0.1 else 0.0)
             if cost < best_cost:
-                best, best_cost = h0, cost
+                best, best_cost, qs = h0, cost, (q_a, q_b)
+        # Which way round to turn: for a near half-turn "the short way" is a coin toss, and one way can run
+        # the wrist into its stop (the Panda failed 5 of 6 half-turns). Follow the way the joints go from
+        # the grasp pose to the place pose.
+        self.turn_dir = 0
         if best is None:
             best = block_yaw + round(wrap_angle(hand_yaw - block_yaw) / (math.pi / 2)) * math.pi / 2
-        self._axis_cache[key] = best
+        elif abs(delta) > math.radians(100):
+            ya = self._yaw_of(self.fk(qs[0])[1])
+            ym = self._yaw_of(self.fk(qs[0] + 0.25 * (qs[1] - qs[0]))[1])
+            self.turn_dir = int(np.sign(wrap_angle(ym - ya)))
+        self._axis_cache[key] = (best, self.turn_dir)
         return best
+
+    @staticmethod
+    def _yaw_of(R: np.ndarray) -> float:
+        return math.atan2(R[1, 1], R[0, 1])
 
     def reach_ok(self, x: float, y: float) -> bool:
         from ..arm_skills import GRASP_Z, TRAVEL_Z
-        return all(self.ik(np.array([x, y, z]), 0.0, q0=self.home_q) is not None for z in (GRASP_Z, TRAVEL_Z))
+        tz = getattr(self, "travel_z", TRAVEL_Z)
+        b = self.cfg.base_yaw  # a turned base reaches most naturally with the hand turned the same way
+        return any(all(self.ik(np.array([x, y, z]), yaw, q0=self.home_q) is not None for z in (GRASP_Z, tz))
+                   for yaw in dict.fromkeys((0.0, b, b + math.pi / 2, b - math.pi / 2)))
 
     def workspace(self) -> dict:
         rs = np.linspace(0.15, 1.0, 60)

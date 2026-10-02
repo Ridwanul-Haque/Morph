@@ -45,6 +45,10 @@ class ArmState:
     block: np.ndarray  # x, y, z, yaw
     goal: np.ndarray  # x, y, yaw
     grasp_yaw: float  # the arm skill layer's chosen closing-axis heading for this block/goal
+    travel_z: float = TRAVEL_Z  # carry height; small arms get a lower one (see auto_arm)
+    rest_z: float = 0.03  # object centre height once set down at the goal (floor, shelf top, bin floor)
+    turn_dir: int = 0  # +1 / -1: which way to turn the object for big heading changes (0 = the short way)
+    block_tilt: float = 0.0  # rad
 
 
 def read_state(arm, spec: TaskSpec) -> ArmState:
@@ -55,9 +59,13 @@ def read_state(arm, spec: TaskSpec) -> ArmState:
     # Holding = both finger sides touching the block, OR the block is off the floor, centred between
     # partly-closed fingers. The second clause removes one-tick contact flicker (seen on the xArm7
     # and Panda pads) that otherwise made the skill "let go" in mid-air. Memoryless by design.
-    between = math.hypot(tcp[0] - p.x, tcp[1] - p.y) < 0.02 and abs(tcp[2] - p.z - 0.01) < 0.02
+    # (xy within the object's footprint: it can slide along the fingers, see expert_action's `aloft`)
+    between = math.hypot(tcp[0] - p.x, tcp[1] - p.y) < 0.035 and abs(tcp[2] - p.z - 0.01) < 0.02
     holding = bool(arm.gripping() or (between and p.z > 0.036 and ap < 0.9))
+    rest_z = getattr(getattr(arm, "block", None), "half_z", 0.03) + float(spec.goal.support_z.value)
     return ArmState(tcp=tcp, hand_yaw=hy, aperture=ap, gripping=holding, q=arm.q(),
+                    travel_z=getattr(arm, "travel_z", TRAVEL_Z), rest_z=rest_z, turn_dir=getattr(arm, "turn_dir", 0),
+                    block_tilt=float(p.tilt),
                     block=np.array([p.x, p.y, p.z, p.yaw]), goal=np.array([spec.gx, spec.gy, spec.gyaw]), grasp_yaw=gy)
 
 
@@ -92,21 +100,30 @@ def expert_action(s: ArmState, p: ExpertParams = ExpertParams()) -> tuple[np.nda
     bx, by, bz, byaw = s.block
     gx, gy, gyaw = s.goal
     tcp = s.tcp
+    TZ = s.travel_z
     goal_err = math.hypot(bx - gx, by - gy)
     yaw_goal_err = wrap_angle(gyaw - byaw)
-    on_floor = bz < 0.034
+    if s.turn_dir and abs(yaw_goal_err) > math.radians(120) and np.sign(yaw_goal_err) != s.turn_dir:
+        yaw_goal_err -= math.copysign(2 * math.pi, yaw_goal_err)  # the long way round is the one the wrist can do
+    on_floor = bz < s.rest_z + 0.004  # set down on its target surface (the floor for most tasks)
+    drop = s.rest_z - 0.03  # how much higher than the floor the object is set down
     in_hand = math.hypot(tcp[0] - bx, tcp[1] - by) < 0.02 and abs(tcp[2] - bz - 0.01) < 0.015
-    gripping = in_hand and s.gripping
+    # Up in the air, a heavy object can slide down or along the fingers while turning; that isn't a drop,
+    # and deciding it is opens the hand mid-air. Only while it's still level: one that is pivoting in the
+    # grip is better set down and picked up again than carried to the goal and placed on its side.
+    aloft = bz > s.rest_z + 0.02 and s.block_tilt < math.radians(8) and math.hypot(tcp[0] - bx, tcp[1] - by) < 0.035 \
+        and 0 < tcp[2] - bz < 0.04
+    gripping = (in_hand or aloft) and s.gripping
     dyaw = 0.0
     close = False
 
     if on_floor and goal_err < p.placed_pos_tol and abs(yaw_goal_err) < p.placed_yaw_tol and not (
-            gripping and tcp[2] > GRASP_Z + 0.01):
+            gripping and tcp[2] > GRASP_Z + drop + 0.01):
         phase = "release_retreat"
-        target = np.array([bx, by, TRAVEL_Z + 0.05]) if s.aperture > 0.8 else tcp.copy()
+        target = np.array([bx, by, TZ + 0.05]) if s.aperture > 0.8 else tcp.copy()
     elif gripping:
         close = True
-        descending = tcp[2] < TRAVEL_Z - 0.015  # hysteresis: once lowering, accept looser alignment
+        descending = tcp[2] < TZ - 0.015  # hysteresis: once lowering, accept looser alignment
         pos_tol = 0.012 if descending else p.carry_pos_tol
         yaw_tol = math.radians(4) if descending else p.carry_yaw_tol
         over_goal = goal_err < pos_tol and abs(yaw_goal_err) < yaw_tol
@@ -116,11 +133,11 @@ def expert_action(s: ArmState, p: ExpertParams = ExpertParams()) -> tuple[np.nda
             clear = float(np.clip((tcp[2] - GRASP_Z - 0.02) / 0.06, 0.0, 1.0))
             phase = "lift" if clear < 1.0 else "transport"
             dyaw = yaw_goal_err * clear
-            target = np.array([tcp[0] + (gx - bx) * clear, tcp[1] + (gy - by) * clear, TRAVEL_Z])
+            target = np.array([tcp[0] + (gx - bx) * clear, tcp[1] + (gy - by) * clear, TZ])
         else:
             phase = "lower"
-            # Lower until the *block* reaches the floor, whatever its offset in the grip.
-            target = np.array([tcp[0] + gx - bx, tcp[1] + gy - by, tcp[2] - (bz - 0.03) - 0.002])
+            # Lower until the *block* reaches its resting height, whatever its offset in the grip.
+            target = np.array([tcp[0] + gx - bx, tcp[1] + gy - by, tcp[2] - (bz - s.rest_z) - 0.002])
             dyaw = yaw_goal_err
     else:
         e = wrap_angle(s.grasp_yaw - s.hand_yaw)
@@ -131,12 +148,12 @@ def expert_action(s: ArmState, p: ExpertParams = ExpertParams()) -> tuple[np.nda
             close = True
             target = tcp.copy()
         elif xy_err > 0.012 or abs(e) > math.radians(3):
-            if tcp[2] < TRAVEL_Z - 0.02 and xy_err > 0.03:
+            if tcp[2] < TZ - 0.02 and xy_err > 0.03:
                 phase = "raise"
-                target = np.array([tcp[0], tcp[1], TRAVEL_Z])
+                target = np.array([tcp[0], tcp[1], TZ])
             else:
                 phase = "approach"
-                target = np.array([bx, by, TRAVEL_Z])
+                target = np.array([bx, by, TZ])
         elif s.aperture < 0.8:  # wait for the fingers to open before descending over the block
             phase = "open"
             target = tcp.copy()
@@ -158,10 +175,25 @@ def apply_task_action(arm, s: ArmState, a: np.ndarray, stats: ExecStats) -> np.n
     """Task-space action -> this arm's joint targets through its own IK."""
     a = np.clip(a, -1, 1)
     ps, ys = getattr(arm, "lead_scale", (1.0, 1.0))  # per-robot servo calibration (adapter property)
-    tgt = s.tcp + a[:3] * MAX_STEP * ps
-    tgt[2] = max(tgt[2], GRASP_Z - 0.01)  # floor guard
     yaw = s.hand_yaw + a[3] * MAX_DYAW * ys
-    q = arm.ik(tgt, yaw)
+    q = None
+    # The lead can overshoot the edge of a small arm's workspace; shorten it before giving up.
+    for shrink in (1.0, 0.5, 0.25):
+        tgt = s.tcp + a[:3] * MAX_STEP * max(ps * shrink, 1.0)
+        tgt[2] = min(max(tgt[2], GRASP_Z - 0.01), s.travel_z + 0.05)  # floor guard / reachable height
+        q = arm.ik(tgt, yaw)
+        if q is not None:
+            break
+    if q is None and hasattr(arm, "ik_reconfigure") and getattr(arm, "_reconf_wait", 0) <= 0:
+        # stuck on the wrong joint branch: head for another posture that reaches it, a bit per tick.
+        # The search is expensive, so after it finds nothing wait a while before trying again.
+        q = arm.ik_reconfigure(tgt, yaw)
+        if q is not None:
+            q = s.q + np.clip(q - s.q, -2 * MAX_DQ, 2 * MAX_DQ)
+        else:
+            arm._reconf_wait = 25
+    elif q is None and hasattr(arm, "ik_reconfigure"):
+        arm._reconf_wait -= 1
     if q is None:
         stats.ik_failures += 1
         q = s.q
@@ -256,11 +288,12 @@ def run_episode(arm: ArmAdapter, spec: TaskSpec, policy, mode: str = "task", max
                               "block": bp.as_dict()})
         if render_every and t % render_every == 0:
             res.frames.append(arm.env.render(camera))
-        if stop_when_done and phase == "release_retreat" and s.tcp[2] > TRAVEL_Z:
+        if stop_when_done and phase == "release_retreat" and s.tcp[2] > s.travel_z:
             done_ticks += 1
             if done_ticks > 5:
                 break
     res.sim_time = float(arm.env.data.time)
     res.ik_failures = stats.ik_failures
-    res.outcome = evaluate(spec, arm.env.block_pose(), arm.env.block_speed(), released(arm))
+    res.outcome = evaluate(spec, arm.env.block_pose(), arm.env.block_speed(), released(arm),
+                           half_z=getattr(getattr(arm, "block", None), "half_z", 0.03))
     return res
