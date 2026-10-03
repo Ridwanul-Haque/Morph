@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, ValidationError
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 PROMPT_VERSION = "morph.prompts/1"
-MAX_PROMPT_CHARS = 12_000
+MAX_PROMPT_CHARS = 30_000  # write_program sends earlier attempts with their step-by-step results
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -107,6 +107,16 @@ class SkillStepsProposal(BaseModel):
     rationale: str = Field(default="", max_length=1200)
 
 
+class StepCandidates(BaseModel):
+    candidates: list[dict] = Field(default_factory=list, max_length=4)  # each: {"idea", "steps": [...]}
+    rationale: str = Field(default="", max_length=1500)
+
+
+class ProgramProposal(BaseModel):
+    steps: list[dict] = Field(default_factory=list, max_length=20)
+    rationale: str = Field(default="", max_length=1500)
+
+
 class Diagnosis(BaseModel):
     failure_class: Literal["wrong_goal", "unreachable", "grasp_lost", "tipped_object", "insufficient_progress",
                            "yaw_not_controlled", "overshoot", "timeout", "robot_instability", "other"]
@@ -141,7 +151,7 @@ class InferenceRecord:
 
 class ReasoningService:
     def __init__(self, log_path: Path | None = None, model: str | None = None, base_url: str | None = None,
-                 timeout_s: float = 90.0, max_retries: int = 2, max_tokens: int = 2500):
+                 timeout_s: float = 120.0, max_retries: int = 2, max_tokens: int = 6000):
         load_dotenv()
         self._key = os.environ.get("NEBIUS_API_KEY", "").strip()
         self.model = model or os.environ.get("MORPH_NEMOTRON_MODEL", DEFAULT_MODEL)
@@ -431,6 +441,84 @@ class ReasoningService:
             payload["fix_these"] = fix  # the previous answer and what Morph couldn't read in it
         user = json.dumps(payload, indent=1, default=str)
         return self._chat("skill_steps", system, user, SkillStepsProposal)
+
+    def revise_steps(self, robot: dict, goal: list[str], steps: list[dict], diagnosis: dict, scales: dict,
+                     rounds: list[dict], fix: dict | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
+        system = (
+            "You coach a robot that is learning a task by trial and error in simulation (reinforcement learning). It "
+            "is rewarded for reaching each step of a plan in order, and for getting closer to the current step. You get "
+            "the current steps and measurements of what the trained robot actually does: which step it gets stuck on, "
+            "how close it comes, the range of each quantity in that step while it tries, how close its end parts get "
+            "to the object, how well it grips and lifts. Rewrite the steps so it can make progress from where it is, "
+            "the way a coach breaks a skill down: split the step it is stuck on into smaller ones it can almost do "
+            "already (e.g. first get a fingertip or foot within a few cm of the object's surface, then get two tips on "
+            "opposite sides, then close, then lift), loosen thresholds it never gets near, and prefer graded "
+            "quantities (touch_dist, grip from 0 to 1, lifted, distances, angles; grip is about 0.25 with the open hand around it, "
+            "about 0.6 with the hand closed on it, and 1 once it is really held and lifted; closure is 0..1, how far the "
+            "gripper is commanded shut) over yes/no ones like held, which "
+            "give it no hint until it is done. Keep the steps it already passes. Think about THIS body: grippers "
+            "close on things; legs walk and a foot pushes while the body stays level; an arm with no gripper pushes "
+            "or tips. done_when is a boolean formula over these quantities: x, y, z, bottom, top, tilt_deg, yaw_deg, "
+            "speed, vx, vy, vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), "
+            "robot_x, robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; functions abs, min, max, "
+            "sqrt, hypot; Python syntax (and, or, not). 2 to 6 steps; the goal checklist is checked after them. "
+            "Reply with ONLY one JSON object: {\"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", "
+            "\"done_when\", \"keep\"}], \"rationale\": what you changed and why, from the measurements}."
+        )
+        payload = {"robot": robot, "goal_checklist": goal, "current_steps": steps, "measured": diagnosis,
+                   "realistic_scales": scales, "earlier_rounds": [{k: v for k, v in r.items() if k != "diagnosis"}
+                                                                  for r in rounds[:-1]]}
+        if fix:
+            payload["fix_these"] = fix
+        user = json.dumps(payload, separators=(",", ":"), default=str)
+        return self._chat("revise_steps", system, user, SkillStepsProposal)
+
+    def step_candidates(self, robot: dict, goal: list[str], steps: list[dict], diagnosis: dict, scales: dict,
+                        rounds: list[dict], k: int = 3, fix: dict | None = None) -> tuple[StepCandidates, InferenceRecord]:
+        """Several different revisions at once (Eureka-style search): Morph trains each briefly and keeps the best."""
+        system = (
+            f"You coach a robot that is learning a task by trial and error in simulation. Propose {k} DIFFERENT revised "
+            "step plans, each built on a different idea about why it is stuck (e.g. a smaller first step, a different "
+            "approach direction, a graded intermediate condition, loosening a threshold it never reaches, a different "
+            "body part). Morph will train each briefly and keep whichever works best, so make them genuinely "
+            "different rather than small variations. Rules for every plan are the same as for a single revision: "
+            "2 to 6 steps, done_when is a boolean formula over: x, y, z, bottom, top, tilt_deg, yaw_deg, speed, vx, vy, "
+            "vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), robot_x, "
+            "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; abs, min, max, sqrt, hypot; Python "
+            "syntax. grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
+            "how far the gripper is commanded shut. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
+            "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}]}], "
+            "\"rationale\": what the measurements suggest}."
+        )
+        payload = {"robot": robot, "goal_checklist": goal, "current_steps": steps, "measured": diagnosis,
+                   "realistic_scales": scales, "earlier_rounds": [{k2: v for k2, v in r.items() if k2 != "diagnosis"}
+                                                                  for r in rounds[:-1]]}
+        if fix:
+            payload["fix_these"] = fix
+        return self._chat("step_candidates", system, json.dumps(payload, separators=(",", ":"), default=str), StepCandidates)
+
+    def write_program(self, robot: dict, goal: list[str], scene: dict, facts: dict, blocks: str,
+                      attempts: list[dict]) -> tuple[ProgramProposal, InferenceRecord]:
+        system = (
+            "You are the motion-programming module of Morph. Write a short program that makes THIS robot reach the goal "
+            "in a physics simulation, using only these building blocks: " + blocks + " Think like a person doing the "
+            "task without thinking about it, and for this body: open the hand before reaching for something; come down "
+            "onto it from above, lined up with its sides; close the hand before lifting; lift clear of anything it has "
+            "to pass over before moving across; move slowly for the last few cm when placing or touching; set things "
+            "down before letting go, unless the goal is to throw or drop it (then let go with release_at while the "
+            "hand is moving fast towards the target, or above it). Use the facts given (where the arm stands, how far "
+            "it reaches, the lowest the hand can go, the object's size, the fixtures' positions) to pick reachable, "
+            "concrete numbers; use formulas such as obj_x or obj_top + 0.05 where it should follow the object. "
+            "The checklist is judged only at the end of the run (and at release for 'when it lets go' items), after "
+            "the object settles. If earlier attempts are given, read exactly what happened in each step and fix the "
+            "cause (e.g. a hand that stopped short is out of reach: choose another point; fingers that closed on "
+            "nothing were not around the object: check its height); never repeat a program that failed. Reply with "
+            "ONLY one JSON object: {\"steps\": [{\"do\": \"move_hand\", \"x\": ..., ...}, {\"do\": \"close_hand\"}, ...], "
+            "\"rationale\": what each part is for, and what you changed from the last attempt}."
+        )
+        user = json.dumps({"robot": robot, "goal_checklist": goal, "scene": scene, "facts": facts,
+                           "earlier_attempts": attempts[-3:]}, separators=(",", ":"), default=str)
+        return self._chat("write_program", system, user, ProgramProposal)
 
     def diagnose(self, failure_report: dict, revision_space: dict) -> tuple[Diagnosis, InferenceRecord]:
         system = (

@@ -88,7 +88,7 @@ class MorphPolicy:
         self.target = np.array(self.spec["target"][:3])
         self.tyaw = self.spec["target"][3]
         self.floating = ix["base"] >= 0
-        self.max_step = self.spec["max_step"] * min(max(speed_scale, 0.05), 1.0)
+        self.max_step = np.asarray(self.spec["max_step"]) * min(max(speed_scale, 0.05), 1.0)
         # input frame -> scene frame: a bolted-down robot's base sits at the training mount
         mx, my, myaw = self.spec["mount"]
         self.to_scene = Frame2D(*scene_origin).inverse() if self.floating else Frame2D(mx, my, myaw)
@@ -160,7 +160,7 @@ class MorphPolicy:
         if self.ctrl is None:
             self.ctrl = np.clip(self.d.actuator_length * self.mask, self.lo, self.hi)
         self.last = self.act(self.observation())
-        want = np.clip(self.q0 + self.last * self.spec["action_scale"], self.lo, self.hi)
+        want = np.clip(self.q0 + self.last * np.asarray(self.spec["action_scale"]), self.lo, self.hi)
         self.ctrl = self.ctrl + np.clip(want - self.ctrl, -self.max_step, self.max_step)
         return self.ctrl.copy()
 
@@ -578,7 +578,7 @@ def write_ros2_package(export_dir: Path, policy: dict, goal_text: str) -> Path:
     # position:   std_msgs/Float64MultiArray to a forward_position_controller (e.g. /forward_position_controller/commands)
     command_mode: trajectory
     command_topic: /joint_trajectory_controller/joint_trajectory
-    # 1.0 = joint targets move at most {policy['max_step']} rad per {policy['control_dt']} s step, as trained. Start lower on hardware.
+    # 1.0 = commands move at most as fast as in training (policy.json max_step, per actuator). Start lower on hardware.
     speed_scale: 1.0
     # stop after this many seconds (0 = 1.5 x the {policy['episode_s']:.0f} s training episode); publish true on /morph_policy/enable to rerun
     max_duration: 0.0
@@ -611,8 +611,8 @@ ros2 topic echo /morph_policy/status            # running, distance to the goal
 
 The node rebuilds exactly what the policy saw in training (joint angles and speeds, the object relative to
 the goal, the robot's end parts relative to the object via forward kinematics on the training model) and
-runs it at {1 / policy['control_dt']:.0f} Hz. Joint targets move smoothly (at most {policy['max_step']} rad per step times
-`speed_scale`).
+runs it at {1 / policy['control_dt']:.0f} Hz. Commands move smoothly (at most policy.json's max_step per step, per actuator,
+times `speed_scale`).
 
 It was trained in simulation{' with physics variation (' + policy['randomize'] + ')' if policy.get('randomize') not in (None, 'off') else ''}. On real hardware, start with a low
 `speed_scale`, keep an emergency stop in reach, and expect to fine-tune.

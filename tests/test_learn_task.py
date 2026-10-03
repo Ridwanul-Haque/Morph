@@ -96,3 +96,45 @@ def test_ros2_package_rebuilds_the_training_observation(tmp_path, monkeypatch, r
     t = task["target"]
     want = observe(np, d.qvel, d.actuator_length, d.actuator_velocity, d.xpos, d.xmat, np.zeros(m.nu), ix, (t["x"], t["y"], t["z"], t["yaw"]))
     np.testing.assert_allclose(core.observation(), want, atol=1e-6)
+
+
+def test_several_step_plans_are_tried_and_the_best_is_kept(tmp_path, monkeypatch):
+    """Eureka-style search: Nemotron proposes plans, each practises briefly, the best on one yardstick wins."""
+    import json as _json
+    import morph.learn_task as lt
+    from morph.reasoning import StepCandidates
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"))
+    m = build_task_model(load_task(task_path))
+    n_obs, n_act = obs_size(indices(m, load_task(task_path))), m.nu
+    _random_policy(task_path.parent, n_obs, n_act)
+    (task_path.parent / "params.pkl").write_bytes(b"x")
+
+    class FakeLLM:
+        available = True
+
+        def step_candidates(self, *a, **k):
+            mk = lambda name, f: {"name": name, "done_when": f}
+            return StepCandidates(candidates=[{"idea": "touch it first", "steps": [mk("touch", "touch_dist < 0.05")]},
+                                              {"idea": "get behind it", "steps": [mk("behind", "hand_x < x - 0.03")]}],
+                                  rationale="stuck at step 1"), None
+
+    scores = {"keep the current steps": 1.0, "touch it first": 9.0, "get behind it": 4.0}
+
+    def fake_train(tp, n, restore):  # a policy, and a training evaluation that scores each plan differently
+        t = _json.loads(tp.read_text())
+        idea = {"touch_dist < 0.05": "touch it first", "hand_x < x - 0.03": "get behind it"}.get(
+            (t.get("steps") or [{}])[0].get("done_when"), "keep the current steps")
+        _random_policy(tp.parent, n_obs, n_act)
+        (tp.parent / "train_meta.json").write_text(_json.dumps({"curve": [{"success": scores[idea], "dist": 1.0}]}))
+        (tp.parent / "params.pkl").write_bytes(idea.encode())
+        return True
+
+    chosen = lt.search_step_plans(pj, goal, task_path, fake_train, FakeLLM(), {"stuck_at": {}}, [{"round": 1}], 1000,
+                                  tries=1, k=2, log=lambda s: None)
+    assert chosen["idea"] == "touch it first" and chosen["tried"] == 3
+    assert load_task(task_path)["steps"][0]["done_when"] == "touch_dist < 0.05"
+    assert (task_path.parent / "params.pkl").read_bytes() == b"touch it first"  # the winner's policy continues
+    assert not list(task_path.parent.glob("candidate_*"))

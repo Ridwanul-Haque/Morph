@@ -191,6 +191,10 @@ canvas { width: 100%; height: 110px; display: block; }
 .res .top b { font-size: 14.5px; }
 .plan { font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--raise); color: var(--dim); white-space: nowrap; }
 .plan.grasp_place_topdown, .plan.legged_foot_push, .plan.mobile_push { background: var(--accbg); color: var(--accent); }
+.plan.program { background: rgba(52,211,153,.14); color: var(--ok); }
+.prog { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+.prog summary { cursor: pointer; font-size: 12.5px; } .prog ol { margin: 4px 0 2px 18px; padding: 0; font-size: 11.5px; color: var(--dim); }
+.prog .rep { font-size: 11px; color: var(--faint); margin: 3px 0 0 18px; } .prog .why3 { font-size: 11.5px; color: var(--dim); margin: 3px 0; font-style: italic; }
 .plan.unsupported { background: var(--badbg); color: var(--bad); } .plan.learned_skill { background: rgba(139, 123, 255, .15); color: #b3a8ff; } .plan.learn_policy { background: var(--warnbg); color: var(--warn); }
 .score { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
 .sbar { height: 6px; background: var(--raise); border-radius: 99px; margin: 10px 0 8px; overflow: hidden; }
@@ -340,6 +344,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <div class="bar" style="margin:10px 0"><div id="trainbar"></div></div>
     <canvas id="curve" width="900" height="120"></canvas>
     <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div>
+    <div id="trainrounds" class="small" style="margin-top:10px"></div>
     <div id="trainsteps" style="margin-top:10px"></div>
   </div>
 </div>
@@ -385,8 +390,10 @@ header [data-tip]:hover::after { left: auto; right: 0; }
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const PLAN = {grasp_place_topdown: "Pick up and place", legged_foot_push: "Walk over and push", mobile_push: "Drive over and push",
-              learn_policy: "Needs to learn first", unsupported: "Can't do this goal", learned_skill: "Its learned skill"};
-const PLAN_LONG = {learned_skill: "Use the skill it learned for this goal", grasp_place_topdown: "Pick it up from above, carry it, set it down (gripper)",
+              learn_policy: "Needs to learn first", unsupported: "Can't do this goal", learned_skill: "Its learned skill",
+              program: "Nemotron's program"};
+const PLAN_LONG = {program: "Nemotron writes a program from building blocks (move the hand, open, close); Morph runs it, tells it what happened, and it fixes the program until the checklist is met",
+                   learned_skill: "Use the skill it learned for this goal", grasp_place_topdown: "Pick it up from above, carry it, set it down (gripper)",
                    legged_foot_push: "Walk with a learned gait, then push with one foot while standing on three",
                    mobile_push: "Drive its base against the object and push it",
                    learn_policy: "Learn a new skill in simulation first (reinforcement learning on a GPU)"};
@@ -707,7 +714,8 @@ function learnCard(r, i, failed) {
   return `<div class="sec"><h4>Learn this task</h4><div class="card small">
     <div class="muted">${failed ? `Morph's ready-made skill didn't work for ${esc(r.name)} here` : `None of Morph's ready-made skills fit ${esc(r.name)} for this goal`}, so it can learn one: it practises in
       simulation thousands of times at once, scored by the goal checklist (${(e.steps / 1e6).toFixed(0)}M practice steps), then tries it here.
-      Pushing things into place usually learns well; picking up and lifting from scratch is much harder and may not succeed.</div>
+      For an arm with a gripper, Nemotron first writes a program that does it; the learner copies that, then practises to make it its own.
+      Between rounds, Nemotron reads what the robot actually did and adjusts the steps.</div>
     <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
       : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your Nebius account.`}
       <a href="#" onclick="showTab('compute');return false">Change</a></div>
@@ -844,6 +852,9 @@ function renderResults() {
         return `<div class="sq ${t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad"} ${can ? "click" : ""}"
           title="try ${i + 1}${t && t.reasons ? (t.success ? ": success" : ": " + esc(t.reasons.join("; "))) : ""}${can ? " (click to replay)" : ""}" ${can ? `onclick="replay('${esc(k)}', ${i})"` : ""}></div>`; }).join("")}</div>`}
       ${R.how ? `<div class="how" onclick="this.classList.toggle('open')" title="click to expand">${esc(R.how)}</div>` : ""}
+      ${(R.programs || []).map(pg => `<details class="prog" ${pg.open ? "open" : ""}><summary>Program ${pg.attempt}: ${pg.success === undefined ? "running…" : pg.success ? "✓ reached the goal" : "✕ " + esc((pg.reasons || [])[0] || "failed")}</summary>
+        ${pg.rationale ? `<div class="why3">${esc(pg.rationale)}</div>` : ""}<ol>${pg.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>
+        ${pg.report ? `<div class="rep">What happened:<br>${pg.report.map(esc).join("<br>")}</div>` : ""}</details>`).join("")}
       ${R.moveit ? `<div class="row" style="margin-top:8px"><a href="/api/export_moveit?name=${encodeURIComponent(R.moveit)}" download><button class="xs">Export for MoveIt 2 (.zip)</button></a>
         <span class="tiny faint grow" data-tip="The arm configurations that worked here (above the object, grasp, lift, above the goal, place, release) in the arm's base frame, the scene's fixtures as collision boxes, and a moveit_py script that plans and runs them with your robot's MoveIt config. Checked in simulation only.">the sequence that worked, as a moveit_py script</span></div>` : ""}</div>`;
   }).join("") : `<span class="muted small">Results appear here during the run. Click a square to replay that try.</span>`;
@@ -894,7 +905,7 @@ function events() {
         caption("Done. Click any square on the right to replay a try."); refreshCosts(); break;
       case "stopped": setRunning(false); progress("plan", "Stopped"); caption("Stopped"); break;
       case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
-      case "training_start": $("trainbox").classList.remove("hidden"); S.curve = []; S.trainSteps = e.steps;
+      case "training_start": $("trainbox").classList.remove("hidden"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = "";
         $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
           : "Score per practice run: higher means it walks and follows directions better.";
         if (e.kind !== "task") $("trainsteps").innerHTML = "";
@@ -911,6 +922,31 @@ function events() {
           : `Practice after ${(e.step / 1e6).toFixed(0)}M steps: ended ${e.dist_cm} cm from the target${e.tilt_deg > 10 ? ", tipped over" : ""}${far}`);
         if (S.skillSteps && e.steps_total) { S.bestStep = Math.max(S.bestStep || 0, e.steps_reached);
           $("trainsteps").innerHTML = stepsHtml(S.skillSteps, S.bestStep, true); }
+        break; }
+      case "program": if (S.results[e.robot]) { const R = S.results[e.robot]; R.programs = (R.programs || []).map(x => ({...x, open: false}));
+          R.programs.push({attempt: e.attempt, steps: e.steps, rationale: e.rationale, open: true}); renderResults(); }
+        caption(`Nemotron wrote program ${e.attempt}: running it`); break;
+      case "program_result": if (S.results[e.robot]) { const pg = (S.results[e.robot].programs || []).find(x => x.attempt === e.attempt);
+          if (pg) Object.assign(pg, {success: e.success, report: e.report, reasons: e.reasons}); renderResults(); }
+        caption(e.success ? `Program ${e.attempt} reached the goal` : `Program ${e.attempt} failed: ${(e.reasons || [])[0] || ""}. Nemotron is fixing it`); break;
+      case "learn_round": {
+        S.rounds = S.rounds || {};
+        const prev = S.rounds[e.round] || {};
+        if (e.stage === "candidate") { prev.cands = [...(prev.cands || []), e]; S.rounds[e.round] = prev; }
+        else if (e.stage === "chosen") { prev.chosen = e; S.rounds[e.round] = prev; }
+        else if (e.stage === "candidates") { prev.ideas = e.ideas; S.rounds[e.round] = prev; }
+        else S.rounds[e.round] = {...prev, ...e};
+        if (e.stage === "candidates") caption(`Nemotron proposed ${e.ideas.length - 1} new plans: trying each briefly, keeping the best`);
+        if (e.stage === "practice") caption(`Round ${e.round} of ${e.rounds}: practising (${(e.steps / 1e6).toFixed(0)}M steps)`);
+        if (e.stage === "revised") caption(`Nemotron revised the steps from what it saw in round ${e.round}`);
+        $("trainrounds").innerHTML = Object.values(S.rounds).map(x => {
+          const d = x.diagnosis || {}, st = d.stuck_at, did = d.what_the_robot_did || {};
+          return `<div class="note" style="margin:4px 0"><b>${x.round === 0 ? "Copy of Nemotron's program" : "Round " + x.round}</b>${x.n ? ` · tried it: ${x.success}/${x.n}` : x.round === 0 ? " · copying…" : " · practising…"}
+            ${st ? `<br><span class="muted">stuck at step ${st.step} (${esc(st.name)}); closest its end parts got to the parcel: ${did["closest any of its end parts got to the object's surface (cm)"]} cm, best grip ${did["best grip score (0..1; 1 = held from opposite sides and lifted)"]}</span>` : ""}
+            ${d.practice_from ? `<br><span class="faint">next round also practises from ${esc(d.practice_from)}</span>` : ""}
+            ${x.rationale ? `<br><span class="faint">Nemotron: ${esc(x.rationale)}</span>` : ""}
+            ${x.ideas ? `<br><span class="muted">Plans tried after this round:</span>${x.ideas.map((idea, k) => { const c = (x.cands || []).find(c => c.index === k), won = x.chosen && x.chosen.index === k;
+              return `<br><span class="${won ? "" : "faint"}">${won ? "✓" : "·"} ${esc(idea)}${c ? ` (${c.success}/${c.n}, ${c.in_goal} moments in the goal state)` : " (practising…)"}</span>`; }).join("")}` : ""}</div>`; }).join("");
         break; }
       case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true); break;
       case "training_retry": toast(`Out of GPU memory: retrying with ${e.envs} practice copies at once`); break;

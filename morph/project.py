@@ -66,6 +66,25 @@ def load_project(root: str | Path) -> Project:
                    description=task.get("description", ""), demo=rel(task.get("demo")))
 
 
+_MUST = [  # words in a request -> what its checklist has to contain (checked without the model)
+    (r"\b(throw|toss|lob|fling|chuck)\w*\b|(?<!don't )(?<!not )(?<!no )\bdrop(s|ped|ping)?\b(?! it gently)",
+     lambda c: c.when == "release",
+     "the request is a throw or a drop, so the checklist needs a condition at the moment the robot lets go"),
+    (r"\b(first\b.*\bthen|on the way|at some point|along the way|before (putting|placing|moving))\b", lambda c: c.when == "ever",
+     "the request has something that happens on the way (first ... then ...), so it needs an 'at some point' condition"),
+    (r"\b(never|without (ever )?(lifting|tipping|touching|dropping)|the whole (time|way)|all the way)\b",
+     lambda c: c.when == "always", "the request says something must hold the whole time, so it needs a 'the whole time' condition"),
+    (r"\b(knock|tip|topple|push)\w*\s+(?:\w+\s+){0,2}over\b|\bon its side\b",
+     lambda c: c.kind == "orientation" and c.up_face == "side", "the request is to knock it over, so it must end lying on its side"),
+]
+
+
+def missing_intent(description: str, goal: GoalSpec) -> list[str]:
+    """What the request clearly asks for that the checklist doesn't have (the model sometimes drops it)."""
+    t = description.lower()
+    return [why for pat, ok, why in _MUST if re.search(pat, t) and not any(ok(c) for c in goal.conditions)]
+
+
 def resolve_goal(pj: Project, description: str = "", demo_path: str | None = None, llm=None, log=print) -> tuple[GoalSpec, dict]:
     """Demonstration -> measured conditions; description -> conditions (Nemotron, else rules); both -> merged
     with the description taking precedence. Everything is validated against the scene."""
@@ -105,7 +124,8 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
                 cand = GoalSpec(object=pj.scene.object_name, conditions=conds,
                                 notes=[f"Nemotron: {prop.rationale}"] + [f"assumed: {a}" for a in prop.ambiguities],
                                 warnings=list(prop.warnings))
-                errs = validate(cand, pj.scene) or unsatisfiable(cand, pj.scene)
+                errs = validate(cand, pj.scene) or (missing_intent(description, cand) if description else []) \
+                    or unsatisfiable(cand, pj.scene)
                 problems = errs
                 if not errs and description and attempt < 2:
                     # does the checklist, read back in plain words, mean what was asked? (catches reversals like
@@ -125,6 +145,16 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
             raise
         except Exception as e:  # noqa: BLE001  (no key, network, bad JSON: fall back, say so)
             log(f"  (Nemotron unavailable: {e}; using the {planner} reading)")
+    if description and goal is not None and goal is not text_goal and text_goal is not None:
+        # the model's reading, still missing something the request clearly says: take that part from the
+        # built-in reader rather than drop it
+        for pat, ok, why in _MUST:
+            if re.search(pat, description.lower()) and not any(ok(c) for c in goal.conditions):
+                extra = [c for c in text_goal.conditions if ok(c)]
+                if extra:
+                    goal.conditions += extra
+                    goal.notes.append(f"added from the built-in reader: {why}")
+                    log(f"  (added from the built-in reader: {why})")
     if goal is None:
         raise ValueError("no goal: give a description, a demonstration, or both")
     errs = validate(goal, pj.scene)
@@ -227,6 +257,21 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         out |= _run_arm(pj, goal, spec, p, robot_path, prof.name, n, log, record_demo, stand_at)
     elif plan["plan_id"] == "legged_foot_push":
         out |= _run_legged(pj, goal, spec, p, prof, n, log, record_demo, stand_at)
+    elif (plan["plan_id"] == "learn_policy" and llm is not None and llm.available and prof.base == "fixed"
+          and prof.has_gripper):
+        # no ready-made skill: Nemotron writes a program from building blocks, Morph runs and checks it, and
+        # Nemotron fixes it from what happened. Seconds per try, instead of minutes of learning.
+        from .programs import solve
+        plan = {"plan_id": "program", "planner": "nemotron", "how": "Nemotron writes a program from building blocks "
+                "(move the hand, open, close); Morph runs it and tells it what happened until the checklist is met"}
+        out["plan"] = plan
+        emit(type="plan", robot=prof.name, plan_id="program", planner="nemotron", how=plan["how"], what_is_it=prof.summary(),
+             templates=[{"id": c.id, "ok": c.applicable, "met": c.met, "missing": c.missing} for c in checks])
+        out |= solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=n, stand_at=stand_at)
+        out.pop("adapter", None), out.pop("demos", None)  # for learning from; not part of the result
+        if not out.get("success"):
+            out["why_not"] = (out.get("why_not") or out.get("setup_error", "")) + \
+                "; it can still learn one: open the Robot tab and choose Learn this task"
     else:
         if plan["plan_id"] == "learn_policy":
             grasp = next((c for c in checks if c.id == "grasp_place_topdown"), None)

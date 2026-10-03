@@ -81,6 +81,7 @@ def scales(scene, p: dict) -> dict:
             "hand_dist_when_gripping_m": f"{min(b.half_x, b.half_y):.3f} to {r + 0.03:.3f} (fingertips sit either side, not at the centre)",
             "object_z_when_resting_on_floor_m": round(b.half_z, 3), "bottom_when_on_floor_m": 0.0,
             "target": {k: round(float(v), 3) for k, v in p.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},
+            "grip_scale": "grip is 0..1: about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure 0..1 = how far the gripper is commanded shut",
             "note": "thresholds must be reachable: allow a few cm of slack; 'held' needs the object off the ground"}
 
 

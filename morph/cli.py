@@ -257,14 +257,14 @@ def _spec_for(sc):
 def cmd_learn(a) -> int:
     """Learn a task for one robot from scratch on this GPU (no browser needed, e.g. on a server or in CI)."""
     import subprocess
-    from .learn_task import export, make_task, try_policy
+    from .learn_task import export, learn_in_rounds, prepare_learning
     from .project import load_project, resolve_goal
     from .reasoning import ReasoningService
     pj = load_project(a.project)
     llm = None if a.no_llm else ReasoningService()
     goal, _ = resolve_goal(pj, a.description, None, llm)
     print("goal:\n" + "\n".join(f"  - {line}" for line in goal.describe()))
-    task = make_task(pj, goal, a.robot, llm=llm)
+    task, prep = prepare_learning(pj, goal, a.robot, llm=llm)
     t = json.loads(task.read_text())
     print(f"steps ({t.get('steps_from', '')}):")
     for k, st in enumerate(t.get("steps", []) + [t["steps_final"]], 1):
@@ -272,26 +272,37 @@ def cmd_learn(a) -> int:
               + (f"\n       done when: {st['done_when']}" if st["done_when"] != "goal" else ""))
     ROOT = Path(__file__).resolve().parents[1]
     py = ROOT / ".venv-rl" / "bin" / "python"
-    envs = a.envs
-    while True:
-        cmd = [str(py), str(ROOT / "scripts" / "train_task.py"), str(task), "--steps", str(a.steps), "--envs", str(envs),
-               "--randomize", a.randomize]
-        print(f"training: {' '.join(cmd[1:])}", flush=True)
-        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-        for line in r.stdout.splitlines():
-            if line.startswith('{"step"'):
-                print("  " + line, flush=True)
-        oom = "out of memory" in r.stdout + r.stderr or "Failed to allocate" in r.stdout + r.stderr
-        if r.returncode == 0 or not oom or envs <= 128:
-            break
-        envs //= 2
-        print(f"GPU out of memory: retrying with {envs} copies at once")
-    if r.returncode != 0:
-        print((r.stderr or r.stdout)[-2000:])
-        return 1
-    res = try_policy(pj, goal, task, n=a.tries)
+    state = {"envs": a.envs}
+
+    def train(task_path, n_steps, restore) -> bool:
+        while True:
+            cmd = [str(py), str(ROOT / "scripts" / "train_task.py"), str(task_path), "--steps", str(n_steps),
+                   "--envs", str(state["envs"]), "--randomize", a.randomize] + (["--restore", str(restore)] if restore else []) \
+                + (["--imitate-only"] if n_steps == 0 else [])
+            print(f"training: {' '.join(cmd[1:])}", flush=True)
+            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
+                               env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"})
+            for line in r.stdout.splitlines():
+                if line.startswith('{"step"'):
+                    print("  " + line, flush=True)
+            oom = "out of memory" in r.stdout + r.stderr or "Failed to allocate" in r.stdout + r.stderr
+            if r.returncode == 0 or not oom or state["envs"] <= 128:
+                break
+            state["envs"] //= 2
+            print(f"GPU out of memory: retrying with {state['envs']} copies at once")
+        if r.returncode != 0:
+            print((r.stderr or r.stdout)[-2000:])
+        return r.returncode == 0
+
+    def emit(**e):
+        if e.get("type") == "learn_round" and e.get("stage") == "revised":
+            print(f"round {e['round']}: Nemotron revised the steps: {e['rationale']}")
+
+    res = learn_in_rounds(pj, goal, task, train, llm=llm, log=print, emit=emit, total_steps=a.steps, rounds=a.rounds,
+                          tries=a.tries)
     print(f"learned skill: {res['success']}/{res['n']} tries succeeded")
-    print(f"export: {export(task)}")
+    if (task.parent / "policy.npz").exists():
+        print(f"export: {export(task)}")
     return 0 if res["success"] else 2
 
 
@@ -409,6 +420,8 @@ def main(argv=None) -> int:
     s.add_argument("--envs", type=int, default=1024)
     s.add_argument("--randomize", choices=("off", "light", "full"), default="light")
     s.add_argument("--tries", type=int, default=5)
+    s.add_argument("--rounds", type=int, default=4, help="practise in this many rounds; between them Nemotron "
+                                                           "revises the steps from what the robot actually did")
     s.add_argument("--no-llm", action="store_true")
     s.set_defaults(fn=cmd_learn)
     s = sub.add_parser("goal-bench", help="does Morph understand varied requests? (judged on example outcomes)")

@@ -17,7 +17,9 @@ Quantities an expression can use (metres, degrees):
   start_x, start_y,
   held (1 if the robot is holding it), dist_to('fixture') (edge to edge), robot_x, robot_y,
   hand_dist (the robot's nearest end part to the object's centre), hand_x, hand_y, hand_z (that end
-  part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level)
+  part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level), grip (0..1: how close
+  the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
+  its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut)
 functions: abs, min, max, sqrt, hypot; operators: + - * / < <= > >= == and or not.
 """
 
@@ -29,8 +31,10 @@ import math
 SIDES = {"east": (1, 0), "west": (-1, 0), "north": (0, 1), "south": (0, -1)}
 FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1, 1), "-y": (1, -1)}
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
-             "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg"}
-ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg"}
+             "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
+             "grip", "touch_dist", "lifted", "closure"}
+ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
+                   "touch_dist"}
 FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"}
 GENERIC = ("orientation", "height", "away_from", "moved", "expression")
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce

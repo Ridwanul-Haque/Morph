@@ -527,15 +527,18 @@ def steps_view(task: Path) -> dict:
 
 
 def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "light", use_llm: bool = True):
-    from ..learn_task import make_task, try_policy
+    from ..learn_task import learn_in_rounds, prepare_learning
     from .compute import cloud_task_job
     if app.goal is None or app.project is None:
         raise ValueError("understand a goal first")
-    task = app.planned.get((path, id(app.goal)))  # the steps already shown, if they were planned first
-    if task is None or not task.exists():
-        app.send(type="caption", text="Working out the steps to go about it")
-        task = make_task(app.project, app.goal, app.resolve(path), llm=app.reasoning() if use_llm else None,
-                         log=lambda t: app.send(type="log", text=t.strip()), stand_at=app.placements.get(path))
+    planned = app.planned.get((path, id(app.goal)))  # the steps already shown, if they were planned first
+    app.send(type="caption", text="Working out how to go about it")
+    task, prep = prepare_learning(app.project, app.goal, app.resolve(path), llm=app.reasoning() if use_llm else None,
+                                  log=lambda t: app.send(type="log", text=t.strip()), emit=lambda **e: app.on_event(e),
+                                  stand_at=app.placements.get(path), steps_from=planned)
+    if prep.get("demo"):
+        app.send(type="log", text=f"Learning starts from Nemotron's program (it worked {prep['program_trials']}); "
+                                  "the learner copies it first, then practises")
     robot = json.loads(task.read_text())["robot"]
     app.send(type="skill_steps", **steps_view(task))
     if app.compute["mode"] == "cloud":
@@ -545,33 +548,51 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
     if not py.exists():
         raise ValueError("the RL environment (.venv-rl) isn't installed; see requirements-rl.lock")
     app.training_task, app.latest_ckpt = task, None
-    envs, first = 1024, True
-    while True:
-        cmd = [str(py), str(ROOT / "scripts" / "train_task.py"), str(task), "--steps", str(steps), "--envs", str(envs),
-               "--randomize", randomize]
-        code, oom = _stream_training(app, cmd, robot, steps, "task", quiet_start=not first)
-        first = False
-        if code == 0 or not oom or envs <= 128:
-            break
-        envs //= 2  # detailed collision meshes need more GPU memory per copy: practise with fewer at once
-        app.send(type="log", robot=robot, text=f"The GPU ran out of memory (this robot has detailed collision shapes). "
-                                               f"Retrying with {envs} practice copies at once instead of {envs * 2}: slower, same result.")
-        app.send(type="training_retry", robot=robot, envs=envs)
+    state = {"envs": 1024, "first": True, "oom": False}
+
+    def train(task_path, n_steps, restore) -> bool:
+        """One round of practice on this GPU (fewer copies at once if it runs out of memory)."""
+        app.training_task = task_path
+        while True:
+            cmd = [str(py), str(ROOT / "scripts" / "train_task.py"), str(task_path), "--steps", str(n_steps),
+                   "--envs", str(state["envs"]), "--randomize", randomize] + (["--restore", str(restore)] if restore else []) \
+                + (["--imitate-only"] if n_steps == 0 else [])
+            code, oom = _stream_training(app, cmd, robot, n_steps, "task", quiet_start=not state["first"])
+            state["first"], state["oom"] = False, oom
+            if code == 0 or not oom or state["envs"] <= 128:
+                break
+            state["envs"] //= 2  # detailed collision meshes need more GPU memory per copy: practise with fewer at once
+            app.send(type="log", robot=robot, text=f"The GPU ran out of memory (this robot has detailed collision shapes). "
+                                                   f"Retrying with {state['envs']} practice copies at once: slower, same result.")
+            app.send(type="training_retry", robot=robot, envs=state["envs"])
+        app.training_task = None
+        if app.demo is not None:
+            app.demo.join(timeout=30)  # let the last practice run notice and stop
+        ok = code == 0 and (task_path.parent / "policy.npz").exists()
+        if ok:
+            app.send(type="robot_start", robot=robot, path=path)
+            app.send(type="stage", robot=robot, stage="trials", text="trying what it has learned so far")
+        return ok
+
+    def emit(**e):
+        if e.get("type") == "learn_round":
+            e["robot"] = robot
+            app.send(**e)
+        else:
+            app.on_event(e)
+
+    res = learn_in_rounds(app.project, app.goal, task, train, llm=app.reasoning() if use_llm else None,
+                          log=lambda t: app.send(type="log", robot=robot, text=t.strip()), emit=emit, total_steps=steps)
     app.training_task = None
-    if app.demo is not None:
-        app.demo.join(timeout=30)  # let the last practice run notice and stop
-    if code != 0 or not (task.parent / "policy.npz").exists():
-        why = "the GPU ran out of memory even with 128 copies" if oom else "the trainer stopped with an error (see the report)"
+    if not (task.parent / "policy.npz").exists():
+        why = "the GPU ran out of memory even with 128 copies" if state["oom"] else "the trainer stopped with an error (see the report)"
         app.send(type="training_done", robot=robot, ok=False, why=why)
         return
     app.send(type="training_done", robot=robot, ok=True, kind="task", folder=task.parent.name)
-    app.send(type="robot_start", robot=robot, path=path)
-    app.send(type="stage", robot=robot, stage="trials", text="trying the skill it just learned")
-    res = try_policy(app.project, app.goal, task, n=5, log=lambda t: app.send(type="log", robot=robot, text=t.strip()),
-                     emit=lambda **e: app.on_event(e))
     app.live.pace = False
     app.result = {"project": app.project.name, "goal": app.goal.model_dump(), "robots": [{"robot": robot, "learned": task.parent.name, **res}]}
-    app.send(type="learn_done", robot=robot, success=res["success"], n=res["n"], folder=task.parent.name)
+    app.send(type="learn_done", robot=robot, success=res["success"], n=res["n"], folder=task.parent.name,
+             rounds=len(res.get("rounds", [])) + 1)
     app.send(type="done", summary=[{"robot": robot, "plan": "learned_skill", "success": res["success"], "n": res["n"]}])
 
 

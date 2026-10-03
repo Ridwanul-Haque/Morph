@@ -145,6 +145,7 @@ class MenagerieArmAdapter:
         m = self.model
         self.name = cfg.name
         self._qadr = np.array([m.joint(j).qposadr[0] for j in cfg.arm_joints])
+        self._five = len(cfg.arm_joints) < 6  # can't choose the hand's turn while pointing down (see ik)
         self._dof = np.array([m.joint(j).dofadr[0] for j in cfg.arm_joints])
         self._lo = np.array([m.joint(j).range[0] for j in cfg.arm_joints])
         self._hi = np.array([m.joint(j).range[1] for j in cfg.arm_joints])
@@ -190,21 +191,30 @@ class MenagerieArmAdapter:
             p = d.site_xpos[self._site]
             R = d.site_xmat[self._site].reshape(3, 3)
             ep = tcp - p
-            er = _rotvec(Rd @ R.T)
+            # 5 arm joints can't point the hand down AND turn it to any angle (6 requirements): for those arms
+            # only "pointing down" is required, and the turn is whatever the arm's direction gives
+            er = np.cross(R[:, 2], Rd[:, 2]) if self._five else _rotvec(Rd @ R.T)
             if np.linalg.norm(ep) < 5e-4 and np.linalg.norm(er) < 5e-3:
                 return q
             mujoco.mj_jacSite(m, d, jp, jr, self._site)
-            J = np.vstack([jp[:, self._dof], jr[:, self._dof]])
-            e = np.concatenate([ep, er * 0.5])
-            JJt = J @ J.T + 1e-4 * np.eye(6)
+            if self._five:  # position + tilt about x and y; the turn about the vertical is left free
+                J = np.vstack([jp[:, self._dof], jr[:2, self._dof]])
+                e = np.concatenate([ep, er[:2] * 0.5])
+            else:
+                J = np.vstack([jp[:, self._dof], jr[:, self._dof]])
+                e = np.concatenate([ep, er * 0.5])
+            JJt = J @ J.T + 1e-4 * np.eye(len(e))
             dq = J.T @ np.linalg.solve(JJt, e)
             N = np.eye(len(q)) - J.T @ np.linalg.solve(JJt, J)
             dq += N @ (0.05 * (self.home_q - q))
             q = np.clip(q + np.clip(dq, -0.3, 0.3), self._lo, self._hi)
         d.qpos[self._qadr] = q
         mujoco.mj_kinematics(m, d)
-        ok = np.linalg.norm(tcp - d.site_xpos[self._site]) < 2e-3 and \
-            np.linalg.norm(_rotvec(Rd @ d.site_xmat[self._site].reshape(3, 3).T)) < 2e-2
+        Rf = d.site_xmat[self._site].reshape(3, 3)
+        rot_err = np.linalg.norm(np.cross(Rf[:, 2], Rd[:, 2])) if self._five else np.linalg.norm(_rotvec(Rd @ Rf.T))
+        # a 5-joint arm can be left a few degrees off vertical (its gripper's axis needn't line up with the wrist
+        # roll); that makes no practical difference to grasping from above
+        ok = np.linalg.norm(tcp - d.site_xpos[self._site]) < 2e-3 and rot_err < (0.06 if self._five else 2e-2)
         return q if ok else None
 
     def ik_reconfigure(self, tcp: np.ndarray, hand_yaw: float, tries: int = 12) -> np.ndarray | None:
