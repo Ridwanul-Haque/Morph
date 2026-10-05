@@ -196,6 +196,8 @@ class App:
         self.proc: subprocess.Popen | None = None
         self.compute = {"mode": "local", "gpu": "H100"}  # where gait training runs
         self.training_task: Path | None = None  # task being learned (for practice runs of checkpoints)
+        self.suggestions: list[str] = []  # what the person watching says while it learns (taken at the end of a round)
+        self.suggest_lock = threading.Lock()
         self.planned: dict = {}  # (robot path, goal) -> task.json whose steps were already planned and shown
         self.placements: dict = {}  # robot path -> (x, y, heading rad) where the user put it; else Morph chooses
         self.latest_ckpt = None
@@ -306,7 +308,7 @@ class App:
         out = []
         for base in (ROOT / "examples", UPLOADS / "scenes"):
             if base.exists():
-                for d in sorted(base.iterdir()):
+                for d in sorted(base.iterdir(), key=lambda d: (d.name != "parcel", d.name)):  # the parcel cell first
                     if (d / "morph.toml").exists() or (d / "scene.xml").exists():
                         out.append({"name": d.name, "path": str(d), "uploaded": base != ROOT / "examples"})
         return out
@@ -364,7 +366,13 @@ class App:
              "plan": plan["plan_id"], "why_not": why or ("" if plan["plan_id"] != "unsupported" else plan.get("rationale", "")),
              "templates": [{"id": c.id, "ok": c.applicable, "met": c.met, "missing": c.missing} for c in checks],
              "import_notes": self._imports.get(path, ("", []))[1] if hasattr(self, "_imports") else [],
-             "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal) if self.goal else None)}
+             "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal) if self.goal else None),
+             "recipes": P.program_body(prof)}
+        if self.goal is not None and not r["learned"]:  # an earlier attempt that didn't work (or didn't finish)
+            from ..learn_task import learning_status, task_dir
+            st = learning_status(task_dir(prof.name, self.goal))
+            if st["state"] != "none":
+                r["attempt"] = {"state": st["state"], "success": st.get("success"), "n": st.get("n")}
         if r["learned"]:
             r["plan"], r["why_not"] = "learned_skill", ""
         self.profiles[key] = r
@@ -487,6 +495,8 @@ def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, q
     """Run a trainer, forward its progress; returns (exit code, ran out of GPU memory?)."""
     if not quiet_start:
         app.send(type="training_start", robot=robot, steps=steps, kind=kind, cmd=" ".join(cmd[1:]))
+    else:  # a later round: its own number of practice steps (the copy round before it had none)
+        app.send(type="training_round_start", robot=robot, steps=steps, kind=kind)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(ROOT), env=dict(os.environ))
     app.proc = proc
     oom, in_trace = False, False
@@ -581,8 +591,16 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
         else:
             app.on_event(e)
 
+    def advice() -> list[str]:  # the suggestions typed since the last round ended
+        with app.suggest_lock:
+            said, app.suggestions = app.suggestions, []
+        return said
+
+    with app.suggest_lock:
+        app.suggestions = []
     res = learn_in_rounds(app.project, app.goal, task, train, llm=app.reasoning() if use_llm else None,
-                          log=lambda t: app.send(type="log", robot=robot, text=t.strip()), emit=emit, total_steps=steps)
+                          log=lambda t: app.send(type="log", robot=robot, text=t.strip()), emit=emit, total_steps=steps,
+                          advice=advice)
     app.training_task = None
     if not (task.parent / "policy.npz").exists():
         why = "the GPU ran out of memory even with 128 copies" if state["oom"] else "the trainer stopped with an error (see the report)"
@@ -753,6 +771,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(APP.place(b))
             elif u.path == "/api/steps":
                 self._json(APP.plan_steps(b["path"], bool(b.get("llm", True))))
+            elif u.path == "/api/suggest":  # while it learns: what the person watching sees it doing wrong
+                text = str(b.get("text", "")).strip()[:500]
+                if not text:
+                    raise ValueError("say what it's doing wrong, e.g. \"it grabs the top edge and the parcel slips\"")
+                if APP.training_task is None:
+                    raise ValueError("nothing is learning right now")
+                with APP.suggest_lock:
+                    APP.suggestions.append(text)
+                now = bool(b.get("now"))
+                if now:  # end the current round at its next snapshot, so the change applies sooner
+                    (Path(APP.training_task).parent / "stop_round").write_text("1")
+                APP.send(type="suggestion", text=text, now=now)
+                self._json({"ok": True, "now": now})
+            elif u.path == "/api/robustness":  # knock the object mid-task: the recipe alone vs the learned skill
+                from ..learn_task import LEARNED, robustness
+                if APP.goal is None or APP.project is None:
+                    raise ValueError("understand a goal first")
+                folder = LEARNED / Path(b.get("task", "")).name  # a folder name only, nothing outside runs/learned
+                if not (folder / "policy.npz").exists():
+                    raise ValueError("nothing learned under that name yet")
+                self._json(robustness(APP.project, APP.goal, folder / "task.json", n=int(min(max(int(b.get("n", 10)), 2), 30)),
+                                      log=lambda s: None))
             elif u.path == "/api/train":
                 APP.start(APP.train, b["path"])
                 self._json({"ok": True})

@@ -37,8 +37,10 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.goal_terms import HOLD_TICKS, condition_violation, is_generic, is_temporal, parse, violation  # noqa: E402
-from morph.task_model import CTRL_DT, SIM_DT, build_task_model, indices, load_task, measure, next_ctrl, obs_size, observe, soft  # noqa: E402
+from morph.goal_terms import (HOLD_TICKS, condition_violation, is_generic, is_temporal, parse, term_value,  # noqa: E402
+                              violation)
+from morph.task_model import (CTRL_DT, SIM_DT, Residual, build_task_model, indices, load_task, measure, next_ctrl,  # noqa: E402
+                              obs_size, observe, soft)  # noqa: E402
 
 
 RANDOMIZE = {  # (low, high) multipliers; "light" halves each spread
@@ -113,6 +115,8 @@ class TaskLearn(mjx_env.MjxEnv):
         # the steps to go about it (skill_steps): reward for reaching each in order
         self.steps = [(parse(st["done_when"], self.fx), parse(st["keep"], self.fx) if st.get("keep") else None)
                       for st in task.get("steps", [])]
+        # extra shaping terms Nemotron wrote (Eureka-style), each logged on its own so it can see what they did
+        self.terms = [(parse(t["formula"], self.fx), float(t["weight"])) for t in task.get("reward_terms", [])]
         b = task["block"]
         self.half = (b["half_x"], b["half_y"], b["half_z"])
         self.nu = self._mj_model.nu
@@ -135,7 +139,12 @@ class TaskLearn(mjx_env.MjxEnv):
             self._starts = jp.array(z["qpos"])
             # the commands at that moment (e.g. the gripper shut on it), or NaN: hold the pose it's in
             self._start_ctrl = jp.array(z["ctrl"]) if "ctrl" in z else jp.full((len(z["qpos"]), self._mj_model.nu), jp.nan)
+            # how far through the recipe each start is (for corrections on top of it), and which ones this round
+            # may use: easy-first practice starts near the end of the recipe and works back (learn_in_rounds)
+            self._start_t = jp.array(z["t"], dtype=jp.int32) if "t" in z else jp.zeros(len(z["qpos"]), jp.int32)
             self._start_share = float(st.get("share", 0.3))
+            lo = int(st.get("from_t", 0))
+            self._start_ok = self._start_t >= lo if "t" in z and lo > 0 and bool(np.any(z["t"] >= lo)) else None
         self._ctrl0 = jp.array(np.clip(self.ix.q0, self.ix.act_lo, self.ix.act_hi))
         self._lo, self._hi = jp.array(self.ix.act_lo), jp.array(self.ix.act_hi)
         self.rand = ranges(randomize)
@@ -147,6 +156,8 @@ class TaskLearn(mjx_env.MjxEnv):
             o, act = z["obs"].astype(np.float32), np.clip(z["act"], -1, 1).astype(np.float32)
             mu, sd = o.mean(0), o.std(0) + 1e-3
             self._demo = (jp.array(mu), jp.array(sd), jp.array((o - mu) / sd), jp.array(act))
+        # corrections on top of the recipe: the action is the recipe's at this moment plus a learned correction
+        self.residual = Residual.of(task, task.get("_dir", "."))
 
     def _dist(self, data, info=None):
         """How far from done, in metres: distance to the place (if the goal has one) plus how unmet the
@@ -178,6 +189,8 @@ class TaskLearn(mjx_env.MjxEnv):
                 elif c["when"] == "always":  # the worst moment so far
                     tv = tv.at[k].set(jp.maximum(tv[k], x[k]))
                     terms.append(tv[k])
+                elif c["when"] == "last":  # keep it up: practise holding it now (the check takes the last seconds)
+                    terms.append(x[k])
                 else:  # ever: the best moment so far
                     tv = tv.at[k].set(jp.minimum(tv[k], x[k]))
                     terms.append(tv[k])
@@ -223,7 +236,10 @@ class TaskLearn(mjx_env.MjxEnv):
         ctrl0 = self._ctrl0
         if self._starts is not None:
             rng, k4, k5 = jax.random.split(rng, 3)
-            i_start = jax.random.randint(k4, (), 0, self._starts.shape[0])
+            if self._start_ok is None:
+                i_start = jax.random.randint(k4, (), 0, self._starts.shape[0])
+            else:  # only the starts this round allows (late in the recipe first)
+                i_start = jax.random.categorical(k4, jp.where(self._start_ok, 0.0, -jp.inf))
             pick = self._starts[i_start]
             use = jax.random.uniform(k5) < self._start_share
             q = jp.where(use, pick, q)
@@ -238,16 +254,20 @@ class TaskLearn(mjx_env.MjxEnv):
             data = data.replace(ctrl=ctrl0)
         delay = (jax.random.uniform(k3) < self.rand["delay_prob"]).astype(jp.float32) if self.rand else jp.zeros(())
         d0, track = self._dist(data)
+        t0 = jp.where(use, self._start_t[i_start], 0) if self._starts is not None else jp.zeros((), jp.int32)
         info = {"rng": rng, "last_act": jp.zeros(self.nu), "prev_d": d0, "ctrl": ctrl0, "delay": delay,
-                "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), **track}
+                "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), **track}
         info["phi"] = self._steps(data, info["step"], info["streak"])[1]
         metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "success", "dist", "steps_done")}
+        metrics |= {f"term_{k}": jp.zeros(()) for k in range(len(self.terms))}
         obs = self._obs(data, info)
         return mjx_env.State(data, obs, jp.zeros(()), jp.zeros(()), metrics, info)
 
     def _obs(self, data, info):
         o = observe(jp, data.qvel, data.actuator_length, data.actuator_velocity, data.xpos, data.xmat, info["last_act"],
                     self.ix, self.target)
+        if self.residual is not None:
+            o = jp.concatenate([o, self.residual.phase(jp, info["t"])])
         if not self.rand:
             return {"state": o, "privileged_state": o}
         info["rng"], k = jax.random.split(info["rng"])
@@ -266,6 +286,8 @@ class TaskLearn(mjx_env.MjxEnv):
     def step(self, state, action):
         # with a delay, the robot acts on the previous command (like a real control loop that lags a step)
         applied = action + state.info["delay"] * (state.info["last_act"] - action)
+        if self.residual is not None:
+            applied = self.residual.action(jp, state.info["t"], applied)
         ctrl = next_ctrl(jp, state.info["ctrl"], applied, self._ctrl0, self.scale, self._lo, self._hi, self._step)
         data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
         ix, info = self.ix, state.info
@@ -310,10 +332,16 @@ class TaskLearn(mjx_env.MjxEnv):
             shaped = 0.5 * (phi - info["phi"])  # a one-off bonus per step reached (not a rate: not scaled by dt)
             r = r + 1.0 * step / len(self.steps) - 1.0 * jp.minimum(keep, 2.0)
             info["step"], info["phi"] = step, phi
+        tvals = []
+        if self.terms:  # Nemotron's terms, on the graded quantities (each clipped: one term can't swamp the rest)
+            vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl))
+            tvals = [jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms]
+            r = r + sum(w * tv for (_, w), tv in zip(self.terms, tvals))
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
+        info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
         state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), success=ok.astype(jp.float32), dist=z(d),
-                             steps_done=info["step"].astype(jp.float32))
+                             steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)})
         obs = self._obs(data, info)
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own
         # environments; otherwise one bad copy turns the whole batch's numbers into NaN
@@ -340,7 +368,7 @@ class TaskLearn(mjx_env.MjxEnv):
         return self._mjx_model
 
 
-def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000):
+def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: bool = False):
     """Copy a demonstration first (behaviour cloning): train the policy network to output the program's actions
     for the observations along it, so practice starts from something that already grips and lifts instead of
     from random flailing. Returns Brax's (normalizer, policy, value) params for PPO to continue from."""
@@ -352,14 +380,26 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000):
     od = {"state": obs, "privileged_state": obs}
     shape = {k: (obs.shape[1],) for k in od}
     netw = ppo_networks.make_ppo_networks(shape, env.action_size, preprocess_observations_fn=running_statistics.normalize, **net)
-    kp, kv = jax.random.split(jax.random.PRNGKey(seed))
+    kp, kv, kn = jax.random.split(jax.random.PRNGKey(seed), 3)
     pol, val = netw.policy_network.init(kp), netw.value_network.init(kv)
+    if residual:  # corrections start at exactly nothing (whatever it sees): the recipe as it is, then practice adds fixes
+        last = sorted(pol["params"])[-1]
+        k, b = pol["params"][last]["kernel"], pol["params"][last]["bias"]
+        pol = {"params": dict(pol["params"], **{last: {"kernel": k.at[:, :env.action_size].set(0.0),
+                                                       "bias": b.at[:env.action_size].set(0.0)}})}
     norm = running_statistics.init_state({k: specs.Array((obs.shape[1],), jp.dtype("float32")) for k in od})
-    norm = running_statistics.update(norm, od)
+    # a reading that never changes along the demonstration (a joint it doesn't use) has ~0 spread: dividing by it
+    # turns a tiny difference at test time into a huge input. A floor of 2 cm / 0.02 rad keeps the copy sane.
+    norm = running_statistics.update(norm, od, std_min_value=0.02)
     n = env.action_size
 
-    def loss(params):
-        out = netw.policy_network.apply(norm, params, od)
+    spread = jp.maximum(obs.std(0), 0.02)
+
+    def loss(params, key):
+        # the same situations, slightly off (DART-style noise): the copy has to answer sensibly near the recorded path
+        # too, not only exactly on it; otherwise its first small slip feeds back (it sees its own last action) and grows
+        o = obs + 0.3 * spread * jax.random.normal(key, obs.shape)
+        out = netw.policy_network.apply(norm, params, {"state": o, "privileged_state": o})
         mean = jp.tanh(out[:, :n])
         std = jax.nn.softplus(out[:, n:])
         # match the program's actions; keep the exploration noise moderate so practice doesn't wreck it at once
@@ -369,16 +409,39 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000):
     st = opt.init(pol)
 
     @jax.jit
-    def upd(params, st):
-        l, g = jax.value_and_grad(loss)(params)
+    def upd(params, st, key):
+        l, g = jax.value_and_grad(loss)(params, key)
         u, st = opt.update(g, st)
         return optax.apply_updates(params, u), st, l
 
     for i in range(steps):
-        pol, st, l = upd(pol, st)
+        pol, st, l = upd(pol, st, jax.random.fold_in(kn, i))
         if i in (0, steps - 1):
             print(json.dumps({"imitation_loss": float(l), "samples": int(obs.shape[0]), "step": i}), flush=True)
     return (norm, pol, val)
+
+
+def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512):
+    """DAPG-style: while it practises, keep a pull towards the demonstration's actions in the situations the
+    demonstration went through (an extra term in PPO's loss), so practice refines a working copy instead of
+    slowly forgetting it. Rajeswaran et al. 2018 ("Learning Complex Dexterous Manipulation with Deep RL and
+    Demonstrations") decay it; here it stays, small, because the demonstration is known to reach the goal."""
+    from brax.training.agents.ppo import losses as ppo_losses
+    z = np.load(demo)
+    obs = jp.array(z["obs"], dtype=jp.float32)
+    act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32)
+    original = ppo_losses.compute_ppo_loss
+
+    def loss(params, normalizer_params, data, rng, ppo_network, *a, **kw):
+        total, metrics = original(params, normalizer_params, data, rng, ppo_network, *a, **kw)
+        i = jax.random.randint(jax.random.fold_in(rng, 7), (min(batch, obs.shape[0]),), 0, obs.shape[0])
+        o = obs[i]
+        out = ppo_network.policy_network.apply(normalizer_params, params.policy, {"state": o, "privileged_state": o})
+        bc = jp.mean(jp.square(jp.tanh(out[:, :n_act]) - act[i]))
+        metrics = dict(metrics, copy_loss=bc)
+        return total + weight * bc, metrics
+
+    ppo_losses.compute_ppo_loss = loss
 
 
 def main():
@@ -390,6 +453,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--restore", help="continue from this earlier round's params.pkl (same robot and scene)")
     ap.add_argument("--imitate-only", action="store_true", help="copy the task's demonstration and stop (no practice)")
+    ap.add_argument("--keep-copying", type=float, default=0.5,
+                    help="with a demonstration: weight of the pull towards its actions during practice (0 = off)")
     ap.add_argument("--randomize", choices=("off", "light", "full"), default="light",
                     help="vary friction, object mass, motor strength, delay and sensor noise between practice copies")
     a = ap.parse_args()
@@ -399,7 +464,8 @@ def main():
     out = task_path.parent
     # the evaluation always starts from the scene's start: the numbers are the real task, not the practice starts
     env, eval_env = TaskLearn(task, a.envs, a.randomize), TaskLearn(task, 128, a.randomize, practice_starts=False)
-    print(json.dumps({"obs": obs_size(env.ix), "actions": env.nu, "tips": [env.mj_model.body(int(b)).name for b in env.ix.tips]}),
+    n_obs = obs_size(env.ix) + (1 if env.residual is not None else 0)
+    print(json.dumps({"obs": n_obs, "actions": env.nu, "residual": env.residual is not None, "tips": [env.mj_model.body(int(b)).name for b in env.ix.tips]}),
           flush=True)
     p = locomotion_params.brax_ppo_config("Go1JoystickFlatTerrain")
     p.num_timesteps, p.num_envs, p.num_evals = a.steps, a.envs, a.evals
@@ -416,45 +482,69 @@ def main():
                # how many of the steps it gets through, on average by the end of an episode (the metric is
                # summed over the episode, so the running count's mean is a lower bound)
                "steps_done": float(metrics.get("eval/episode_steps_done", 0.0)) / p.episode_length}
+        if env.terms:  # each of Nemotron's reward terms: its average value per control step in the evaluation
+            rec["terms"] = [round(float(metrics.get(f"eval/episode_term_{k}", 0.0)) / p.episode_length, 4)
+                            for k in range(len(env.terms))]
         log.append(rec)
         print(json.dumps(rec), flush=True)
 
     ckpts = out / "checkpoints"
     ckpts.mkdir(exist_ok=True)
 
+    import pickle
+    latest = {}
+
+    class StopRound(Exception):
+        pass
+
     def checkpoint(step, _make_policy, params):  # the app plays each one so you can watch it improve
         path = ckpts / f"step_{int(step):012d}.npz"
         export_numpy(params, path)
+        latest["params"], latest["step"] = jax.device_get(params), int(step)
         print(json.dumps({"checkpoint": str(path), "step": int(step)}), flush=True)
+        if (out / "stop_round").exists():  # the person watching asked to change the plan now: end this round here
+            (out / "stop_round").unlink(missing_ok=True)
+            raise StopRound()
 
     rand = domain_randomize(env, a.randomize) if a.randomize != "off" else None
     restore = None
     if not a.restore and task.get("demo") and (out / task["demo"]).exists():  # first round: copy the program first
-        restore = imitate(env, net, out / task["demo"], a.seed)
-        import pickle
+        restore = imitate(env, net, out / task["demo"], a.seed, residual=env.residual is not None)
         export_numpy(restore, out / "policy.npz")  # the copy on its own: Morph tries it before any practice
         (out / "params.pkl").write_bytes(pickle.dumps(jax.device_get(restore)))
         if a.imitate_only:
             print(json.dumps({"imitated": str(out / "policy.npz")}), flush=True)
             return
     if task.get("demo"):  # practice from a copy: small, careful updates, so practice refines it rather than wrecks it
-        kw["learning_rate"] = kw.get("learning_rate", 3e-4) / 6
-        kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) / 10
+        # ... unless copying it didn't work: then the learner must be free to move away from it (learn_in_rounds sets
+        # how free, from how the copy did: task["copy_trust"] 1 = it works, 0 = it never does)
+        trust = float(task.get("copy_trust", 1.0))
+        kw["learning_rate"] = kw.get("learning_rate", 3e-4) / (1 + 5 * trust)
+        kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) / (1 + 9 * trust)
+        weight = a.keep_copying * max(trust, 0.2)
+        if weight > 0 and (out / task["demo"]).exists():
+            keep_copying(out / task["demo"], env.nu, weight)
     if a.restore and Path(a.restore).exists():  # a later round: continue from where the last one got to
-        import pickle
         restore = pickle.loads(Path(a.restore).read_bytes())
         print(json.dumps({"restored": a.restore}), flush=True)
     train = functools.partial(ppo.train, **kw, seed=a.seed, progress_fn=progress, policy_params_fn=checkpoint,
                               restore_params=restore, restore_value_fn=True,
                               randomization_fn=rand,
                               network_factory=functools.partial(ppo_networks.make_ppo_networks, **net))
-    _, params, _ = train(environment=env, eval_env=eval_env, wrap_env_fn=wrapper.wrap_for_brax_training)
+    stopped = False
+    (out / "stop_round").unlink(missing_ok=True)
+    try:
+        _, params, _ = train(environment=env, eval_env=eval_env, wrap_env_fn=wrapper.wrap_for_brax_training)
+    except StopRound:  # ended early on request: keep what it learned up to the last snapshot
+        params, stopped = latest["params"], True
+        print(json.dumps({"stopped_early": latest["step"]}), flush=True)
     shapes = export_numpy(params, out / "policy.npz")
-    import pickle
     (out / "params.pkl").write_bytes(pickle.dumps(jax.device_get(params)))  # for the next round to continue from
     meta = {"task": str(task_path), "steps": a.steps, "num_envs": a.envs, "randomize": a.randomize,
             "randomize_ranges": ranges(a.randomize), "wall_s": round(time.time() - t0, 1),
-            "network": shapes, "curve": log, "obs_size": obs_size(env.ix), "actions": env.nu}
+            "network": shapes, "curve": log, "obs_size": n_obs, "actions": env.nu,
+            "keep_copying": a.keep_copying if task.get("demo") else 0.0, "stopped_early": stopped,
+            "residual": task.get("residual") if env.residual is not None else None}
     (out / "train_meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps({k: v for k, v in meta.items() if k != "curve"}), flush=True)
 

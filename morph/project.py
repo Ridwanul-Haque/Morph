@@ -257,18 +257,11 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         out |= _run_arm(pj, goal, spec, p, robot_path, prof.name, n, log, record_demo, stand_at)
     elif plan["plan_id"] == "legged_foot_push":
         out |= _run_legged(pj, goal, spec, p, prof, n, log, record_demo, stand_at)
-    elif (plan["plan_id"] == "learn_policy" and llm is not None and llm.available and prof.base == "fixed"
-          and prof.has_gripper):
+    elif plan["plan_id"] == "learn_policy" and llm is not None and llm.available and program_body(prof):
         # no ready-made skill: Nemotron writes a program from building blocks, Morph runs and checks it, and
         # Nemotron fixes it from what happened. Seconds per try, instead of minutes of learning.
-        from .programs import solve
-        plan = {"plan_id": "program", "planner": "nemotron", "how": "Nemotron writes a program from building blocks "
-                "(move the hand, open, close); Morph runs it and tells it what happened until the checklist is met"}
-        out["plan"] = plan
-        emit(type="plan", robot=prof.name, plan_id="program", planner="nemotron", how=plan["how"], what_is_it=prof.summary(),
-             templates=[{"id": c.id, "ok": c.applicable, "met": c.met, "missing": c.missing} for c in checks])
-        out |= solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=n, stand_at=stand_at)
-        out.pop("adapter", None), out.pop("demos", None)  # for learning from; not part of the result
+        out |= run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out)
+        plan = out["plan"]
         if not out.get("success"):
             out["why_not"] = (out.get("why_not") or out.get("setup_error", "")) + \
                 "; it can still learn one: open the Robot tab and choose Learn this task"
@@ -285,6 +278,13 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         log(f"nothing this robot can run for this goal yet ({plan['plan_id']}): {why}")
         out["success"], out["n"] = 0, 0
         out["why_not"] = why
+    if (out.get("setup_error") and not out.get("n") and plan["plan_id"] != "program" and llm is not None and llm.available
+            and program_body(prof)):
+        # the ready-made skill couldn't be set up here (e.g. out of reach from where it could stand): a program instead
+        log(f"  the ready-made skill couldn't be set up ({out['setup_error']}): Nemotron writes a program instead")
+        out.pop("setup_error")
+        out |= run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out)
+        plan = out["plan"]
     if out.get("setup_error") and not out.get("n"):
         out["why_not"] = (f"the ready-made skill couldn't be set up: {out['setup_error']}; it can learn one instead: "
                           "open the Robot tab and choose Learn this task")
@@ -292,6 +292,65 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
     emit(type="robot_done", robot=prof.name, plan_id=plan["plan_id"], success=out.get("success", 0), n=out.get("n", 0),
          why_not=out.get("why_not", ""))
     return out
+
+
+def program_body(prof) -> str | None:
+    """Which building blocks Nemotron can write a program from for this body: "arm" (a bolted-down arm with a parallel
+    gripper: programs.py), "body" (any other bolted-down robot: a gripperless arm, a hand, a tilted grasp:
+    body_programs.py), "legged" (a walking robot with a learned gait: legged_programs.py), or None."""
+    from .planner import walk_policy_dir
+    if prof.base == "fixed":
+        return "arm" if prof.has_gripper else "body"
+    if prof.base == "floating" and prof.n_legs >= 4 and walk_policy_dir(prof) is not None:
+        return "legged"
+    return None
+
+
+def run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out) -> dict:
+    """Nemotron's program for this body (program_body), run and checked; an arm whose hand-down blocks don't work out
+    gets a second go with the general blocks (any part, any pointing)."""
+    from .learn_task import LEARNED
+    kind = program_body(prof)
+    how = {"arm": "Nemotron writes a program from building blocks (move the hand, open, close, throw); Morph runs it and "
+                  "tells it what happened until the checklist is met",
+           "body": "Nemotron writes a program that moves the robot's parts (any part, pointing any way); Morph runs it and "
+                   "tells it what happened until the checklist is met",
+           "legged": "Nemotron writes a program from walking building blocks (walk to, turn, push with a foot, bump); Morph "
+                     "runs it on the robot's learned gait and tells it what happened until the checklist is met"}
+
+    def announce(k):
+        plan = {"plan_id": "program", "planner": "nemotron", "how": how[k]}
+        emit(type="plan", robot=prof.name, plan_id="program", planner="nemotron", how=plan["how"], what_is_it=prof.summary(),
+             templates=[{"id": t["id"], "ok": t["applicable"], "met": t["met"], "missing": t["missing"]}
+                        for t in out.get("templates", [])])
+        return plan
+
+    res: dict = {}
+    if kind == "arm":
+        from .programs import solve
+        res = solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=n, stand_at=stand_at)
+        res.pop("adapter", None), res.pop("demos", None)  # for learning from; not part of the result
+        res["plan"] = announce("arm")
+        if res.get("success"):
+            return res
+        log("  the hand-down building blocks didn't work out: trying the general ones (any part, any pointing)")
+        kind = "body"
+        first = res
+    if kind == "body":
+        from .body_programs import solve_body
+        from .learn_task import make_task, slug
+        folder = LEARNED.parent / "programs" / "tasks" / f"{prof.name}__{slug(' '.join(goal.describe())) or 'goal'}"
+        task = make_task(pj, goal, robot_path, plan=False, stand_at=stand_at, folder=folder)
+        r = solve_body(pj, goal, task, llm, log=log, emit=emit, n=n, attempts=3 if res else 5)
+        r.pop("demos", None)
+        r["plan"] = announce("body")
+        if res and not r.get("success") and not r.get("n"):
+            return first  # the arm blocks got further: report those
+        return r
+    from .legged_programs import solve_legged
+    r = solve_legged(pj, goal, prof, llm, log=log, emit=emit, n=n, stand_at=stand_at)
+    r["plan"] = announce("legged")
+    return r
 
 
 def _finish_trial(pj, goal, env, released, t0, i, log, robot="", n=0, fell=False) -> dict:

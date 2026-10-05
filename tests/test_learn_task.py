@@ -138,3 +138,138 @@ def test_several_step_plans_are_tried_and_the_best_is_kept(tmp_path, monkeypatch
     assert load_task(task_path)["steps"][0]["done_when"] == "touch_dist < 0.05"
     assert (task_path.parent / "params.pkl").read_bytes() == b"touch it first"  # the winner's policy continues
     assert not list(task_path.parent.glob("candidate_*"))
+
+
+def test_corrections_on_a_recipe_replay_it_and_export_the_same(tmp_path, monkeypatch):
+    """Residual learning: a policy that outputs nothing replays the recipe exactly; the ROS 2 core and Morph's own
+    loop give the same commands step by step (recipe + scale x correction, with the recipe's phase observed)."""
+    import morph.learn_task as lt
+    from morph.learn_task import NumpyPolicy, demo_to_task
+    from morph.task_model import CTRL_DT, Residual, next_ctrl
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"), plan=False)
+    task = load_task(task_path)
+    m = build_task_model(task)
+    ix = indices(m, task)
+    d = mujoco.MjData(m)
+    d.qpos[ix.home_adr] = ix.home_val
+    mujoco.mj_forward(m, d)
+    rng = np.random.default_rng(0)
+    demo, c = [], np.clip(ix.q0, ix.act_lo, ix.act_hi)
+    for k in range(60):  # a "recipe" recorded on the task's own model: a smooth wander of the joints
+        c = np.clip(c + rng.normal(0, 0.02, m.nu), ix.act_lo, ix.act_hi)
+        d.ctrl[:] = c
+        for _ in range(round(CTRL_DT / m.opt.timestep)):
+            mujoco.mj_step(m, d)
+        demo.append((d.qpos.copy(), d.qvel.copy(), c.copy()))
+    info = demo_to_task(task_path, None, [demo])
+    assert info["residual"]
+    task = load_task(task_path)
+    res = Residual.of(task, task_path.parent)
+    assert res is not None and res.T == 60
+    z = np.load(task_path.parent / "demo.npz")
+    assert np.allclose(z["act"], 0.0)  # along the recipe itself there's nothing to correct
+    _random_policy(task_path.parent, obs_size(indices(m, task)) + 1, m.nu)
+    export(task_path)
+    pkg = next((task_path.parent / "export" / "ros2").iterdir())
+    assert (pkg / "policy" / "recipe.npy").exists()
+    spec = importlib.util.spec_from_file_location("policy_core", pkg / pkg.name / "policy_core.py")
+    core_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core_mod)
+    core = core_mod.MorphPolicy(pkg / "policy")
+    out = core.scene_to_input()
+    me = mujoco.MjModel.from_xml_path(str(pkg / "policy" / "model.xml"))
+    de = mujoco.MjData(me)
+    de.qpos[:] = core.spec["initial_qpos"]
+    mujoco.mj_forward(me, de)
+    ix = indices(me, task)
+    pol = NumpyPolicy(task_path.parent / "policy.npz")
+    t = task["target"]
+    tgt = (t["x"], t["y"], t["z"], t["yaw"])
+    last, ctrl = np.zeros(me.nu), np.clip(ix.q0, ix.act_lo, ix.act_hi)
+    core.ctrl = ctrl.copy()  # the same first command on both sides
+    for k in range(25):
+        b, bv = ix.block, ix.block_v
+        core.set_state(de.qpos[ix.home_adr], de.qvel[ix.joint_vadr], out.point(de.xpos[b]), out.quat(de.xquat[b]),
+                       out.vector(de.qvel[bv:bv + 3]))
+        theirs = core.step()
+        o = np.concatenate([observe(np, de.qvel, de.actuator_length, de.actuator_velocity, de.xpos, de.xmat, last, ix, tgt),
+                            res.phase(np, k)])
+        last = pol(o)
+        ctrl = next_ctrl(np, ctrl, res.action(np, k, last), ix.q0, ix.act_scale, ix.act_lo, ix.act_hi, ix.act_step)
+        np.testing.assert_allclose(theirs, ctrl, atol=1e-6)
+        de.ctrl[:] = ctrl
+        for _ in range(round(CTRL_DT / me.opt.timestep)):
+            mujoco.mj_step(me, de)
+        mujoco.mj_forward(me, de)
+    zp = task_path.parent / "export.zip"
+    unz = tmp_path / "unz"
+    zipfile.ZipFile(zp).extractall(unz)
+    r = subprocess.run([sys.executable, "run_policy.py"], cwd=unz, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "object ended at" in r.stdout, r.stderr[-800:]
+
+
+def test_what_the_person_watching_says_reaches_nemotron_and_changes_the_plan(tmp_path, monkeypatch):
+    """A suggestion typed during a round goes to Nemotron with the measurements at the end of it; the revised steps
+    are what the next round practises, and the round's record says what was said."""
+    import json as _json
+    import morph.learn_task as lt
+    from morph.reasoning import SkillStepsProposal
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"))
+    m = build_task_model(load_task(task_path))
+    n_obs, n_act = obs_size(indices(m, load_task(task_path))), m.nu
+    heard = []
+
+    class FakeLLM:
+        available = True
+
+        def revise_steps(self, *a, advice=None, **k):
+            heard.append(advice)
+            return SkillStepsProposal(steps=[{"name": "get the tip low behind it", "done_when": "touch_dist < 0.03"}],
+                                      reward_terms=[{"name": "low", "formula": "-abs(hand_z - z)", "weight": 1}],
+                                      rationale="You said: push it lower. Added a step that gets the tip low first."), None
+
+    def fake_train(tp, n, restore):
+        _random_policy(tp.parent, n_obs, n_act)
+        (tp.parent / "train_meta.json").write_text(_json.dumps({"curve": [{"success": 0.0, "dist": 1.0}]}))
+        return True
+
+    said = [["it pushes the top and tips it, push it lower"]]
+    events = []
+    res = lt.learn_in_rounds(pj, goal, task_path, fake_train, llm=FakeLLM(), log=lambda s: None,
+                             emit=lambda **e: events.append(e), total_steps=10_000_000, rounds=2, tries=1, candidates=0,
+                             advice=lambda: said.pop() if said else [])
+    assert heard == [["it pushes the top and tips it, push it lower"]]
+    t = load_task(task_path)
+    assert t["steps"][0]["done_when"] == "touch_dist < 0.03" and t["reward_terms"][0]["name"] == "low"
+    assert res["rounds"][0]["person_said"] == ["it pushes the top and tips it, push it lower"]
+    assert any(e.get("stage") == "advice" and e["rationale"].startswith("You said") for e in events)
+
+
+def test_only_a_finished_skill_that_works_is_used(tmp_path):
+    """A policy on disk isn't a learned skill: learning must have finished and succeeded in at least half its tries."""
+    import json as _json
+    from morph.learn_task import learning_status
+    d = tmp_path / "robot__goal"
+    d.mkdir()
+    assert learning_status(d)["state"] == "none"
+    (d / "task.json").write_text("{}")
+    (d / "policy.npz").write_bytes(b"x")
+    (d / "status.json").write_text(_json.dumps({"state": "learning"}))
+    assert not learning_status(d)["good"]  # stopped part-way
+    (d / "status.json").write_text(_json.dumps({"state": "done", "success": 2, "n": 10}))
+    assert not learning_status(d)["good"]  # finished, but it doesn't work
+    (d / "status.json").write_text(_json.dumps({"state": "done", "success": 6, "n": 10}))
+    assert learning_status(d)["good"]
+    (d / "status.json").unlink()  # older folders: finished, and its last evaluation reached the goal
+    (d / "train_meta.json").write_text(_json.dumps({"curve": [{"success": 0.0}]}))
+    assert not learning_status(d)["good"]
+    (d / "train_meta.json").write_text(_json.dumps({"curve": [{"success": 120.0}]}))
+    assert learning_status(d)["good"]
+    (d / "candidate_0").mkdir()  # an interrupted plan search
+    assert not learning_status(d)["good"]

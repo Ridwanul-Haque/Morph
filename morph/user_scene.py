@@ -87,7 +87,7 @@ class UserScene:
         b = self.block
         return {"object": {"name": self.object_name, "size_cm": [round(2 * b.half_x * 100, 1), round(2 * b.half_y * 100, 1),
                                                                   round(2 * b.half_z * 100, 1)],
-                           "start_xy_m": [round(self.start[0], 3), round(self.start[1], 3)],
+                           "shape": b.shape, "start_xy_m": [round(self.start[0], 3), round(self.start[1], 3)],
                            "start_heading_deg": round(math.degrees(self.start[2]), 1)},
                 "fixtures": {n: f.geometry() for n, f in self.fixtures.items()},
                 "frame": "metres; x east, y north, z up; heading 0 = east, 90 = north; the floor is z = 0"}
@@ -96,7 +96,7 @@ class UserScene:
         b = self.block
         return {"object": {"name": self.object_name, "size_cm": [round(2 * b.half_x * 100, 1), round(2 * b.half_y * 100, 1),
                                                                   round(2 * b.half_z * 100, 1)],
-                           "mass_kg": b.mass, "start_xy": [round(self.start[0], 3), round(self.start[1], 3)],
+                           "shape": b.shape, "mass_kg": b.mass, "start_xy": [round(self.start[0], 3), round(self.start[1], 3)],
                            "start_yaw_deg": round(math.degrees(self.start[2]), 1)},
                 "fixtures": {n: f.describe() for n, f in self.fixtures.items()}, "notes": self.notes}
 
@@ -190,7 +190,17 @@ def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
         pts.append((corners - pb) @ Rb)
     pts = np.vstack(pts)
     half = (pts.max(0) - pts.min(0)) / 2
-    if not (len(og) == 1 and m.geom_type[og[0]] == int(mujoco.mjtGeom.mjGEOM_BOX)):
+    shape = "box"
+    if len(og) == 1:  # a single sphere, upright cylinder or capsule is simulated as itself
+        t, sz = int(m.geom_type[og[0]]), m.geom_size[og[0]]
+        upright = abs((d.geom_xmat[og[0]].reshape(3, 3))[2, 2]) > 0.99
+        if t == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+            shape, half = "sphere", np.array([sz[0]] * 3)
+        elif t == int(mujoco.mjtGeom.mjGEOM_CYLINDER) and upright:
+            shape, half = "cylinder", np.array([sz[0], sz[0], sz[1]])
+        elif t == int(mujoco.mjtGeom.mjGEOM_CAPSULE) and upright:
+            shape, half = "capsule", np.array([sz[0], sz[0], sz[1] + sz[0]])
+    if shape == "box" and not (len(og) == 1 and m.geom_type[og[0]] == int(mujoco.mjtGeom.mjGEOM_BOX)):
         notes.append(f"object {obj_name} is modelled as its {2 * half[0] * 100:.1f} x {2 * half[1] * 100:.1f} x "
                      f"{2 * half[2] * 100:.1f} cm bounding box")
     block_mass = float(m.body_subtreemass[ob])
@@ -245,5 +255,5 @@ def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
         fixtures[name] = f
 
     block = BlockSpec(half_x=float(half[0]), half_y=float(half[1]), half_z=float(half[2]), mass=block_mass,
-                      friction=friction, fixtures_xml="".join(xml))
+                      friction=friction, fixtures_xml="".join(xml), shape=shape)
     return UserScene(str(path), obj_name, block, start, fixtures, notes)

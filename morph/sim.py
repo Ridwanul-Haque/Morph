@@ -86,13 +86,24 @@ class SimulationEnvironment:
         mujoco.mj_resetData(self.model, self.data)
         self.model.body_mass[self._block_body] = params.block_mass
         self.model.geom_friction[self._block_geom, 0] = params.block_friction
-        # inertia must follow mass for a solid box
-        sx, sy, sz = (2 * self.model.geom_size[self._block_geom])
+        # inertia must follow mass, for the object's own shape
         m = params.block_mass
-        self.model.body_inertia[self._block_body] = [
-            m / 12 * (sy**2 + sz**2), m / 12 * (sx**2 + sz**2), m / 12 * (sx**2 + sy**2)]
+        size, kind = self.model.geom_size[self._block_geom], int(self.model.geom_type[self._block_geom])
+        if kind == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+            r = size[0]
+            self.model.body_inertia[self._block_body] = [0.4 * m * r * r] * 3
+            hz = r
+        elif kind in (int(mujoco.mjtGeom.mjGEOM_CYLINDER), int(mujoco.mjtGeom.mjGEOM_CAPSULE)):
+            r, h = size[0], 2 * size[1] + (2 * size[0] if kind == int(mujoco.mjtGeom.mjGEOM_CAPSULE) else 0.0)
+            side = m * (3 * r * r + h * h) / 12
+            self.model.body_inertia[self._block_body] = [side, side, 0.5 * m * r * r]
+            hz = h / 2
+        else:
+            sx, sy, sz = (2 * size)
+            self.model.body_inertia[self._block_body] = [
+                m / 12 * (sy**2 + sz**2), m / 12 * (sx**2 + sz**2), m / 12 * (sx**2 + sy**2)]
+            hz = size[2]
         x, y, yaw = block_xy_yaw
-        hz = self.model.geom_size[self._block_geom][2]
         self.data.qpos[self._bq:self._bq + 3] = [x, y, hz]
         self.data.qpos[self._bq + 3:self._bq + 7] = quat_from_yaw(yaw)
         if robot_qpos:

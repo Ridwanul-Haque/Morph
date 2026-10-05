@@ -419,7 +419,7 @@ def main(argv=None) -> int:
     s.add_argument("--steps", type=int, default=60_000_000)
     s.add_argument("--envs", type=int, default=1024)
     s.add_argument("--randomize", choices=("off", "light", "full"), default="light")
-    s.add_argument("--tries", type=int, default=5)
+    s.add_argument("--tries", type=int, default=10)
     s.add_argument("--rounds", type=int, default=4, help="practise in this many rounds; between them Nemotron "
                                                            "revises the steps from what the robot actually did")
     s.add_argument("--no-llm", action="store_true")

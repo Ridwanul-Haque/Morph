@@ -56,13 +56,15 @@ class Condition(BaseModel):
     text: str | None = None  # expression: what it means in words
     # when it must hold: at the end (default), at the moment the robot lets go (throwing), the whole time,
     # or at some point during the task
-    when: Literal["end", "release", "always", "ever"] = "end"
+    # ... or for the last `seconds` of the try, without a break (keep it spinning, keep it balanced)
+    when: Literal["end", "release", "always", "ever", "last"] = "end"
+    seconds: float | None = None  # when = "last": for how long (default 2 s)
     source: Literal["demo", "description", "default"] = "default"
 
     def describe(self) -> str:
         base = self._describe()
         return {"end": base, "release": f"when it lets go: {base}", "always": f"the whole time: {base}",
-                "ever": f"at some point: {base}"}[self.when]
+                "ever": f"at some point: {base}", "last": f"for the last {self.seconds or 2.0:.0f} s: {base}"}[self.when]
 
     def _describe(self) -> str:
         k = self.kind
@@ -390,7 +392,7 @@ def _measure(goal, scene, model, data, pose, released) -> tuple[dict, dict]:
         kw = {"robot_xy": data.xpos[robot[0]][:2].copy(),
               "hand_dist": float(min(np.linalg.norm(data.xpos[i] - pos) for i in robot))}
     v = quantities(np, pos=pos, R=data.xmat[bid].reshape(3, 3).copy(), vel=data.qvel[j.dofadr[0]:j.dofadr[0] + 3].copy(),
-                   start=scene.start[:2], half=(b.half_x, b.half_y, b.half_z), fixtures=fx,
+                   ang=data.qvel[j.dofadr[0] + 3:j.dofadr[0] + 6].copy(), start=scene.start[:2], half=(b.half_x, b.half_y, b.half_z), fixtures=fx,
                    held=0.0 if released else 1.0, **kw)
     return v, fx
 
@@ -455,7 +457,8 @@ def explain(c: Condition, scene: UserScene) -> str:
     text = _explain(c, scene)
     when = {"release": " Checked at the moment the robot lets go of it (the last time it releases it), not at the end.",
             "always": " Checked at every moment from start to end: one slip fails it.",
-            "ever": " It only has to happen once, at any moment during the try."}.get(c.when, "")
+            "ever": " It only has to happen once, at any moment during the try.",
+            "last": f" It has to hold without a break for the last {c.seconds or 2.0:.0f} s of the try (keep it up)."}.get(c.when, "")
     return (text + when).strip()
 
 

@@ -92,6 +92,10 @@ class MorphPolicy:
         # input frame -> scene frame: a bolted-down robot's base sits at the training mount
         mx, my, myaw = self.spec["mount"]
         self.to_scene = Frame2D(*scene_origin).inverse() if self.floating else Frame2D(mx, my, myaw)
+        # corrections on top of a recipe: the command is the recipe's action at this moment + scale x the output
+        r = self.spec.get("residual")
+        self.recipe = np.load(d / r["file"]) if r else None
+        self.res_scale = float(r["scale"]) if r else 0.0
         self.reset()
 
     @property
@@ -110,6 +114,7 @@ class MorphPolicy:
         self.d.qvel[:] = 0
         self.last = np.zeros(self.m.nu)
         self.ctrl = None
+        self.t = 0  # control steps since the start (how far through the recipe, if there is one)
 
     def set_state(self, joint_pos, joint_vel, obj_pos, obj_quat, obj_vel=(0, 0, 0),
                   base_pos=None, base_quat=None, base_lin_vel=None, base_ang_vel=None):
@@ -145,6 +150,8 @@ class MorphPolicy:
             Rb = d.xmat[ix["base"]].reshape(3, 3)
             v = ix["base_v"]
             parts += [d.xpos[ix["base"]] - bp, Rb.T @ [0, 0, -1.0], Rb.T @ d.qvel[v:v + 3] * 0.5, d.qvel[v + 3:v + 6] * 0.2]
+        if self.recipe is not None:
+            parts.append([min(self.t / len(self.recipe), 1.5)])
         return np.concatenate(parts)
 
     def act(self, obs):
@@ -160,7 +167,11 @@ class MorphPolicy:
         if self.ctrl is None:
             self.ctrl = np.clip(self.d.actuator_length * self.mask, self.lo, self.hi)
         self.last = self.act(self.observation())
-        want = np.clip(self.q0 + self.last * np.asarray(self.spec["action_scale"]), self.lo, self.hi)
+        a = self.last
+        if self.recipe is not None:
+            a = np.clip(self.recipe[min(self.t, len(self.recipe) - 1)] + self.res_scale * a, -1.0, 1.0)
+        self.t += 1
+        want = np.clip(self.q0 + a * np.asarray(self.spec["action_scale"]), self.lo, self.hi)
         self.ctrl = self.ctrl + np.clip(want - self.ctrl, -self.max_step, self.max_step)
         return self.ctrl.copy()
 
@@ -545,8 +556,9 @@ def write_ros2_package(export_dir: Path, policy: dict, goal_text: str) -> Path:
     (root / "config").mkdir()
     pol = root / "policy"
     pol.mkdir()
-    for f in ("policy.npz", "policy.json", "model.xml"):
-        shutil.copy(export_dir / f, pol / f)
+    for f in ("policy.npz", "policy.json", "model.xml", "recipe.npy"):
+        if f != "recipe.npy" or (export_dir / f).exists():
+            shutil.copy(export_dir / f, pol / f)
     if (export_dir / "assets").exists():
         shutil.copytree(export_dir / "assets", pol / "assets")
     floating = policy["indices"]["base"] >= 0

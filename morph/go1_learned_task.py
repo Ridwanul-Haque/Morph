@@ -111,13 +111,15 @@ def _route_block(a, b, block_xy) -> list[np.ndarray]:
 
 def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: int, base0=(0.0, -0.7, math.pi / 2),
                          max_pushes: int = 14, render_every: int = 0, camera: str = "track", log=print,
-                         robot=None, on_tick=None, obstacles=None, done=None) -> LearnedGo1Result:
+                         robot=None, on_tick=None, obstacles=None, done=None, reset: bool = True,
+                         push_height: float = 0.025) -> LearnedGo1Result:
     """Also runs any LearnedWalker (robots/learned_walker.py): its leg geometry is measured from the model.
     obstacles: world AABBs (lo, hi) of fixtures the robot must not stand on or walk through.
     done(): optional goal check (e.g. goal conditions measured in the scene), tested before each push."""
     t0 = time.time()
     rb = robot or LearnedGo1()
-    rb.reset(seed, block0, params, base_xy_yaw=base0)
+    if reset:  # reset=False: carry on from where the robot is (a step of a legged program)
+        rb.reset(seed, block0, params, base_xy_yaw=base0)
     rb.env.set_goal_marker(spec.gx, spec.gy, spec.gyaw)
     generic = hasattr(rb, "legs_adapter")
     qa = rb.legs_adapter() if generic else QuadrupedAdapter(model=rb.model, env=rb.env)
@@ -161,7 +163,7 @@ def run_learned_go1_push(spec: TaskSpec, block0, params: PhysicalParams, seed: i
             res.frame_info.append({"t": round(r.env.data.time, 2), "block": r.env.block_pose().as_dict(),
                                    "push": len(res.pushes), "mode": "learned walk"})
     rb.on_tick = tick
-    PUSH_H = 0.025  # contact low on the face: the 5x5x6 cm block tips if pushed above ~4 cm
+    PUSH_H = push_height  # default low on the face: the 5x5x6 cm block tips if pushed above ~4 cm
     pm = PushModel(block=rb.block, push_height=PUSH_H)
     h = rb.block.half_x
     offsets = (-0.6 * h, -0.3 * h, 0.0, 0.3 * h, 0.6 * h)  # keep the contact on the block face

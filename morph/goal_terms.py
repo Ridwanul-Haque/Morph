@@ -32,7 +32,7 @@ SIDES = {"east": (1, 0), "west": (-1, 0), "north": (0, 1), "south": (0, -1)}
 FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1, 1), "-y": (1, -1)}
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
-             "grip", "touch_dist", "lifted", "closure"}
+             "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps"}
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
                    "touch_dist"}
 FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"}
@@ -109,7 +109,7 @@ def _unit(node) -> float:
     return ANGLE_UNIT if any(v.endswith("_deg") for v in names) else LENGTH_UNIT
 
 
-def violation(xp, tree: ast.Expression, v: dict):
+def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
     """How far from true the formula is (0 when true), in rough units (90 deg ~ 30 cm ~ 1)."""
 
     def val(n):
@@ -139,6 +139,9 @@ def violation(xp, tree: ast.Expression, v: dict):
             for a in args[1:]:
                 out = xp.minimum(out, a) if f == "min" else xp.maximum(out, a)
             return out
+        if isinstance(n, (ast.Compare, ast.BoolOp)) or (isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not)):
+            # a condition inside arithmetic (a reward term like "closure * (touch_dist < 0.03)"): 1 when it holds
+            return xp.where(viol(n, False) <= 1e-9, 1.0, 0.0)
         raise ExprError("a comparison can't be used as a number")
 
     def viol(n, neg):
@@ -171,7 +174,17 @@ def violation(xp, tree: ast.Expression, v: dict):
         x = val(n)
         return xp.maximum(x - 0.5, 0.0) * 2 if neg else xp.maximum(0.5 - x, 0.0) * 2
 
+    if numeric:
+        body = tree.body if isinstance(tree, ast.Expression) else tree
+        if isinstance(body, (ast.Compare, ast.BoolOp)) or (isinstance(body, ast.UnaryOp) and isinstance(body.op, ast.Not)):
+            return -viol(tree, False)  # a condition: its graded distance from true, as a penalty (0 when it holds)
+        return val(body)
     return viol(tree, False)
+
+
+def term_value(xp, tree: ast.Expression, v: dict):
+    """A reward term's value: the number a formula gives, or for a condition minus how far from true it is."""
+    return violation(xp, tree, v, numeric=True)
 
 
 # ------------------------------------------------------------------ the condition kinds
@@ -283,6 +296,7 @@ class History:
         self.snap: dict[int, dict] = {}  # what things looked like at that moment (for the checklist)
         self.was_held = False
         self.released = False
+        self.window: dict[int, list] = {}
 
     def update(self, v: dict) -> None:
         held = float(v["held"]) > 0.5
@@ -299,6 +313,14 @@ class History:
                 keep = x >= self.value.get(i, -1.0)  # the worst moment
             elif w == "ever":
                 keep = x < self.value.get(i, math.inf)  # the best moment
+            elif w == "last":  # the worst moment of the last `seconds` (it must keep it up until the end)
+                win = self.window.setdefault(i, [])
+                win.append(x)
+                del win[:-max(1, int(round(float(c.get("seconds") or 2.0) / 0.02)))]
+                worst = max(win)
+                if worst != self.value.get(i):
+                    self.value[i] = worst
+                    self.snap[i] = snapshot(v)
             if keep:
                 self.value[i] = x
                 self.snap[i] = snapshot(v)
@@ -312,7 +334,8 @@ class History:
 
 
 def quantities(xp, *, pos, R, vel, start, half, fixtures: dict, held, robot_xy=None, hand_dist=None,
-               hand_pos=None, base_z=None, base_up=None) -> dict:
+               hand_pos=None, base_z=None, base_up=None, ang=None) -> dict:
+    """ang: the object's angular velocity in its own frame (a free joint's qvel[3:6]), for spin."""
     """Everything a condition or formula can read, from the object's state (NumPy or JAX arrays)."""
     x, y, z = pos[0], pos[1], pos[2]
     extent_z = xp.abs(R[2, 0]) * half[0] + xp.abs(R[2, 1]) * half[1] + xp.abs(R[2, 2]) * half[2]  # half height as it lies
@@ -325,6 +348,12 @@ def quantities(xp, *, pos, R, vel, start, half, fixtures: dict, held, robot_xy=N
          "vx": vel[0], "vy": vel[1], "vz": vel[2],
          "start_x": start[0], "start_y": start[1],
          "travelled": xp.sqrt((x - start[0]) ** 2 + (y - start[1]) ** 2), "held": held, "dist": dist, "R": R}
+    if ang is not None:  # how fast it spins (deg/s), and about the vertical (+ = anticlockwise seen from above)
+        w = R @ ang
+        v["spin_dps"] = xp.degrees(xp.sqrt(xp.sum(w * w)))
+        v["spin_z_dps"] = xp.degrees(w[2])
+    else:
+        v["spin_dps"] = v["spin_z_dps"] = xp.asarray(0.0)
     if robot_xy is not None:
         v["robot_x"], v["robot_y"] = robot_xy[0], robot_xy[1]
     if hand_dist is not None:

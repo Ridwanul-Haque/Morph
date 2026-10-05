@@ -1,172 +1,259 @@
 # Morph
 
-**Transfer the outcome of a demonstrated robot task, not the robot's motion, to a robot with a different body.**
+**Describe a task once, in plain words. Any robot does it in MuJoCo, with NVIDIA Nemotron reasoning at every step.**
 
-Morph runs a demonstration on a source robot in MuJoCo and records what actually happened to the object. It turns that
-into a robot-independent, user-confirmed goal (`TaskSpec`: where the block must end up and which way its arrow must point).
-It then checks whether a target robot can plausibly achieve that goal, picks a strategy that fits the target's real
-capabilities, executes it in physics, and reports the *measured* result: success, or the specific reason for failure.
-NVIDIA Nemotron (via Nebius Token Factory) interprets the instruction, selects among implemented strategies and
-diagnoses failures. The simulator, not the language model, decides what is feasible and whether it worked.
+You give Morph a scene (any MuJoCo file with one object to move: a parcel, a ball, …), pick robots (MuJoCo
+Menagerie models or your own MJCF, URDF or xacro), and type what should happen: *"throw the parcel into the bin from
+1 m north of it"*, *"knock the parcel over"*, *"lift it 10 cm and hold it there"*. Morph then:
 
-Status as of 2026-09-28 (measured with the commands under "Reproduce the results"):
+1. **Understands the goal.** Nemotron turns the sentence into a checklist of measurable conditions (where the object
+   must end up, which way up, when: at the end, at the moment the robot lets go, the whole time, the last N seconds).
+   A second Nemotron pass reviews it for wrong meanings, and Morph checks that it is consistent and physically possible
+   in this scene.
+2. **Understands the robot.** It reads the robot file itself: base (bolted down, legged, wheeled, flying), arms, legs,
+   gripper and how far it opens, each part a program can move, reach, and joint limits. Torque motors become servos;
+   floating models are stood on the floor.
+3. **Does the task with a program Nemotron writes.** Nemotron writes a short recipe from building blocks for that
+   body. Morph runs it in physics, measures what happened at every step (*"the fingers closed on nothing: the parcel
+   is 3 cm from the point between them"*), and Nemotron fixes it, up to 5 times.
+4. **Learns a robust skill from it, when that's wanted or needed.** Reinforcement learning on the GPU (MuJoCo
+   Warp + Brax PPO, thousands of copies at once, varied physics). It starts from the working program and learns
+   corrections on top of it; between rounds Nemotron reads what the robot actually did and rewrites the plan and
+   reward terms, Eureka-style.
+5. **Exports it.** The learned policy as NumPy weights plus a standalone runner, a **ROS 2 package** (a node for the
+   real robot plus a simulated stand-in), and for scripted arm runs a **MoveIt** (moveit_py) script.
 
-| What | Status |
-|---|---|
-| Franka Emika Panda → UFactory xArm7 (Menagerie models): Panda-trained task-space policy, zero-shot on the xArm7 | **48/50** held-out |
-| Same Panda-trained policy in joint space / raw joint replay on the xArm7 (baselines) | 0/50 / 0/50 |
-| Generated arm A → arm B (49% longer upper arm): task-space policy / joint policy / replay | 47/50 / 33/50 / 0/50 |
-| Source arm → arm-free mobile pusher (closed-loop push planning, contact only) | **26/30**; baselines 2/30 and 2/30 |
-| Source arm → Unitree Go1 (no arm): learned walking (RL, trained locally in ~20 min) + foot pushing | **12/16** held-out, 0 falls (hand-written crawl: 0/8) |
-| Unsupported request (face-up flip) | reported as `unsupported` with reasons |
-| Nemotron (`nvidia/nemotron-3-super-120b-a12b` via Token Factory) | live; intent benchmark Nemotron 8/8 vs rule 4/8 |
-| Visual demo | `morph view` (live 3D window) and `morph showcase` (4-robot video) |
+The simulator, not the language model, decides whether anything worked: every result is measured on the physics.
+
+## Results
+
+Measured on 2026-10-03 with the commands under [Reproduce](#reproduce). *n* tries each from slightly different
+starts (object ±2 cm, ±10°, varied mass and friction).
+
+**Programs, one sentence in, Nemotron on** (`morph do`, 4 tasks × 6 robots):
+
+| Task | Franka Panda | UFactory xArm7 | UR5e (no gripper) | SO-ARM100 (5-joint wrist, 41 cm reach) | Unitree Go1 | Unitree Go2 |
+|---|---|---|---|---|---|---|
+| Put the parcel into the bin | **5/5** (ready-made skill) | **5/5** (ready-made skill) | can't lift *(reported)* | 0/5: bin out of reach | can't lift *(reported)* | can't lift *(reported)* |
+| Lift it 10 cm and hold it | 2/5 | **5/5** | can't lift *(reported)* | 0/5 | can't lift *(reported)* | can't lift *(reported)* |
+| Knock it over | **5/5** | **5/5** | 0/5 (tilted it 34° at best) | 0/5 | 2/5 | 0/5 |
+| Push it 20 cm east | **5/5** | **5/5** | **4/5** | 0/5 (11 cm at best) | **4/5** | **4/5** |
+
+"Can't lift" cells are physically impossible for that body (no gripper, or no arm), and Morph says so before trying.
+Of the 18 possible cells, 12 succeeded at least once and 10 succeeded 4/5 or 5/5; every program was written by
+Nemotron within 5 attempts, from the sentence alone. Programs: 2–5 Nemotron calls each, about $0.01 per robot.
+
+**Learning on top of a program**, end to end with Nemotron (`morph learn`, xArm7, "lift the parcel 10 cm off the
+ground and hold it there", 10 tries): Nemotron's third program worked 8/8 on the arm it was written for, but
+replayed move for move in the learner's GPU physics its grasp slips (that physics has no anti-slip contact solver).
+Copied as is: **0/10**. After one practice round of corrections (10M steps, easy-first, about 8 min on a laptop
+GPU): **10/10**.
+
+With a hand-written program (no Nemotron), the copy alone already succeeded: lift 10/10, put it in the bin 10/10.
+
+**Why learn when the program already works:** the lift skill with the parcel knocked mid-task (it slides about 4 cm,
+a quarter of the way through), 10 tries each:
+
+| Knock | Program alone (hand-written) | Learned skill | Nemotron's program alone | Learned from it |
+|---|---|---|---|---|
+| 0.7 m/s at 20% of the way | 3/10 | **8/10** | 0/10 | **8/10** |
+| 1.0 m/s at 20% | 1/10 | **6/10** | 0/10 | 1/10 |
+| 0.7 m/s at 35% | 3/10 | **9/10** | 0/10 | **9/10** |
+
+A program follows fixed moves; the learned skill sees where the object is and corrects. The app runs this test with
+one click (Robot tab → *Test it: knock the parcel mid-task*).
+
+**Understanding requests:** `morph goal-bench`, 27 varied requests judged on example outcomes (throwing from a spot,
+gentle placing, "first the shelf, then the bin", lying on its side by the wall, …): **Nemotron 27/27**. Morph's own rule
+reader, without Nemotron: 13/26 on the earlier 26 cases.
 
 ## Quick start
 
-Tested on Ubuntu 24.04 (WSL2), Python 3.12. Running everything needs only a CPU. Training the Go1 walking policy
-needs an NVIDIA GPU, but the trained policy is included.
+Tested on Ubuntu 24.04 (WSL2), Python 3.12, an RTX 5070 Laptop GPU (8 GB) for learning. Programs and everything
+except learning run on a CPU.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.lock
 .venv/bin/pip install --no-deps -e .
-./scripts/fetch_assets.sh              # Unitree Go1 MJCF from MuJoCo Menagerie (BSD-3-Clause), pinned commit
+./scripts/fetch_assets.sh --extra      # MuJoCo Menagerie robots at a pinned commit (licenses in each folder)
 cp .env.example .env                   # then put your Nebius Token Factory key in .env (git-ignored)
+.venv/bin/morph app                    # opens http://localhost:8765
 ```
 
-If your shell sets `PYTHONPATH` (e.g. ROS), run commands with `env -u PYTHONPATH`. Rendering uses `MUJOCO_GL=glfw`
-(needs a display; on WSL2 WSLg provides one). For headless servers install OSMesa/EGL and set `MUJOCO_GL=egl`.
+For learning, a second environment with JAX on CUDA:
+`python3 -m venv .venv-rl && .venv-rl/bin/pip install "jax[cuda12]==0.11.2" && .venv-rl/bin/pip install -r requirements-rl.lock`.
+If your shell sets `PYTHONPATH` (e.g. ROS), run commands with `env -u PYTHONPATH`.
 
-### See it (visual demo)
+In the app: pick a scene (or upload your own), tick robots, type a goal, and press Run. The Robot tab shows what
+Morph found in each robot, where it stands (move it by typing or clicking on the view), the plan, and *Learn this
+task* / *Make it robust*. The view orbits, pans and zooms (⟲ resets it).
+
+From the command line:
 
 ```bash
-.venv/bin/morph view --robot franka_panda              # live 3D window: Panda does the demonstration
-.venv/bin/morph view --robot ufactory_xarm7 --policy   # Panda-trained policy running on the xArm7
-.venv/bin/morph view --robot pusher                    # arm-free mobile pusher reaches the same goal
-.venv/bin/morph view --robot go1                       # Unitree Go1: learned walking + foot pushing
-.venv/bin/morph showcase                               # renders runs/showcase/showcase.mp4 (4 robots, 2x2)
+.venv/bin/morph do examples/parcel "put the parcel into the bin" --robot third_party/mujoco_menagerie/universal_robots_ur5e/ur5e.xml
+.venv/bin/morph do examples/ball "put the ball into the bin"          # a real sphere: it rolls
+.venv/bin/morph learn examples/parcel "lift the parcel 10 cm and hold it" --robot <model.xml> --rounds 4
+.venv/bin/morph export runs/learned/<robot>__<goal>                    # policy + runner + ROS 2 package
+.venv/bin/morph inspect <model.xml|.urdf|.xacro>                       # what Morph sees in a robot
+.venv/bin/morph goal-bench                                             # does it understand varied requests?
 ```
 
-The viewer is MuJoCo's native window (drag to orbit, right-drag to pan, scroll to zoom). `--seed N` picks a
-held-out scenario, `--speed 2` plays faster, and `--once` stops after one episode.
+## How it works
 
-### The showcase (one command)
+### The goal: a checklist, not a target pose
 
-```bash
-.venv/bin/morph check-llm      # verifies the key and that the Nemotron model id is served (GET /v1/models)
-.venv/bin/morph transfer       # Panda demo -> Nemotron -> confirm -> assess -> strategy -> xArm7 -> verify -> export
-.venv/bin/morph transfer --source arm_A --target arm_B    # the generated different-length arm pair
-.venv/bin/morph transfer --target pusher   # same demo -> arm-free mobile pusher (closed-loop pushing)
-.venv/bin/morph transfer --target go1      # same demo -> Go1 quadruped (learned walking + foot pushes)
-.venv/bin/morph transfer --interactive     # confirm/edit goal x, y, yaw and tolerances at a prompt
-.venv/bin/morph transfer --flip            # face-up flip request: should come back "unsupported"
-```
+Conditions Morph can measure on the simulation: inside / on top of / touching / near / beside a fixture (or not),
+at a position, facing a heading, which face is up, lifted to a height, moved N cm in a direction, away from something,
+plus any formula over measured quantities (`x`, `y`, `z`, `tilt_deg`, `speed`, `spin_dps`, `held`, `dist_to('bin')`,
+…). Each can say *when* it must hold: `end`, `release` (throwing, dropping), `always`, `ever`, or `last` (the last N
+seconds without a break: keep it spinning, keep it balanced). "Held" is decided from real contacts: touched from two
+opposite sides and nothing else carrying it.
 
-Each run writes `runs/<timestamp>_*/` with: `source/` (the executed demo trace), `taskspec_draft.json` and
-`taskspec_confirmed.json` (per-field provenance), `capability.json`, `strategy.json`, `target/` traces, `diagnosis*.json`,
-`verify.json`, `inference.jsonl` (every Nemotron call: prompt version, model, latency, tokens, raw and parsed reply; no
-key), `export/plan.json`, `report.md`, and `replay_side_by_side.mp4`.
+### Programs: building blocks for each kind of body
 
-**Offline baseline (not hackathon compliant):** `morph transfer --no-llm` makes no Nebius call and uses deterministic
-rules. It is labelled `OFFLINE BASELINE` in the console, report and JSON.
+| Body | Building blocks | Runs on |
+|---|---|---|
+| Arm with a parallel gripper | `move_hand` (hand pointing down, lined up with the object), `open_hand`, `close_hand`, `throw_to` (Morph does the wind-up and swing and corrects the aim from where practice throws land), `wait` | the arm's own IK and gripper, grip strength found by a test pick |
+| Any robot that stands still (arms without a gripper, hands, other grippers) | `move` *any part* to a point, pointing any way (`down`, `east`, `object`, or a vector), fingers turned across the object; `push`; `grip`; `joints`; `home`; `wait` | damped least-squares IK on the learner's own model; joint-space swing when the straight path hits a joint limit; grip strength found by measuring the squeeze |
+| Legged robots with a learned gait (Go1, Go2) | `walk_to`, `turn_to`, `foot_push` (low slides it, high pushes near its top), `bump` (with the body), `push_object_to` (Morph plans a series of pushes) | the robot's walking policy, three-leg stance for the foot push |
 
-### Reproduce the results
+All of them are reactive: `until: "touch"` stops a move on contact, and `repeat_if(condition, back_to, times)` goes
+back if something didn't work ("if `held == 0` after lifting: grasp again"). Numbers can be formulas over where things
+are when the step starts (`obj_x`, `obj_top + 0.05`, `bin_x`, `hand_z`, …), so a program follows the object.
+Programs are JSON data, never code. Working programs are cached, so a rerun makes no new Nemotron call.
 
-Nothing in the results table is shipped as a file; every number is re-measured on your machine by these commands.
-Results are written to `artifacts/evidence/` (git-ignored), which the strategy selector then reads.
+### Learning: start from the program, learn corrections
 
-```bash
-.venv/bin/python -m pytest -q                                  # 28 tests, ~15 s
-.venv/bin/morph eval -n 50 --source franka_panda               # Panda -> xArm7 / arm B transfer table (~4 min)
-.venv/bin/morph eval -n 50 --source arm_A                      # arm A -> arm B (~1.5 min)
-.venv/bin/python -c "from pathlib import Path; from morph.evaluation import evaluate_pusher, evaluate_go1_learned, evaluate_go1; o=Path('artifacts/evidence'); evaluate_pusher(30, out=o); evaluate_go1_learned(16, out=o); evaluate_go1(8, out=o)"
-.venv/bin/python -c "from morph.intent_bench import run_bench; run_bench()"   # Nemotron vs rule (needs the API key)
-.venv/bin/morph spike                                          # Go1 foot-contact feasibility check + video
-.venv/bin/morph train --source franka_panda                    # retrain the arm policies from scratch (~10 min CPU each)
-```
+* **Corrections on top of the program** (residual learning): the learner's action is the program's action at that
+  moment plus a learned correction, so a policy that outputs nothing *is* the program. The correction network starts
+  at exactly zero and is first fitted to the corrections the program needed from other starts, on slightly noisy inputs
+  so it stays steady near the recorded path.
+* **Keep copying while practising** (DAPG, Rajeswaran et al. 2018): an extra term in PPO's loss keeps a pull towards
+  the program's actions, so practice refines the skill instead of slowly forgetting it.
+* **Easy-first practice** (reverse curriculum): early rounds start from moments late in the program (already holding
+  it, nearly there) and each round moves the starts back. If it's stuck at the same step twice, most practice starts
+  where it got closest on that step.
+* **The steps a person would take** (Nemotron, per body: which parts, in what order) are the reward: progress
+  towards the current step, and a step only counts after it has held for 0.2 s.
+* **Eureka-style revision:** after each round Morph replays the policy, measures where it gets stuck and what it
+  actually does, and sends that to Nemotron. Nemotron rewrites the steps and can add weighted **reward terms**
+  (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in training. When progress
+  stalls it proposes several different plans; each practises briefly and the best is kept.
+* **You can coach it too:** while it practises, type what you see it doing wrong in the Learning tab ("it grabs the
+  top edge and it slips; grab it lower"). At the end of the round (or right away, keeping what it learned so far)
+  Nemotron reads your words together with Morph's measurements and changes the steps and reward terms. Your words are
+  advice: the measurements still decide what is kept.
+* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept.
+* **Out of reach:** a bolted-down robot that never gets near the object because it stands too far away is moved
+  closer, once (not if you placed it yourself).
+* Varied physics per practice copy (friction, object mass, motor strength, a one-step delay, sensor noise).
 
-### What runs live vs. what is loaded
+Arm programs and general programs are recorded on the learner's own model, or translated joint by joint, so the copy
+matches. Learning from legged programs isn't supported yet: legged robots learn from scratch or use their program.
 
-* **Simulated live, every time:** the source demonstration, every target robot's motion, all grasps and pushes (by
-  contact physics only: no welds, no teleporting), and the success check, which reads the block's final pose from
-  the simulator. Nothing is replayed from a recording.
-* **Loaded from disk:** only trained network weights. `artifacts/policies/franka_panda/` was trained on the Panda
-  alone (see `trained_on` in its `.json`); the xArm7 and arm B run it zero-shot through their own IK.
-  `artifacts/go1_walk/` is the Go1 walking policy (training log in `train_meta.json`). Both can be retrained with the
-  commands above; without the Go1 file, Morph falls back to the hand-written crawl gait.
-* **Nemotron** sees measured object poses, the instruction, the robot's capability description and, if you've run
-  `morph eval`, the held-out success counts. It chooses among implemented strategies; the simulator decides whether
-  they worked.
+### Exports
 
-### Train the Go1 walking policy (optional; the trained policy is committed)
-
-```bash
-python3 -m venv .venv-rl && .venv-rl/bin/pip install "jax[cuda12]==0.11.2" && .venv-rl/bin/pip install -r requirements-rl.lock
-.venv-rl/bin/python scripts/train_go1_walk.py --steps 200_000_000 --envs 4096   # ~20 min on an RTX 5070 Laptop GPU
-.venv/bin/python scripts/eval_go1_walk.py                                       # sim-to-sim check in Morph's scene
-```
+* **Standalone:** `policy.npz` (NumPy weights), `policy.json` (exactly what it reads and outputs, joint order, rates,
+  the program it corrects), `model.xml` with its meshes, and `run_policy.py`.
+* **ROS 2** (`ament_python`): `policy_node` subscribes to `joint_states` and the object pose (and odometry for mobile
+  robots) and publishes `JointTrajectory` or `Float64MultiArray` commands; `sim_bridge` is a MuJoCo stand-in that speaks
+  the same topics; `ros2 launch <pkg> policy.launch.py sim:=true`. Tested: the node rebuilds the training observation
+  exactly, and the closed loop reaches the goal through ROS topics.
+* **MoveIt:** for scripted arm runs, a `moveit_py` script with the grasp and place waypoints in the robot's base frame.
 
 ## Compute and cost
 
-| item | measured | cost |
+| Item | Measured | Cost |
 |---|---|---|
-| Nemotron calls (Token Factory) | ~3.4–4.2k tokens per `morph transfer` run (2 calls) | ~$0.002 per run (at $0.30 / $0.90 per 1M input/output tokens) |
-| Arm policy training (BC/DAgger) | CPU, ~3–10 min per policy | $0 |
-| Go1 walking policy (RL, 200M steps) | local RTX 5070 Laptop GPU, 20.5 min | $0 |
-| Same on **Nebius AI Cloud** (option, not used) | an L40S from $1.55/h or an H100 at $3.85/h (rising to $4.50/h on 2026-10-01) | about $1–3 per training run; parallel sweeps for harder robots scale linearly |
+| Nemotron (Token Factory, $0.30 / $0.90 per 1M input / output tokens, read live from `/v1/models`) | goal + review: 2 calls; a program: 1 call per attempt; a learning revision: 1 call | about $0.002–0.01 per call; a full `morph do` with programs: a few cents |
+| Learning one skill (60M practice steps, 4 rounds) | local RTX 5070 Laptop, 512–1024 copies at once | about 30–40 min, no bill (about $0.05 of electricity) |
+| Same on **Nebius AI Cloud** (option) | H100 / H200 / B200; prices change on 2026-10-01, Morph shows the right one by date | about $1–3 per skill; Morph prepares the job, you start it |
 
 ## How NVIDIA and Nebius are used
 
-* **Model:** NVIDIA Nemotron (default `nvidia/nemotron-3-super-120b-a12b`, configurable via `MORPH_NEMOTRON_MODEL`),
-  an NVIDIA open model, called at runtime through the **Nebius Token Factory** OpenAI-compatible API
-  (`https://api.tokenfactory.nebius.com/v1/`, bearer `NEBIUS_API_KEY`).
-* **Three bounded calls per run**, none in the control loop:
-  1. `interpret_task`: instruction + measured object change → proposed goal, tolerances, orientation mode (e.g.
-     "arrow pointing north" overrides a sloppy 68° demo; "turn it over" → `face_up_flip` → `unsupported`).
-  2. `select_strategy`: choose one of the **implemented** strategies using recorded held-out evidence. An invented id is
-     rejected.
-  3. `diagnose`: classify a failed trial from structured evidence and propose one revision from a declared space.
-     Out-of-space revisions are rejected.
-* Every reply is JSON-schema validated (pydantic), sanity-checked against the scene, logged, and shown with its provenance.
-  Timeouts, 429/5xx retries with backoff, one bounded re-ask on invalid JSON, and a clearly labelled fallback on failure.
-* **Ablation:** `morph/intent_bench.py` scores the target's *measured* final pose against the operator's intended goal
-  for 8 fixed cases, with and without Nemotron. Result: Nemotron 8/8, rule-based baseline 4/8.
-  The rule baseline trusts the demonstration literally; Nemotron recovers intent the demo alone can't express
-  ("pointing north" when the demo stopped at 68°, "same place but facing east", "turn it over" → unsupported).
-* **Where Token Factory helped:** an OpenAI-compatible endpoint meant the reasoning layer is one small HTTP client
-  (`morph/reasoning.py`) with no SDK or GPU of our own. Swapping Nemotron sizes is one environment variable
-  (`MORPH_NEMOTRON_MODEL`, checked at startup against `GET /v1/models`). Calls take ~8–16 s and ~2k tokens, which is
-  cheap enough (~$0.002 per transfer run) to call Nemotron on every run and after every failed attempt.
-* Every call is logged to `runs/<run>/inference.jsonl` (model, latency, tokens, prompt version, raw and parsed reply).
+* **Model:** NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b`, configurable with `MORPH_NEMOTRON_MODEL`), an
+  NVIDIA open model, called through the **Nebius Token Factory** OpenAI-compatible API.
+* **What Nemotron does** (none of it in the control loop):
+  1. reads the request into a goal checklist, and reviews its own reading for wrong meanings;
+  2. plans the steps a person would take with this body;
+  3. writes programs from building blocks and fixes them from Morph's step-by-step report;
+  4. coaches learning: reads what the robot actually did, rewrites the steps and reward terms, proposes alternative
+     plans when progress stalls.
+* Every reply is schema-validated (pydantic), every formula is parsed by Morph's own safe evaluator (no `eval`), and
+  invented names, unknown building blocks or impossible numbers are sent back with the reason. A wrong answer costs a
+  retry, never a crash. Every call is logged with model, latency and tokens (`runs/app_inference.jsonl`), never the key.
+* **GPU:** learning runs on NVIDIA GPUs through JAX and MuJoCo Warp (local, or a prepared Nebius AI Cloud job).
+
+## Related work
+
+* **Eureka** (Ma et al., NVIDIA 2023): an LLM writes reward code and improves it from training statistics; it reached
+  expert-level rewards for dexterous skills such as pen spinning, with expert-prepared environments and large GPU
+  budgets. Morph's revision loop is Eureka-like, but Nemotron writes checked formulas rather than code, and Morph aims at
+  everyday tasks from a sentence, for any robot file, on one GPU.
+* **Code as Policies** (Liang et al. 2022), **RoboGen** (Wang et al. 2023), **GenSim** (Wang et al. 2023): language
+  models writing robot programs, and using them to make training data. Morph's programs follow this idea.
+* **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
+  **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017): the learning methods above.
 
 ## Robots and assets
 
-| Robot | Source | License | Controller |
-|---|---|---|---|
-| **Franka Emika Panda** (source) | [MuJoCo Menagerie `franka_emika_panda`](https://github.com/google-deepmind/mujoco_menagerie/tree/main/franka_emika_panda) @ `c96a32d` | Apache-2.0 | our DLS IK (7-DoF, posture null-space), top-down TCP, wrist-range-aware grasp axis; gripper servo gain x10 (force limit unchanged); gravity compensation |
-| **UFactory xArm7** (target arm) | [Menagerie `ufactory_xarm7`](https://github.com/google-deepmind/mujoco_menagerie/tree/main/ufactory_xarm7) @ `c96a32d` | BSD-3-Clause | same generic adapter; its own linkage gripper; gravity compensation |
-| **Unitree Go1** (arm-free quadruped) | [Menagerie `unitree_go1`](https://github.com/google-deepmind/mujoco_menagerie/tree/main/unitree_go1) @ `c96a32d` | BSD-3-Clause | our analytic leg IK, crawl gait, three-leg stance, foot push; servo kp raised to 200 (torque limits unchanged) |
-| mobile pusher | generated MJCF: holonomic base (slide x/y, hinge yaw, 30 N / 6 Nm limits), 0.023 m tip | Apache-2.0 | our tip-pose lead controller, travel around the object, push primitive |
-| arm A, arm B | generated MJCF (`morph/scene.py`), 5-DoF + parallel gripper; B has a 49% longer upper arm | Apache-2.0 | analytic IK + Cartesian lead controller |
+Any MJCF, URDF or xacro (ROS packages next to it are found). Tested with these MuJoCo Menagerie models
+(`scripts/fetch_assets.sh --extra`, pinned commit `c96a32d`): Franka Panda, UFactory xArm7 and Lite6, AgileX Piper,
+Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1 and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch.
+Walking policies are included for the Go1 (`artifacts/go1_walk/`) and the Go2 (`artifacts/walk/go2/`); `morph app`
+can train one for another legged robot.
 
-The shared object is a 5 x 5 x 6 cm block with an arrow on top, sized for the Panda's 8 cm gripper.
+## What this is not, and known limits
 
-## What this is not
+* A simulation workbench: it reads simulator ground truth (no perception) and has no real-robot validation. The ROS 2
+  export is meant as a starting point to fine-tune on hardware.
+* Programs can't express everything: dexterous in-hand skills (spinning a pen), balancing, catching. Those need
+  learning from scratch, which is much less reliable and needs far more compute.
+* Humanoids and robots without a walking policy get no programs yet; learning from legged programs isn't supported.
+* Objects are boxes, spheres, upright cylinders or capsules (other shapes are treated as their bounding box).
+* A program's accuracy is limited by its open-loop moves (pushing to within 2 cm is hard); that's what learning
+  corrections are for.
 
-A simulation workbench. It reads simulator ground truth (no perception), has no sim-to-real validation, and the exported
-plan is valid only for the MuJoCo models in this repository. It is not a real-robot controller.
+## Reproduce
+
+```bash
+.venv/bin/python -m pytest -q                       # 133 tests, ~1 min (CPU)
+.venv/bin/morph goal-bench                          # request understanding: Nemotron vs rules (~$0.07)
+.venv/bin/morph do examples/parcel "<task>" --robot <model> --run 5 --yes   # each cell of the programs table
+```
+
+The learning tables use `morph learn` (or the app) on the xArm7, and the knock test is `learn_task.robustness`.
+
+## The original transfer pipeline
+
+Morph started as demonstration transfer: a Panda demonstrates, Morph records what happened to the object and has a
+robot with a different body reach the same outcome. It's still here (`morph transfer`, `morph view`, `morph showcase`,
+`morph eval`):
+
+| What (measured 2026-09-28) | Result |
+|---|---|
+| Panda-trained task-space policy, zero-shot on the xArm7 | 48/50 (joint-space / raw replay baselines: 0/50, 0/50) |
+| Generated arm A → arm B (49% longer upper arm): task-space / joint policy / replay | 47/50 / 33/50 / 0/50 |
+| Arm → arm-free mobile pusher (closed-loop push planning) | 26/30 (baselines 2/30, 2/30) |
+| Arm → Unitree Go1: learned walking (RL, ~20 min) + foot pushing | 12/16, 0 falls (hand-written crawl: 0/8) |
+
+```bash
+.venv/bin/morph transfer                     # Panda demo -> Nemotron -> confirm -> strategy -> xArm7 -> verify
+.venv/bin/morph view --robot go1             # live 3D window
+.venv/bin/morph eval -n 50 --source franka_panda
+```
 
 ## Third-party code and licenses
 
 This repository is Apache-2.0 (`LICENSE`). It builds on:
 
-* [MuJoCo](https://github.com/google-deepmind/mujoco) (Apache-2.0) and MuJoCo MJX/Warp.
+* [MuJoCo](https://github.com/google-deepmind/mujoco) (Apache-2.0), MuJoCo MJX and Warp.
 * [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) robot models, fetched by
-  `scripts/fetch_assets.sh` at a pinned commit (not stored in this repo): `franka_emika_panda` (Apache-2.0),
-  `ufactory_xarm7` (BSD-3-Clause, © UFACTORY), `unitree_go1` (BSD-3-Clause, © Unitree Robotics).
+  `scripts/fetch_assets.sh` at a pinned commit (not stored in this repo); each model folder holds its license.
 * [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) (Apache-2.0): its Go1 model is included in
-  `third_party/playground_go1/` with its license, and its `Go1Joystick` task was used to train the walking policy.
-* Brax, JAX, Flax (Apache-2.0); PyTorch, NumPy, httpx (BSD-3-Clause); pydantic (MIT); imageio (BSD-2-Clause);
-  Pillow (MIT-CMU).
+  `third_party/playground_go1/` with its license, and its `Go1Joystick` task was used to train the Go1 walking policy.
+* Brax, JAX, Flax, optax (Apache-2.0); PyTorch, NumPy, httpx (BSD-3-Clause); pydantic (MIT); imageio (BSD-2-Clause);
+  Pillow (MIT-CMU); xacro (BSD-3-Clause, optional).
 * NVIDIA Nemotron via Nebius Token Factory (called over the API; no model weights in this repo).

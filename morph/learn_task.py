@@ -25,8 +25,8 @@ from .project import Project, _free_spot, _params, _start_poses
 from .robot_import import import_robot
 from .sim import SimulationEnvironment, SimulationUnstable
 from .skill_steps import StepTracker, plan_steps
-from .task_model import (CTRL_DT, MAX_STEP, build_task_model, contact_held, indices, load_task, measure, next_ctrl,
-                         observe, write_task)
+from .task_model import (CTRL_DT, MAX_STEP, Residual, build_task_model, contact_held, indices, load_task, measure,
+                         next_ctrl, observe, write_task)
 
 ROOT = Path(__file__).resolve().parents[1]
 LEARNED = ROOT / "runs" / "learned"
@@ -37,7 +37,7 @@ def slug(s: str) -> str:
 
 
 def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print, plan: bool = True,
-              stand_at: tuple | None = None) -> Path:
+              stand_at: tuple | None = None, folder: Path | None = None) -> Path:
     """The task file for learning this goal with this robot, including the steps to go about it
     (skill_steps: Nemotron's when llm is given, else Morph's own; plan=False: none). stand_at: (x, y,
     heading) where the user put the robot, used instead of Morph's choice."""
@@ -72,6 +72,9 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         myaw = math.atan2(cy - my, cx - mx) - (math.atan2(v[1], v[0]) if np.linalg.norm(v) > 0.05 else 0.0)
     if stand_at is not None:
         mx, my, myaw = (float(v) for v in stand_at)
+        placed = True
+    else:
+        placed = False
     gripper = None
     if prof.has_gripper:  # which motor is the gripper, and which end of its range is open / closed
         try:
@@ -89,7 +92,7 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
               "yaw_tol": p["yaw_tol"], "heading": any(c.kind == "heading" for c in goal.conditions),
               "upright": any(c.kind == "upright" for c in goal.conditions), "lift": bool(p["needs_lift"]),
               "has_place": bool(p.get("has_place", True)), "lets_go": lets_go(goal)}
-    out = task_dir(prof.name, goal)
+    out = folder or task_dir(prof.name, goal)
     task = write_task(out / "task.json", robot_xml=str(xml), block=b, start=pj.scene.start, target=target,
                       mount=(mx, my, myaw), floating=floating, q0=q0, conditions=[c.model_dump() for c in goal.conditions],
                       scene_path=pj.scene.path, robot_name=prof.name, home=home,
@@ -101,6 +104,7 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         task["gripper"] = gripper
     if not floating:  # like the arm the programs run on (and real arm controllers): gravity compensated
         task["gravcomp"] = True
+    task["placed_by_user"] = placed
     if plan:
         steps, info = plan_steps(prof, goal, pj.scene, p, llm, log)
         task["steps"] = [st.model_dump() for st in steps[:-1]]  # the last step is the goal itself
@@ -129,10 +133,32 @@ def task_dir(robot_name: str, goal: GoalSpec) -> Path:
     return LEARNED / f"{robot_name}__{slug(' '.join(c.describe() for c in goal.conditions if c.kind != 'upright')) or 'goal'}"
 
 
+def learning_status(folder: Path) -> dict:
+    """How learning in this folder went: {"state": "learning" | "done" | "none", "success", "n", "good"}. A skill is
+    "good" (runs use it) only if learning finished and it succeeded in at least half of its final tries. Folders from
+    before status.json was kept count as good if their learning ran to the end (train_meta.json, no plans left over
+    from an interrupted search) and its last evaluation reached the goal state at all."""
+    folder = Path(folder)
+    if not (folder / "policy.npz").exists() or not (folder / "task.json").exists():
+        return {"state": "none", "good": False}
+    f = folder / "status.json"
+    if f.exists():
+        st = json.loads(f.read_text())
+        st["good"] = st.get("state") == "done" and st.get("n", 0) > 0 and 2 * st.get("success", 0) >= st["n"]
+        return st
+    finished = (folder / "train_meta.json").exists() and not list(folder.glob("candidate_*"))
+    reached = False
+    if finished:  # it must have reached the goal in its last evaluation at least some of the time
+        curve = json.loads((folder / "train_meta.json").read_text()).get("curve") or [{}]
+        reached = (curve[-1].get("success") or 0) > 0
+    return {"state": "done" if finished else "learning", "good": finished and reached}
+
+
 def learned_for(robot_name: str, goal: GoalSpec) -> Path | None:
-    """task.json of a finished learned skill for this robot and goal, if there is one."""
+    """task.json of a learned skill for this robot and goal that runs should use: learning finished and it worked
+    (learning_status good), else None."""
     d = task_dir(robot_name, goal)
-    return d / "task.json" if (d / "policy.npz").exists() and (d / "task.json").exists() else None
+    return d / "task.json" if learning_status(d)["good"] else None
 
 
 class NumpyPolicy:
@@ -153,7 +179,8 @@ class NumpyPolicy:
         return np.tanh(x[: self.act_dim])
 
 
-def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), settle_s: float = 1.0) -> bool:
+def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), settle_s: float = 1.0,
+            residual: "Residual | None" = None, disturb: tuple | None = None) -> bool:
     """One episode of a policy from a start pose. Returns True if the simulation blew up.
     watch: things that follow the run every control tick (skill_steps.StepTracker, goal_terms.History),
     each given the measured quantities with "held" from the real contacts."""
@@ -171,14 +198,25 @@ def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), set
     env.track_extra = (lambda: d.xpos[ix.base][:2]) if ix.base >= 0 else None
     mujoco.mj_forward(m, d)
     last, ctrl = np.zeros(m.nu), ctrl0.copy()
+    if residual is None and task.get("residual"):
+        residual = Residual.of(task, task.get("_dir", "."))
     try:
-        for _ in range(int(task["episode_s"] / CTRL_DT)):
+        for t in range(int(task["episode_s"] / CTRL_DT)):
             if stop is not None and stop():
                 break
-            a = pol(observe(np, d.qvel, d.actuator_length, d.actuator_velocity, d.xpos, d.xmat, last, ix, tgt))
+            o = observe(np, d.qvel, d.actuator_length, d.actuator_velocity, d.xpos, d.xmat, last, ix, tgt)
+            if residual is not None:  # corrections on top of the recipe: it also sees how far through it is
+                o = np.concatenate([o, residual.phase(np, t)])
+            a = pol(o)
             last = a
+            if residual is not None:
+                a = residual.action(np, t, a)
             ctrl = next_ctrl(np, ctrl, a, ctrl0, ix.act_scale, ix.act_lo, ix.act_hi, ix.act_step)
+            if disturb is not None and t == disturb[0]:  # a bump: the object suddenly gets this velocity (m/s)
+                d.qvel[ix.block_v:ix.block_v + 3] += disturb[1]
             env.advance(ctrl)
+            for w in watch:
+                w.t = t
             if watch:
                 v = measure(np, d.xpos, d.xmat, d.qvel, ix, task, held=contact_held(m, d, ix), ctrl=d.ctrl)
                 for w in watch:
@@ -241,6 +279,40 @@ def try_policy(pj: Project, goal: GoalSpec, task_path: Path, n: int = 5, log=pri
     return {"success": ok, "n": len(trials), "trials": trials}
 
 
+def robustness(pj: Project, goal: GoalSpec, task_path: Path, n: int = 10, at: float = 0.25, speed: float = 0.7,
+               log=print) -> dict:
+    """The difference learning makes: the same tries with the object bumped part-way through (it suddenly slides at
+    `speed` m/s in a random direction, `at` of the way through the recipe), once with the recipe alone (the policy's
+    corrections switched off) and once with the learned skill. A recipe follows fixed moves and doesn't notice; the
+    learned skill sees where the object is and corrects."""
+    task = load_task(task_path)
+    m = build_task_model(task, accurate=True)
+    ix = indices(m, task)
+    env = SimulationEnvironment(m, control_dt=CTRL_DT)
+    res = Residual.of(task, task_path.parent)
+    T = res.T if res is not None else int(task["episode_s"] / CTRL_DT / 1.6)
+    rng = np.random.default_rng(7)
+    bumps = [(int(at * T), np.array([*(speed * np.array([math.cos(a), math.sin(a)])), 0.0]))
+             for a in rng.uniform(0, 2 * math.pi, n)]
+    pols = {"learned skill": NumpyPolicy(task_path.parent / "policy.npz")}
+    if res is not None:
+        pols = {"recipe alone": lambda o: np.zeros(m.nu)} | pols
+    out = {"n": n, "bump": f"the {pj.scene.object_name} is knocked at {speed:.1f} m/s in a random direction, "
+                            f"{at:.0%} of the way through the task"}
+    for name, pol in pols.items():
+        ok = 0
+        for i, (start, bump) in enumerate(zip(_start_poses(pj.scene, n), bumps)):
+            hist = History([c.model_dump() for c in goal.conditions], task.get("fixtures", {}),
+                           (task["block"]["half_x"], task["block"]["half_y"], task["block"]["half_z"]))
+            blew = rollout(env, m, ix, task, pol, start, _params(i), i, watch=(hist,), residual=res, disturb=bump)
+            held = contact_held(m, env.data, ix) > 0.5
+            r = check(goal, pj.scene, m, env.data, env.block_pose(), env.block_speed(), not held, history=hist)
+            ok += bool(r["success"]) and not blew
+        out[name] = ok
+        log(f"  bumped mid-task, {name}: {ok}/{n}")
+    return out
+
+
 RUNNER = '''"""Run the policy Morph learned, in MuJoCo (numpy + mujoco only).
 
     pip install mujoco numpy
@@ -274,13 +346,18 @@ tips, mask = np.array(ix["tips"]), np.array(ix["pos_mask"])
 q0, lo, hi = np.array(spec["default_pose"]), np.array(ix["act_lo"]), np.array(ix["act_hi"])
 tx, ty, tz, tyaw = spec["target"]
 
-def observe(last):
+res = spec.get("residual")  # corrections on top of a recipe (recipe.npy): action = recipe[t] + scale * output
+recipe = np.load(res["file"]) if res else None
+
+def observe(last, t):
     bp = d.xpos[ix["block"]]; R = d.xmat[ix["block"]].reshape(3, 3); yaw = math.atan2(R[1, 0], R[0, 0])
     parts = [(d.actuator_length - q0) * mask, d.actuator_velocity * 0.1, bp - [tx, ty, tz], R[:, 2], [math.cos(yaw - tyaw), math.sin(yaw - tyaw)],
              d.qvel[ix["block_v"]:ix["block_v"] + 3] * 0.5, (d.xpos[tips] - bp).ravel(), last]
     if ix["base"] >= 0:
         Rb = d.xmat[ix["base"]].reshape(3, 3); v = ix["base_v"]
         parts += [d.xpos[ix["base"]] - bp, Rb.T @ [0, 0, -1.0], Rb.T @ d.qvel[v:v + 3] * 0.5, d.qvel[v + 3:v + 6] * 0.2]
+    if recipe is not None:
+        parts.append([min(t / len(recipe), 1.5)])
     return np.concatenate(parts)
 
 d.qpos[:] = spec["initial_qpos"]; d.ctrl[:] = np.clip(q0, lo, hi); mujoco.mj_forward(m, d)
@@ -289,9 +366,10 @@ last, ctrl = np.zeros(m.nu), np.clip(q0, lo, hi)
 viewer = None
 if "--view" in sys.argv:
     import mujoco.viewer; viewer = mujoco.viewer.launch_passive(m, d)
-for _ in range(int(spec["episode_s"] / spec["control_dt"])):
-    last = policy(observe(last))
-    want = np.clip(q0 + last * np.asarray(spec["action_scale"]), lo, hi)
+for t in range(int(spec["episode_s"] / spec["control_dt"])):
+    last = policy(observe(last, t))
+    a = last if recipe is None else np.clip(recipe[min(t, len(recipe) - 1)] + res["scale"] * last, -1, 1)
+    want = np.clip(q0 + a * np.asarray(spec["action_scale"]), lo, hi)
     ctrl = ctrl + np.clip(want - ctrl, -np.asarray(spec["max_step"]), np.asarray(spec["max_step"]))
     d.ctrl[:] = ctrl
     for _ in range(steps):
@@ -313,6 +391,9 @@ def export(task_path: Path, dest: Path | None = None) -> Path:
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     shutil.copy(src / "policy.npz", dest / "policy.npz")
+    res = Residual.of(task, src)
+    if res is not None:  # the recipe the policy corrects (its action per control step)
+        np.save(dest / "recipe.npy", res.base)
     (dest / "model.xml").write_text(_portable_xml(task, dest / "assets"))
     d = mujoco.MjData(m)
     d.qpos[ix.home_adr] = ix.home_val
@@ -338,8 +419,9 @@ def export(task_path: Path, dest: Path | None = None) -> Path:
                         "object up axis (3)", "cos, sin of (object heading - target heading) (2)", "object velocity x 0.5 (3)",
                         f"end bodies relative to object ({len(ix.tips)} x 3: " +
                         ", ".join(m.body(int(b)).name.removeprefix("robot_") for b in ix.tips) + ")",
-                        "last action (n)"] + (["base - object (3)", "gravity in base frame (3)", "base velocity in base frame x 0.5 (3)",
-                                               "base angular velocity x 0.2 (3)"] if ix.base >= 0 else []),
+                        "last action (n): the network's own output"] + (["base - object (3)", "gravity in base frame (3)", "base velocity in base frame x 0.5 (3)",
+                                               "base angular velocity x 0.2 (3)"] if ix.base >= 0 else [])
+                       + (["how far through the recipe: control steps / recipe length, at most 1.5 (1)"] if res is not None else []),
         "network": "normalise with obs_mean/obs_std, 3 hidden layers with swish, tanh on the first half of the output",
         "indices": {"joint_qadr": ix.home_adr.tolist(), "joint_vadr": ix.joint_vadr.tolist(), "pos_mask": ix.pos_mask.tolist(),
                     "tips": ix.tips.tolist(), "block": ix.block,
@@ -347,6 +429,10 @@ def export(task_path: Path, dest: Path | None = None) -> Path:
                     "act_hi": ix.act_hi.tolist()},
         "initial_qpos": d.qpos.tolist(), "training": {k: meta.get(k) for k in ("steps", "wall_s")},
         "mount": list(task["mount"]), "randomize": meta.get("randomize", "off"),
+        "residual": {"file": "recipe.npy", "scale": res.scale,
+                     "meaning": "corrections on top of a recipe: action = recipe[t] + scale * output (t = control steps "
+                                "since the start, clipped to the recipe's last); the observation ends with t / len(recipe)"}
+        if res is not None else None,
     }
     (dest / "policy.json").write_text(json.dumps(policy_json, indent=1))
     (dest / "run_policy.py").write_text(RUNNER)
@@ -411,6 +497,7 @@ class _Watch:
         self.seen: dict[int, dict] = {}
         self.ext = {"touch": 9.0, "grip": 0.0, "lifted": 0.0, "moved": 0.0, "speed": 0.0, "tilt": 0.0, "held_s": 0.0}
         self.frontier: dict[int, np.ndarray] = {}  # the state it was in when it came closest to each step
+        self.frontier_t: dict[int, int] = {}
         self._improved = None
 
     def update(self, v: dict) -> None:
@@ -438,8 +525,9 @@ class _Watch:
 
 
     def see(self, d) -> None:
-        if self._improved is not None:  # keep the state of its best moment so far on that step
+        if self._improved is not None:  # keep the state of its best moment so far on that step (and when it was)
             self.frontier[self._improved] = d.qpos.copy()
+            self.frontier_t[self._improved] = getattr(self, "t", 0)
             self._improved = None
 
 
@@ -475,14 +563,17 @@ def diagnose(task_path: Path, policy_path: Path, n: int = 4) -> dict:
     if stuck:  # where it got closest on the step it's stuck at: the next round practises from there too
         k = stuck[0][0]
         starts = [w.frontier[k] for w in watches if k in w.frontier]
+        when = [w.frontier_t[k] for w in watches if k in w.frontier]
         if starts:
             f = task_path.parent / "starts.npz"
             qs, cs = np.array(starts), np.full((len(starts), m.nu), np.nan)  # no commands: hold the pose it's in
+            ts = np.array(when, dtype=np.int32)
             if f.exists() and task.get("demo"):  # keep the program's moments too
                 old = np.load(f)
                 qs = np.concatenate([old["qpos"], qs])
                 cs = np.concatenate([old["ctrl"] if "ctrl" in old else np.full((len(old["qpos"]), m.nu), np.nan), cs])
-            np.savez(f, qpos=qs, ctrl=cs)
+                ts = np.concatenate([old["t"] if "t" in old else np.zeros(len(old["qpos"]), np.int32), ts])
+            np.savez(f, qpos=qs, ctrl=cs, t=ts)
             task["starts"] = {"file": "starts.npz", "share": 0.5 if task.get("demo") else 0.3,
                               "from": f"its closest moments on step {k + 1}" + (" and the program's" if task.get("demo") else "")}
             task_path.write_text(json.dumps(task, indent=1))
@@ -497,41 +588,107 @@ def diagnose(task_path: Path, policy_path: Path, n: int = 4) -> dict:
         "fastest the object moved (m/s)": round(max(e["speed"]), 2)}
     if task.get("floating"):
         out["what_the_robot_did"]["most its body tilted (degrees)"] = round(max(e["tilt"]), 0)
+    terms = term_stats(task_path.parent, task)
+    if terms:
+        out["reward_terms"] = terms
     return out
 
 
-def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, scene, rounds: list, log=print) -> dict | None:
+def term_stats(folder: Path, task: dict) -> list[dict]:
+    """How each of Nemotron's reward terms behaved in the last practice: its average value per tick in the first and
+    last evaluation (Eureka's "reward reflection": a term that never moves isn't helping)."""
+    terms = task.get("reward_terms") or []
+    meta = json.loads((folder / "train_meta.json").read_text()) if (folder / "train_meta.json").exists() else {}
+    curve = [c for c in meta.get("curve", []) if c.get("terms") and len(c["terms"]) == len(terms)]
+    if not terms or not curve:
+        return []
+    return [{"name": t["name"], "formula": t["formula"], "weight": t["weight"],
+             "average_per_tick_at_start": curve[0]["terms"][k], "average_per_tick_at_end": curve[-1]["terms"][k]}
+            for k, t in enumerate(terms)]
+
+
+def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, scene, rounds: list, log=print,
+                      advice: list[str] | None = None) -> dict | None:
     """Nemotron reads what the learner actually did and rewrites the steps (smaller first steps, reachable
     thresholds, graded quantities); Morph checks the new steps and writes them into the task."""
     from .introspect import profile_robot
-    from .skill_steps import Step, check_steps, robot_brief, scales
+    from .skill_steps import Step, check_steps, check_terms, robot_brief, scales
     task = load_task(task_path)
     prof = profile_robot(task["robot_xml"])
     p = placement(goal, scene)
     errors, fix = [], None
     for _ in range(2):
         prop, rec = llm.revise_steps(robot_brief(prof), [c.describe() for c in goal.conditions], task.get("steps", []),
-                                     diagnosis, scales(scene, p), rounds, fix)
+                                     diagnosis, scales(scene, p), rounds, fix, advice=advice)
         raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
         new, errors = check_steps(raw, list(scene.fixtures), scene.object_name)
+        terms, t_err = check_terms(prop.reward_terms, list(scene.fixtures), scene.object_name)
+        errors += t_err
         if new and not errors:
             task["steps"] = [s.model_dump() for s in new]
+            task["reward_terms"] = terms
             task["steps_from"] = f"nemotron, revised after round {len(rounds)}"
             task_path.write_text(json.dumps(task, indent=1))
             return {"steps": task["steps"], "rationale": prop.rationale}
-        fix = {"your_previous_steps": [s.model_dump() for s in raw], "problems": errors}
+        fix = {"your_previous_steps": [s.model_dump() for s in raw], "your_previous_reward_terms": prop.reward_terms,
+               "problems": errors}
     log(f"  (Nemotron's revised steps couldn't be measured: {'; '.join(errors[:2])}; keeping the old ones)")
     return None
 
 
 def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None, log=print, emit=None,
-                    total_steps: int = 60_000_000, rounds: int = 4, tries: int = 5, candidates: int = 3) -> dict:
+                    total_steps: int = 60_000_000, rounds: int = 4, tries: int = 10, candidates: int = 3,
+                    advice=None) -> dict:
+    """Learning in rounds (see _learn_rounds), with its state kept in status.json: runs only use the skill once
+    learning has finished and it worked (learning_status)."""
+    folder = task_path.parent
+    for c in folder.glob("candidate_*"):  # left over from an interrupted plan search
+        shutil.rmtree(c, ignore_errors=True)
+    (folder / "status.json").write_text(json.dumps({"state": "learning"}))
+    res = _learn_rounds(pj, goal, task_path, train, llm, log, emit, total_steps, rounds, tries, candidates, advice)
+    (folder / "status.json").write_text(json.dumps({"state": "done", "success": int(res.get("success", 0)),
+                                                    "n": int(res.get("n", 0)), "tries": tries}))
+    return res
+
+
+def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None, log=print, emit=None,
+                  total_steps: int = 60_000_000, rounds: int = 4, tries: int = 10, candidates: int = 3,
+                  advice=None) -> dict:
     """Practise in short rounds. After each: try it; if it isn't there yet, measure what it actually does and
     (with Nemotron) revise the steps, then keep practising from where it got to. candidates > 0: instead of one
     revision, Nemotron proposes that many different plans and the best after brief practice is kept (Eureka-style).
     A round that did better than the one before keeps its plan: the plan only changes when progress stalls.
-    train(task_path, steps, restore) -> bool runs the GPU trainer."""
+    train(task_path, steps, restore) -> bool runs the GPU trainer. advice() -> list[str]: what the person watching has
+    said since it was last asked (e.g. "it grabs the top edge and it slips"); it goes to Nemotron with the measurements
+    at the end of the round, and the plan is revised from both."""
     emit = emit or (lambda **e: None)
+
+    def take_advice(r: int, history: list) -> bool:
+        said = [a.strip() for a in (advice() if advice else []) if a and a.strip()]
+        if not said:
+            return False
+        if llm is None or not getattr(llm, "available", False):
+            emit(type="learn_round", round=r, rounds=rounds, stage="advice", said=said,
+                 rationale="Nemotron is off, so suggestions can't be turned into steps")
+            return False
+        diag = diagnose(task_path, task_path.parent / "policy.npz")
+        history.append({"round": r, "tries_succeeded": f"{res['success']}/{res['n']}", "diagnosis": diag, "person_said": said})
+        log(f"  you said: {' / '.join(said)}")
+        try:
+            rev = revise_task_steps(task_path, llm, diag, goal, pj.scene, history, log, advice=said)
+        except Exception as e:  # noqa: BLE001
+            rev = None
+            log(f"  (Nemotron's revision couldn't be used: {e})")
+        why = rev["rationale"] if rev else ("Nemotron's answer couldn't be turned into steps Morph can measure, so the plan "
+                                            "stays as it was (see the Log)")
+        history[-1]["revision"] = why
+        emit(type="learn_round", round=r, rounds=rounds, stage="advice", said=said, rationale=why)
+        if rev:
+            t = load_task(task_path)
+            emit(type="skill_steps", robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+                 rationale=why)
+        return bool(rev)
+
     per = max(5_000_000, total_steps // rounds)
     history, res, best, last_fit = [], {"success": 0, "n": 0}, None, None
     task = load_task(task_path)
@@ -546,8 +703,17 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
                 res["learned_by"] = "copying the program"
                 res["rounds"] = history
                 return res
+            # how far to trust the program while practising: the less the copy works, the freer practice is to change
+            t = load_task(task_path)
+            t["copy_trust"] = round(res["success"] / max(res["n"], 1), 2)
+            task_path.write_text(json.dumps(t, indent=1))
+            if t["copy_trust"] < 0.3:
+                log(f"  the copy only worked {res['success']}/{res['n']}: practice is free to move well away from the program")
+            take_advice(0, history)
+    stuck_before = None
     for r in range(1, rounds + 1):
         restore = task_path.parent / "params.pkl" if (r > 1 or task.get("demo")) else None
+        _easy_first(task_path, r, rounds, log)
         emit(type="learn_round", round=r, rounds=rounds, stage="practice", steps=per)
         if not train(task_path, per, restore):
             res["why_not"] = "the trainer stopped (see the log)"
@@ -557,6 +723,12 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
         best = _keep_best(task_path, res, best, f"round {r}")
         if res["success"] >= math.ceil(0.6 * tries) or r == rounds:
             break
+        if take_advice(r, history):  # the person watching said what's wrong: that revision is this round's
+            t = load_task(task_path)  # and loosen the pull towards the program, so the change can show
+            t["copy_trust"] = round(min(float(t.get("copy_trust", 1.0)), 0.5), 2)
+            task_path.write_text(json.dumps(t, indent=1))
+            last_fit = _fitness(task_path.parent, res)
+            continue
         fit = _fitness(task_path.parent, res)
         improving = fit > last_fit if last_fit is not None else fit[1] > 0  # first round: any time in the goal state
         if improving:  # still getting better: keep practising the same plan
@@ -571,6 +743,15 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
                         "diagnosis": diag})
         stuck = diag.get("stuck_at")
         log(f"  round {r}: {res['success']}/{res['n']}" + (f"; stuck at step {stuck['step']} ({stuck['name']})" if stuck else ""))
+        moved = _remount(task_path, diag, log)
+        if moved:  # it couldn't reach: stand closer and start again (nothing it learned carries over)
+            history[-1]["remounted"] = moved
+            emit(type="learn_round", round=r, rounds=rounds, stage="remounted", text=moved)
+            last_fit, stuck_before = None, None
+            continue
+        if stuck and stuck_before == stuck["step"] and diag.get("practice_from"):
+            _focus(task_path, stuck, log)  # stuck at the same step twice: practise mostly from there
+        stuck_before = stuck["step"] if stuck else None
         emit(type="learn_round", round=r, rounds=rounds, stage="diagnosed", diagnosis=diag)
         if llm is not None and getattr(llm, "available", False) and candidates > 0:
             each = max(2_000_000, per // (candidates + 1))
@@ -608,16 +789,81 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
     return res
 
 
+def _remount(task_path: Path, diag: dict, log=print) -> str | None:
+    """A bolted-down robot that never got near the object because it stands too far away: move its mount closer
+    (once), so the object is well inside its reach, and practise again from scratch. Not when the user placed it,
+    and not when it learns from a recipe (the recipe was recorded where it stands)."""
+    task = load_task(task_path)
+    did = diag.get("what_the_robot_did", {})
+    touch = did.get("closest any of its end parts got to the object's surface (cm)", 0.0) / 100
+    if task.get("floating") or task.get("demo") or task.get("placed_by_user") or task.get("remounted") or touch < 0.08:
+        return None
+    reach = max((v["max_horizontal"] for v in profile_robot(task["robot_xml"]).reach_m.values()), default=0.0)
+    mx, my, myaw = task["mount"]
+    sx, sy = task["start"][:2]
+    dist = math.hypot(sx - mx, sy - my)
+    if reach <= 0 or dist < 0.8 * reach:
+        return None  # in reach: it's the skill that's missing, not the spot
+    step = dist - 0.6 * reach
+    task["mount"] = [mx + (sx - mx) / dist * step, my + (sy - my) / dist * step, myaw]
+    task["remounted"] = True
+    task_path.write_text(json.dumps(task, indent=1))
+    for f in ("params.pkl", "starts.npz"):
+        (task_path.parent / f).unlink(missing_ok=True)
+    task = load_task(task_path)
+    task.pop("starts", None)
+    task_path.write_text(json.dumps(task, indent=1))
+    msg = (f"it never got within {touch * 100:.0f} cm of the {task.get('object', 'object')}: the object is {dist:.2f} m away and "
+           f"it reaches about {reach:.2f} m, so it now stands {step:.2f} m closer")
+    log(f"  {msg}")
+    return msg
+
+
+def _easy_first(task_path: Path, r: int, rounds: int, log=print) -> None:
+    """Easy-first practice (a reverse curriculum, Florensa et al. 2017): with a recipe to start from, early rounds
+    practise from moments late in it (already holding it, nearly there), and each round moves the starts back
+    towards the beginning, so the end of the task is mastered first and every later skill builds on it."""
+    task = load_task(task_path)
+    st = task.get("starts")
+    if not task.get("demo") or not st or st.get("focus"):
+        return
+    z = np.load(task_path.parent / st["file"])
+    if "t" not in z or not len(z["t"]):
+        return
+    frac = max(0.0, 0.5 - 0.25 * (r - 1)) if rounds > 1 else 0.0  # 50% of the way in, then 25%, then all of it
+    st["from_t"] = int(frac * int(z["t"].max()))
+    task["starts"] = st
+    task_path.write_text(json.dumps(task, indent=1))
+    if st["from_t"]:
+        log(f"  round {r}: practising from the later part of the recipe first (from {frac:.0%} of the way in)")
+
+
+def _focus(task_path: Path, stuck: dict, log=print) -> None:
+    """Stuck at the same step two rounds running: most practice starts where it got closest on that step, so it
+    practises that step on its own rather than spending most of its time on what it can already do."""
+    task = load_task(task_path)
+    if task.get("starts"):
+        task["starts"].update(share=0.7, from_t=0, focus=stuck["step"])
+        task_path.write_text(json.dumps(task, indent=1))
+        log(f"  stuck at step {stuck['step']} twice: practising mostly from its closest moments on that step")
+
+
 # ------------------------------------------------------------------ learning from a working program
-def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: float = 0.5) -> dict:
-    """A program's successful runs (recorded on the arm it ran on) in the learner's terms: the observation the
-    policy would see at each moment and the action that gives the program's commands (for imitation), plus
-    states along the way to start practice from (hand around it, gripping it, lifting it). The task's arm must
-    stand where the program's arm stood (make_task stand_at)."""
+def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: float = 0.5,
+                 residual: float | None = 0.3) -> dict:
+    """A program's successful runs in the learner's terms: the observation the policy would see at each moment and
+    the action that gives the program's commands (for imitation), plus states along the way to start practice from
+    (hand around it, gripping it, lifting it). ad: the adapter whose model the runs were recorded on (an arm the
+    program ran on; it must stand where the task's arm stands, make_task stand_at), or None if they were recorded on
+    the task's own model (body_programs).
+
+    residual (default): the learner outputs corrections on top of the first run's actions (Residual), scaled by this;
+    the targets to copy are then the corrections each run needed (zero along the first run). None: it outputs whole
+    actions, copied from the runs."""
     task = load_task(task_path)
     m = build_task_model(task)
     d = mujoco.MjData(m)
-    src = ad.model
+    src = ad.model if ad is not None else m
     jmap, amap = [], []
     for j in range(src.njnt):
         n = src.joint(j).name
@@ -626,13 +872,14 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
             jmap.append((src.jnt_qposadr[j], m.jnt_qposadr[tj], 7, src.jnt_dofadr[j], m.jnt_dofadr[tj], 6))
             continue
         try:
-            tj = m.joint("robot_" + n).id
+            tj = m.joint(n if ad is None else "robot_" + n).id
         except KeyError:
             continue
-        jmap.append((src.jnt_qposadr[j], m.jnt_qposadr[tj], 1, src.jnt_dofadr[j], m.jnt_dofadr[tj], 1))
+        span = 7 if int(src.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE) else 1
+        jmap.append((src.jnt_qposadr[j], m.jnt_qposadr[tj], span, src.jnt_dofadr[j], m.jnt_dofadr[tj], 6 if span == 7 else 1))
     for a in range(src.nu):
         try:
-            amap.append((a, m.actuator("robot_" + src.actuator(a).name).id))
+            amap.append((a, m.actuator(src.actuator(a).name if ad is None else "robot_" + src.actuator(a).name).id))
         except KeyError:
             continue
     # start where the demonstration started (the arm's own ready pose, hand open), and let "no action" mean
@@ -642,7 +889,7 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
         name = m.joint(j).name
         if name.startswith("robot_") and name.removeprefix("robot_") in task.get("home", {}):
             try:
-                sj = src.joint(name.removeprefix("robot_")).id
+                sj = src.joint(name if ad is None else name.removeprefix("robot_")).id
             except KeyError:
                 continue
             task["home"][name.removeprefix("robot_")] = float(q_first[src.jnt_qposadr[sj]])
@@ -650,13 +897,13 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
     for sa, ta in amap:
         q0[ta] = float(c_first[sa])
     task["q0"] = q0
+    task["residual"] = {"scale": residual} if residual else None
     task_path.write_text(json.dumps(task, indent=1))
     ix = indices(m, task)
     t = task["target"]
     tgt = (t["x"], t["y"], t["z"], t["yaw"])
-    obs, acts, sq, sc = [], [], [], []
-    for demo in demos:
-        last = np.zeros(m.nu)
+
+    def frames(demo):  # each moment of a run in the task model: (state set in d, the absolute action)
         for k, (qpos, qvel, ctrl) in enumerate(demo):
             d.qpos[:] = m.qpos0
             d.qvel[:] = 0
@@ -668,32 +915,46 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
             for sa, ta in amap:
                 c[ta] = ctrl[sa]
             c = np.clip(c, ix.act_lo, ix.act_hi)
-            a = np.clip((c - ix.q0) / ix.act_scale, -1.0, 1.0)
-            obs.append(observe(np, d.qvel, d.actuator_length, d.actuator_velocity, d.xpos, d.xmat, last, ix, tgt))
+            yield k, c, np.clip((c - ix.q0) / ix.act_scale, -1.0, 1.0)
+
+    base = np.array([a for _, _, a in frames(demos[0])]) if residual else None
+    obs, acts, sq, sc, st = [], [], [], [], []
+    for demo in demos:
+        last = np.zeros(m.nu)
+        for k, c, a in frames(demo):
+            o = observe(np, d.qvel, d.actuator_length, d.actuator_velocity, d.xpos, d.xmat, last, ix, tgt)
+            if residual:  # what the policy outputs here: the correction from the first run's action at this moment
+                o = np.concatenate([o, [min(k / len(base), 1.5)]])
+                a = np.clip((a - base[min(k, len(base) - 1)]) / residual, -1.0, 1.0)
+            obs.append(o)
             acts.append(a)
             last = a
             if k % start_every == 0:
                 sq.append(d.qpos.copy())
                 sc.append(c)
-    np.savez(task_path.parent / "demo.npz", obs=np.array(obs), act=np.array(acts))
-    np.savez(task_path.parent / "starts.npz", qpos=np.array(sq), ctrl=np.array(sc))
+                st.append(k)
+    extra = {"base": base} if residual else {}
+    np.savez(task_path.parent / "demo.npz", obs=np.array(obs), act=np.array(acts), **extra)
+    np.savez(task_path.parent / "starts.npz", qpos=np.array(sq), ctrl=np.array(sc), t=np.array(st, dtype=np.int32))
     task["demo"] = "demo.npz"
     task["starts"] = {"file": "starts.npz", "share": share, "from": "moments along the program that worked"}
     # enough time to do it at a learner's pace: the program's own duration, and then some
     longest = max(len(dm) for dm in demos) * CTRL_DT
     task["episode_s"] = round(max(task.get("episode_s", 8.0), 1.6 * longest), 1)
-    if task.get("gripper"):  # the gripper strength the arm's grip test settled on (the program ran with it)
+    if task.get("gripper") and ad is not None:  # the gripper strength the arm's grip test settled on (the program ran with it)
         task["gripper"]["gain_scale"] = float(getattr(ad.cfg, "gripper_gain_scale", 1.0))
     task_path.write_text(json.dumps(task, indent=1))
-    return {"samples": len(obs), "starts": len(sq)}
+    return {"samples": len(obs), "starts": len(sq), "residual": bool(residual)}
 
 
 def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print, emit=None, stand_at=None,
                      steps_from: Path | None = None) -> tuple[Path, dict]:
-    """The task to learn, from a working program when there can be one: for an arm with a gripper, Nemotron writes a
-    program (programs.solve), its successful runs are recorded, and the learner starts by copying them and
-    practises from moments along them. Otherwise the task as usual. steps_from: a task.json whose steps were
-    already planned (reused, no new planning)."""
+    """The task to learn, from a working program when there can be one. For an arm with a gripper, Nemotron writes a
+    program from the hand-down blocks (programs.solve); its runs are recorded, and kept if they still work replayed in
+    the learner's own physics. Otherwise (or for any other bolted-down robot) a program from the general blocks, run on
+    the learner's own model (body_programs.solve_body). The learner then starts from the program and learns
+    corrections on top of it. Without a working program: the task as usual (learning from scratch). steps_from: a
+    task.json whose steps were already planned (reused, no new planning)."""
     from .programs import solve
     emit = emit or (lambda **e: None)
     xml, _ = import_robot(robot_path)
@@ -702,7 +963,7 @@ def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log
     planned = load_task(steps_from) if steps_from and Path(steps_from).exists() else None
     if llm is not None and getattr(llm, "available", False) and prof.base == "fixed" and prof.has_gripper:
         emit(type="caption", text="Nemotron is writing a program to learn from")
-        r = solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=3, stand_at=stand_at)
+        r = solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=8, stand_at=stand_at)
         if r.get("demos"):
             ad = r["adapter"]
             mount = (ad.cfg.base_pos[0], ad.cfg.base_pos[1], getattr(ad.cfg, "base_yaw", 0.0))
@@ -715,14 +976,54 @@ def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log
                         t[k] = planned[k]
                 task.write_text(json.dumps(t, indent=1))
             d = demo_to_task(task, ad, r["demos"])
+            ok = replay_check(pj, goal, task)
+            # replayed move for move in the learner's physics (no anti-slip contacts there) a grasp may slip; practice
+            # learns the corrections that fix it (xArm7 lift: 0/10 copied, 10/10 after one round), so keep it
+            log(f"  learning from Nemotron's program: {len(r['demos'])} successful runs, {d['samples']} moments to copy, "
+                f"{d['starts']} to practise from (replayed in the learner's physics: {ok}/3"
+                + ("; practice will correct the rest)" if ok < 3 else ")"))
+            info = {"demo": True, "program": r["program"], "program_trials": f"{r['success']}/{r['n']}", "replay": f"{ok}/3"}
+            return task, info
+        else:
+            log("  (the hand-down building blocks didn't give a working program: trying the general ones)")
+    if planned:
+        task = Path(steps_from)
+    else:
+        task = make_task(pj, goal, robot_path, llm=llm, log=log, stand_at=stand_at)
+    if llm is not None and getattr(llm, "available", False) and prof.base == "fixed":
+        # any bolted-down body: a program over its parts, run on the learner's own model, so its runs are copied as is
+        from .body_programs import solve_body
+        emit(type="caption", text="Nemotron is writing a program to learn from (moving the robot's parts)")
+        r = solve_body(pj, goal, task, llm, log=log, emit=emit, n=8, attempts=3 if prof.has_gripper else 5)
+        if r.get("demos"):
+            d = demo_to_task(task, None, r["demos"])
             log(f"  learning from Nemotron's program: {len(r['demos'])} successful runs, {d['samples']} moments to copy, "
                 f"{d['starts']} to practise from")
-            info = {"demo": True, "program": r["program"], "program_trials": f"{r['success']}/{r['n']}"}
-            return task, info
+            return task, {"demo": True, "program": r["program"], "program_trials": f"{r['success']}/{r['n']}"}
+    if info.get("demo") is False and prof.base == "fixed" and llm is not None and getattr(llm, "available", False):
         log("  (no working program to learn from: learning from scratch)")
-    if planned:
-        return Path(steps_from), info
-    return make_task(pj, goal, robot_path, llm=llm, log=log, stand_at=stand_at), info
+    return task, info
+
+
+def replay_check(pj: Project, goal: GoalSpec, task_path: Path, n: int = 3) -> int:
+    """How many of n tries the recorded program succeeds when replayed move for move in the learner's own physics
+    (the learner's starting point: corrections of zero)."""
+    task = load_task(task_path)
+    res = Residual.of(task, task_path.parent)
+    if res is None:
+        return 0
+    m = build_task_model(task, accurate=True)
+    ix = indices(m, task)
+    env = SimulationEnvironment(m, control_dt=CTRL_DT)
+    ok = 0
+    for i, start in enumerate(_start_poses(pj.scene, n)):
+        hist = History([c.model_dump() for c in goal.conditions], task.get("fixtures", {}),
+                       (task["block"]["half_x"], task["block"]["half_y"], task["block"]["half_z"]))
+        blew = rollout(env, m, ix, task, lambda o: np.zeros(m.nu), start, _params(i), i, watch=(hist,), residual=res)
+        held = contact_held(m, env.data, ix) > 0.5
+        r = check(goal, pj.scene, m, env.data, env.block_pose(), env.block_speed(), not held, history=hist)
+        ok += bool(r["success"]) and not blew
+    return ok
 
 
 def _keep_best(task_path: Path, res: dict, best, label: str):
@@ -754,7 +1055,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     learner is now, in its own folder; the best on the same yardstick becomes the plan and the policy. Returns what
     was chosen, or None if Nemotron couldn't propose any."""
     from .introspect import profile_robot
-    from .skill_steps import Step, check_steps, robot_brief, scales
+    from .skill_steps import Step, check_steps, check_terms, robot_brief, scales
     emit = emit or (lambda **e: None)
     task = load_task(task_path)
     prof = profile_robot(task["robot_xml"])
@@ -764,12 +1065,14 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     except Exception as e:  # noqa: BLE001
         log(f"  (Nemotron couldn't propose step plans: {e})")
         return None
-    plans = [{"idea": "keep the current steps", "steps": task.get("steps", [])}]
+    plans = [{"idea": "keep the current steps", "steps": task.get("steps", []), "reward_terms": task.get("reward_terms", [])}]
     for c in prop.candidates:
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
         ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name)
+        terms, t_err = check_terms(c.get("reward_terms"), list(pj.scene.fixtures), pj.scene.object_name)
+        errors += t_err
         if ok and not errors:
-            plans.append({"idea": str(c.get("idea", ""))[:200], "steps": [s.model_dump() for s in ok]})
+            plans.append({"idea": str(c.get("idea", ""))[:200], "steps": [s.model_dump() for s in ok], "reward_terms": terms})
         else:
             log(f"  (a proposed plan couldn't be measured: {'; '.join(errors[:1])})")
     if len(plans) == 1:
@@ -784,7 +1087,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         for f in ("demo.npz", "starts.npz"):  # the same demonstration and practice starts
             if (main / f).exists():
                 shutil.copy(main / f, cdir / f)
-        t = dict(task, steps=plan["steps"])
+        t = dict(task, steps=plan["steps"], reward_terms=plan["reward_terms"])
         (cdir / "task.json").write_text(json.dumps(t, indent=1))
         log(f"  candidate {i + 1}/{len(plans)}: {plan['idea']}")
         if not train(cdir / "task.json", steps_each, main / "params.pkl"):
@@ -808,7 +1111,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     for i in range(len(plans)):
         shutil.rmtree(main / f"candidate_{i}", ignore_errors=True)
     chosen = {"index": best, "idea": plans[best]["idea"], "tries": f"{res['success']}/{res['n']}", "in_goal": fit[1],
-              "tried": len(plans), "rationale": prop.rationale}
+              "tried": len(plans), "rationale": prop.rationale, "reward_terms": plans[best]["reward_terms"]}
     log(f"  kept candidate {best + 1}: {plans[best]['idea']} ({res['success']}/{res['n']})")
     emit(type="learn_round", stage="chosen", **chosen)
     return chosen | {"result": res}

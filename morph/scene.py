@@ -36,6 +36,10 @@ class BlockSpec:
     # Static things from a user's scene (bins, platforms, walls), as world-frame MJCF bodies. They go
     # wherever the block goes, so every robot's scene and the push planner's model contain them.
     fixtures_xml: str = ""
+    # its shape: "box" (half_x, half_y, half_z), "sphere" (radius half_z), "cylinder" (radius half_x, half-height
+    # half_z, standing up), "capsule" (radius half_x, half_z to the tip of a cap). Everything that plans or checks
+    # positions treats it as its bounding box (half_x, half_y, half_z).
+    shape: str = "box"
 
     def as_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if k != "fixtures_xml"}
@@ -90,6 +94,18 @@ ARM_B = ArmGeometry(
 def _block_xml(block: BlockSpec) -> str:
     hx, hy, hz = block.half_x, block.half_y, block.half_z
     top = hz + 0.0006
+    shape = getattr(block, "shape", "box")
+    if shape != "box":
+        size = {"sphere": f"{hz}", "cylinder": f"{hx} {hz}", "capsule": f"{hx} {max(hz - hx, 0.001)}"}[shape]
+        return f"""
+    <body name="block" pos="0.45 -0.15 {hz}">
+      <freejoint name="block_free"/>
+      <geom name="block_geom" type="{shape}" size="{size}" mass="{block.mass}"
+            friction="{block.friction} 0.005 0.0001" rgba="0.95 0.75 0.2 1" condim="{6 if shape == 'sphere' else 4}"/>
+      <!-- visual-only stripe, so turning and rolling show -->
+      <geom type="box" size="{hx * 0.9} {hx * 0.12} {hz * 0.9}" contype="0" conaffinity="0" mass="0" rgba="0.8 0.1 0.1 1"/>
+      <site name="block_center" pos="0 0 0" size="0.005"/>
+    </body>{block.fixtures_xml}"""
     return f"""
     <body name="block" pos="0.45 -0.15 {hz}">
       <freejoint name="block_free"/>

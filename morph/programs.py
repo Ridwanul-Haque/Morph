@@ -20,7 +20,11 @@ Programs are data (JSON steps), never code: Morph only runs these building block
 from __future__ import annotations
 
 import ast
+import hashlib
+import re
+import json
 import math
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -29,7 +33,7 @@ from .goals import GoalSpec, check
 from .goal_terms import History
 
 SPEEDS = {"slow": 0.003, "normal": 0.008, "fast": 0.03}  # metres per 20 ms control tick: 0.15, 0.4, 1.5 m/s
-OPS = {"move_hand", "open_hand", "close_hand", "wait", "throw_to"}
+OPS = {"move_hand", "open_hand", "close_hand", "wait", "throw_to", "repeat_if"}
 NAMES = {"obj_x", "obj_y", "obj_z", "obj_top", "obj_bottom", "obj_yaw_deg", "hand_x", "hand_y", "hand_z"}
 MAX_STEPS = 24
 MAX_TIME = 30.0  # seconds of simulation per program run
@@ -44,7 +48,12 @@ BLOCKS_DOC = (
     "the fast swing and lets go on the way, and corrects the aim from where practice throws land; from_x, from_y "
     "(optional) is where the hand should be when it lets go (e.g. 1 m away), else about 40 cm before the target. Use "
     "it for any throw or toss; pick the object up first. "
-    "open_hand(), close_hand() (waits until the fingers stop), wait(seconds). Every number can instead be a formula "
+    "open_hand(), close_hand() (waits until the fingers stop), wait(seconds). move_hand also takes until: \"touch\" "
+    "(stop as soon as the fingers touch the object). repeat_if(condition, back_to, times): measure now and, if the "
+    "condition holds, go back to step back_to (at most times, 1..3), e.g. {\"do\": \"repeat_if\", \"condition\": "
+    "\"held == 0\", \"back_to\": 2} after lifting grasps again if it slipped (held is 1 only while the robot alone "
+    "carries it, off whatever it rested on; conditions use the goal formula names: held, lifted, x, y, "
+    "z, bottom, tilt_deg, speed, dist_to(<fixture>)). Every number can instead be a formula "
     "(a string) over obj_x, obj_y, obj_z (object centre), obj_top, obj_bottom, obj_yaw_deg, hand_x, hand_y, hand_z, "
     "and the scene's own names (each fixture's <name>_x, <name>_y, <name>_top, <name>_floor; carry_z; lowest_z), "
     "with + - * / abs min max hypot sqrt, read when that step starts, e.g. {\"x\": \"obj_x\", \"z\": \"obj_top + 0.05\"} or "
@@ -57,10 +66,12 @@ class ProgramError(ValueError):
 
 
 # ------------------------------------------------------------------ checking a program
-def scene_names(scene, carry_z: float, lowest_z: float) -> dict:
+def scene_names(scene, carry_z: float, lowest_z: float, goal_xy=None) -> dict:
     """Numbers a formula can use by name: where each fixture is (centre x, y; its top; for containers the floor
     things rest on inside), the comfortable carry height and the lowest the hand can go."""
     out = {"carry_z": float(carry_z), "lowest_z": float(lowest_z)}
+    if goal_xy is not None:  # where the goal puts the object (if it has a place)
+        out["goal_x"], out["goal_y"] = float(goal_xy[0]), float(goal_xy[1])
     for n, f in scene.fixtures.items():
         key = "".join(ch if ch.isalnum() else "_" for ch in n.lower())
         out[f"{key}_x"] = float((f.lo[0] + f.hi[0]) / 2)
@@ -92,7 +103,29 @@ def _formula(v, what: str, known: set = frozenset()):
     return v
 
 
-def check_program(steps: list, known: set = frozenset()) -> list[dict]:
+def normalize_step(st):
+    """The same step written another common way: arguments nested under "args" (a dict, or a list / a word for one
+    argument such as grip's "close"), "action"/"op" for "do", and dotted names like where_it_must_end.x."""
+    if not isinstance(st, dict):
+        return st
+    st = dict(st)
+    if "do" not in st:
+        st["do"] = st.pop("op", None) or st.pop("action", None) or st.pop("block", None)
+    args = st.pop("args", None) or st.pop("arguments", None) or st.pop("params", None)
+    if isinstance(args, dict):
+        st = {**args, **st}
+    elif isinstance(args, (list, tuple)) and args:
+        st.setdefault("how", args[0])
+    elif isinstance(args, str):
+        st.setdefault("how", args)
+    for k, v in list(st.items()):
+        if isinstance(v, str):
+            v = re.sub(r"\bwhere_it_must_end\.(x|y)\b", r"goal_\1", v)
+            st[k] = re.sub(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b", r"\1_\2", v)  # bin.x -> bin_x, bin.top -> bin_top
+    return st
+
+
+def check_program(steps: list, known: set = frozenset(), fixtures=None) -> list[dict]:
     """The program in Morph's form; ProgramError says what's wrong, in words Nemotron can act on."""
     if not isinstance(steps, list) or not steps:
         raise ProgramError("the program has no steps")
@@ -100,6 +133,7 @@ def check_program(steps: list, known: set = frozenset()) -> list[dict]:
         raise ProgramError(f"too many steps ({len(steps)}; at most {MAX_STEPS})")
     out = []
     for i, st in enumerate(steps, 1):
+        st = normalize_step(st)
         if not isinstance(st, dict):
             raise ProgramError(f"step {i} isn't an object")
         op = st.get("do") or st.get("op")
@@ -116,6 +150,10 @@ def check_program(steps: list, known: set = frozenset()) -> list[dict]:
             s["speed"] = st.get("speed", "normal")
             if s["speed"] not in SPEEDS:
                 raise ProgramError(f"step {i}: speed must be slow, normal or fast")
+            if st.get("until") not in (None, "touch"):
+                raise ProgramError(f"step {i}: until can only be \"touch\"")
+            if st.get("until"):
+                s["until"] = "touch"
             if st.get("release_at") is not None:
                 r = float(st["release_at"])
                 if not 0.0 <= r <= 1.0:
@@ -123,6 +161,9 @@ def check_program(steps: list, known: set = frozenset()) -> list[dict]:
                 s["release_at"] = r
         elif op == "wait":
             s["seconds"] = min(max(float(st.get("seconds", 0.5)), 0.0), 5.0)
+        elif op == "repeat_if":
+            from .body_programs import check_repeat
+            s.update(check_repeat(st, i, fixtures))
         elif op == "throw_to":
             for k in ("x", "y"):
                 if k not in st:
@@ -166,6 +207,8 @@ def describe_step(s: dict) -> str:
         return f"move the hand to ({s['x']}, {s['y']}, {s['z']}){yaw}{extra}"
     if s["do"] == "wait":
         return f"wait {s['seconds']:.1f} s"
+    if s["do"] == "repeat_if":
+        return f"if {s['condition']}: back to step {s['back_to']} (at most {s['times']}x)"
     return s["do"].replace("_", " ")
 
 
@@ -241,9 +284,27 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
         near = np.linalg.norm(ad.tcp() - np.array([p.x, p.y, p.z])) < 0.035
         v["held"] = 1.0 if state["close"] and (ad.gripping() or near) else 0.0
         hist.update(v)
+        state["v"] = v
 
     report = []
-    for i, st in enumerate(steps, 1):
+    jumps: dict = {}
+    nxt = 0
+    while nxt < len(steps):
+        i, st = nxt + 1, steps[nxt]
+        nxt += 1
+        if st["do"] == "repeat_if":  # reactive: measure now, and go back if the condition holds
+            from .goal_terms import fixtures_geometry as _fg, parse, violation
+            if "v" not in state:
+                tick()
+            holds = float(violation(np, parse(st["condition"], _fg(scene)), state["v"])) <= 1e-6
+            if holds and jumps.get(i, 0) < st["times"]:
+                jumps[i] = jumps.get(i, 0) + 1
+                nxt = st["back_to"] - 1
+                report.append(f"{i}. {describe_step(st)}: it holds, going back to step {st['back_to']} (time {jumps[i]})")
+            else:
+                report.append(f"{i}. {describe_step(st)}: " + (f"it holds, but it was already repeated {st['times']} times: "
+                                                               "carrying on" if holds else "it doesn't hold: carrying on"))
+            continue
         if state["t"] > MAX_TIME:
             report.append(f"{i}. not run: out of time ({MAX_TIME:.0f} s of simulation)")
             break
@@ -269,7 +330,7 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
             p0 = ad.tcp()
             dist = float(np.linalg.norm(target - p0))
             n = max(1, math.ceil(max(dist / SPEEDS[st["speed"]], abs(dyaw) / 0.06)))
-            stuck = None
+            stuck, touched = None, None
             for k in range(n):
                 f = (k + 1) / n
                 p = p0 + (target - p0) * f
@@ -284,12 +345,17 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
                     state["close"] = False
                     note += f" (let go at {f:.0%}, hand moving at {SPEEDS[st['speed']] / env.control_dt:.1f} m/s)"
                 tick()
+                if st.get("until") == "touch" and scene.object_name in _touching(ad, bodies):
+                    touched = f
+                    break
             for _ in range(25):  # let the servos catch up (0.5 s at most)
-                if np.linalg.norm(ad.tcp() - target) < 0.005:
+                if touched is not None or np.linalg.norm(ad.tcp() - target) < 0.005:
                     break
                 tick()
             err = float(np.linalg.norm(ad.tcp() - target))
-            if stuck is not None:
+            if touched is not None:
+                note = f"touched the {scene.object_name} {touched:.0%} of the way there (stopped)" + note
+            elif stuck is not None:
                 note = (f"stopped {np.linalg.norm(target - ad.tcp()) * 100:.0f} cm short: the hand can't reach "
                         f"({stuck[0]:.2f}, {stuck[1]:.2f}, {stuck[2]:.2f}) pointing down from where the arm stands" + note)
             else:
@@ -329,7 +395,7 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
         obj = f"; the {scene.object_name} is at ({after.x:.2f}, {after.y:.2f}), bottom {bottom * 100:.0f} cm up"
         if moved > 0.01:
             obj += f" (moved {moved * 100:.0f} cm)"
-        if math.degrees(after.tilt) > 15:
+        if math.degrees(after.tilt) > 15 and getattr(b, "shape", "box") != "sphere":
             obj += f", tipped {math.degrees(after.tilt):.0f}°"
         hit = sorted(state["touched"] - {scene.object_name})
         if hit:
@@ -408,6 +474,11 @@ def tune(ad, steps: list[dict], goal: GoalSpec, scene, names: dict, params, log=
     return None if best is None else (best[1], best[2])
 
 
+def _fx(scene) -> dict:
+    from .goal_terms import fixtures_geometry
+    return fixtures_geometry(scene)
+
+
 def _has_body(m, name: str) -> bool:
     try:
         m.body(name)
@@ -424,6 +495,17 @@ def feedback(run: dict) -> dict:
 
 
 # ------------------------------------------------------------------ write, run, fix
+PROGRAM_CACHE = Path(__file__).resolve().parents[1] / "runs" / "programs"
+
+
+def _cache_path(name: str, goal: GoalSpec, scene, ad) -> Path:
+    """Where a working program for this robot, goal, scene and mount is kept (programs are data, cheap to keep)."""
+    key = json.dumps([name, [c.model_dump() for c in goal.conditions], str(getattr(scene, "path", "")), list(scene.start),
+                      [round(float(v), 3) for v in ad.cfg.base_pos[:2]], round(float(getattr(ad.cfg, "base_yaw", 0.0)), 3)],
+                     sort_keys=True, default=str)
+    return PROGRAM_CACHE / f"{name}__{hashlib.sha1(key.encode()).hexdigest()[:12]}.json"
+
+
 def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=lambda **e: None, n: int = 5,
           attempts: int = 5, stand_at=None) -> dict:
     """Nemotron writes a program; Morph runs it and tells it what happened; repeat until the checklist is met
@@ -460,10 +542,26 @@ def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=l
              "where_it_must_end": {k: round(float(p[k]), 3) for k in ("x", "y", "support_z")} if p.get("has_place") else None,
              "where_to_let_go": [round(v, 3) for v in spot] if spot else None}
     checklist = [f"{c.describe()}: {explain(c, scene)}" for c in goal.conditions]
-    names = scene_names(scene, rep.get("travel_z") or 0.15, GRASP_Z - 0.015)
+    names = scene_names(scene, rep.get("travel_z") or 0.15, GRASP_Z - 0.015,
+                        (p["x"], p["y"]) if p.get("has_place") else None)
     facts["names_for_formulas"] = {k: round(v, 3) for k, v in names.items()}
     tries, steps, ok_run = [], None, None
     a, format_fixes = 0, 0
+    cache = _cache_path(name, goal, scene, ad)
+    if cache.exists():  # a program that worked here before (same robot, goal, scene and mount): try it first, for free
+        try:
+            cached = check_program(json.loads(cache.read_text())["program"], set(names), _fx(scene))
+            ad.reset(0, scene.start, _params(0))
+            run = run_program(ad, cached, goal, scene, names=names)
+            if run["success"]:
+                log("  using the program that worked last time (no new Nemotron call)")
+                emit(type="program", robot=name, attempt=1, steps=[describe_step(x) for x in cached],
+                     rationale="Nemotron's program that worked here last time (kept, so no new call)")
+                emit(type="program_result", robot=name, attempt=1, success=True, report=run["report"], reasons=[])
+                steps, ok_run = cached, run
+                attempts = 0
+        except (ProgramError, KeyError, ValueError):
+            pass
     while a < attempts:
         emit(type="stage", robot=name, stage="trials", text=f"Nemotron is writing program {a + 1}")
         try:
@@ -475,7 +573,7 @@ def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=l
                 break
             continue
         try:
-            steps = check_program(prop.steps, set(names))
+            steps = check_program(prop.steps, set(names), _fx(scene))
         except ProgramError as e:  # a slip in the writing, not a wrong idea: doesn't use up a try (up to 3 times)
             tries.append({"program": prop.steps, "problem": f"Morph couldn't run it: {e}"})
             log(f"  program {a + 1}: can't run it: {e}")
@@ -535,6 +633,9 @@ def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=l
     if ok_run is None:
         out |= {"success": 0, "n": 0, "why_not": f"Nemotron's programs didn't reach the goal in {a} tries"}
         return out
+    if not cache.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"robot": name, "goal": goal.describe(), "program": steps}, indent=1))
     emit(type="stage", robot=name, stage="trials", text="trying the program from slightly different starts")
     trials, demos = [], []
     for i, start in enumerate(_start_poses(scene, n)):

@@ -162,10 +162,13 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .seg button.on { background: var(--raise); color: var(--text); }
 .tlabel { font-size: 12px; color: var(--faint); }
 @media (max-width: 1750px) { .toolbar .tlabel { display: none; } .toolbar { gap: 8px; } }
-.trainbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 14px; }
+/* learning shows below the view: it scrolls inside a capped height, so the view never shrinks below ~60% */
+/* learning shows as one slim strip under the view (details in the Learning tab), so the view keeps its size */
+.trainbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 10px 14px 12px; flex: none; }
+.trainbox .trainhead .row { gap: 10px; }
 .bar { height: 8px; background: var(--raise); border-radius: 99px; overflow: hidden; }
 .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .4s; }
-canvas { width: 100%; height: 110px; display: block; }
+canvas { width: 100%; height: 160px; display: block; }
 
 /* ---------- right: tabs ---------- */
 .tabs { display: flex; gap: 4px; padding: 12px 14px 0; border-bottom: 1px solid var(--line); }
@@ -340,12 +343,9 @@ header [data-tip]:hover::after { left: auto; right: 0; }
   </div>
 
   <div class="trainbox hidden" id="trainbox">
-    <div class="row"><b id="traintitle" class="grow">Learning to walk</b><span class="small muted" id="trainpct"></span></div>
-    <div class="bar" style="margin:10px 0"><div id="trainbar"></div></div>
-    <canvas id="curve" width="900" height="120"></canvas>
-    <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div>
-    <div id="trainrounds" class="small" style="margin-top:10px"></div>
-    <div id="trainsteps" style="margin-top:10px"></div>
+    <div class="trainhead"><div class="row"><b id="traintitle" class="grow">Learning to walk</b><span class="small muted" id="trainpct"></span>
+      <button class="xs ghost" onclick="showTab('learning')" data-tip="The score curve, each round, and the steps it is learning, in the Learning tab">Details</button></div>
+    <div class="bar" style="margin:10px 0 0"><div id="trainbar"></div></div></div>
   </div>
 </div>
 
@@ -355,6 +355,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <button class="tab on" data-t="results" onclick="showTab('results')">Results</button>
     <button class="tab" data-t="robot" onclick="showTab('robot')">Robot</button>
     <button class="tab" data-t="compute" onclick="showTab('compute')">Compute &amp; cost</button>
+    <button class="tab hidden" data-t="learning" id="tab-learning" onclick="showTab('learning')">Learning</button>
     <button class="tab" data-t="log" onclick="showTab('log')">Log</button>
   </div>
 
@@ -381,6 +382,19 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <div class="sec"><h4>Live view</h4><div class="card small" id="renderinfo"></div></div>
   </div>
 
+  <div class="pane hidden" id="p-learning">
+    <div class="sec"><h4>Seeing it do something wrong?</h4><div class="card small">
+      <textarea id="suggest" rows="2" style="width:100%;resize:vertical" placeholder="e.g. it grabs the parcel by the top edge and it slips out; grab it lower, around the middle"></textarea>
+      <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="xs primary" onclick="suggest(false)" data-tip="At the end of this practice round, Nemotron reads what you wrote together with Morph's measurements and changes the steps and reward terms to fix it. Your words are advice: the measurements still decide what is kept, and the best version so far is never lost. About $0.005.">Fix it after this round</button>
+        <button class="xs" onclick="suggest(true)" data-tip="Ends this round at its next snapshot (within a minute or two), keeping what it has learned so far, then changes the plan right away.">Fix it now</button></div>
+      <div id="suggested" class="tiny muted" style="margin-top:6px"></div></div></div>
+    <div class="sec"><h4>Score while it practises</h4><div class="card">
+      <canvas id="curve" width="900" height="240"></canvas>
+      <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div></div></div>
+    <div class="sec"><h4>Rounds</h4><div id="trainrounds" class="small"></div></div>
+    <div id="trainsteps"></div>
+  </div>
   <div class="pane hidden" id="p-log"><div class="log" id="log">Nothing yet.</div></div>
 </div>
 </main>
@@ -421,7 +435,7 @@ function seg(id, opts, cur, onpick) {
 }
 function showTab(t) {
   document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.t === t));
-  ["results", "robot", "compute", "log"].forEach(x => $("p-" + x).classList.toggle("hidden", x !== t));
+  ["results", "robot", "compute", "learning", "log"].forEach(x => $("p-" + x).classList.toggle("hidden", x !== t));
   if (t === "compute") refreshCosts();
 }
 
@@ -590,6 +604,7 @@ async function loadScene(path) {
   try {
     const s = await api("/api/scene", {path});
     S.scene = s; const o = s.summary.object;
+    if ([...$("scene").options].some(x => x.value === path)) $("scene").value = path;  // the picker shows what's loaded
     $("things").innerHTML = thing("object", o.name, `${o.size_cm.join(" × ")} cm · ${o.mass_kg} kg`) +
       s.fixtures.map(f => thing(f.kind, f.name, fixSub(f))).join("") +
       (s.summary.notes.length ? `<div class="note tiny">${s.summary.notes.map(esc).join("<br>")}</div>` : "");
@@ -686,6 +701,10 @@ async function profile(i) {
         <button class="xs ghost" onclick="placeReset()">Let Morph choose</button></div>
       <div class="tiny faint" style="margin-top:6px">${p.base === "fixed" ? "Where the arm is bolted down and which way it faces." : "Where it starts and which way it faces."}
         Runs and learning use this spot (0° faces east, 90° north).</div></div></div>
+    <div class="tiny muted" style="margin-top:8px" data-tip="The building blocks Nemotron can write a program from for this body. Morph runs the program, tells Nemotron what happened, and Nemotron fixes it; a program that works is also what learning starts from.">
+      Programs by Nemotron: ${{arm: "move the hand, open, close, throw, react (an arm with a gripper)",
+        body: "move any of its parts to a point, pointing any way, push, grip, react",
+        legged: "walk to, turn, push with a foot, bump with the body (on its learned gait)"}[p.recipes] || "none yet for this body (it can still learn from scratch)"}</div>
     <div class="sec" style="margin-top:14px"><h4>${S.goal ? "Plan for this goal" : "What it could do"}</h4><div class="card">
       <span class="plan ${p.plan}">${esc(PLAN[p.plan])}</span>
       ${p.why_not ? `<div class="why">${esc(p.why_not)}</div>` : ""}
@@ -694,8 +713,10 @@ async function profile(i) {
     ${p.learned ? `<div class="sec"><h4>Learned skill</h4><div class="card small">
       <div><span class="st ok">✓</span> ${esc(r.name)} has a skill it learned for this goal. Runs use it automatically.</div>
       <div class="row" style="margin-top:10px"><a href="/api/export?task=${encodeURIComponent(p.learned)}" download><button class="primary">Export the policy (.zip)</button></a>
-      <span class="tiny faint grow">network weights, the model, a runner script, and a ROS 2 package (a node for your robot plus a simulated stand-in to try it)</span></div></div></div>` : ""}
-    ${S.goal && !p.learned && !noGait && (p.plan === "learn_policy" || readyFailed(r)) ? learnCard(r, i, readyFailed(r)) : ""}
+      <span class="tiny faint grow">network weights, the model, a runner script, and a ROS 2 package (a node for your robot plus a simulated stand-in to try it)</span></div>
+      <div class="row" style="margin-top:10px"><button class="xs" onclick="robustTest(this, '${esc(p.learned)}')" data-tip="Ten tries in which the ${esc((S.scene && S.scene.summary.object.name) || "object")} is suddenly knocked (it slides a few cm) a quarter of the way through. Once with the program alone, replayed move for move, and once with the learned skill, which sees where things are and corrects. Takes a few seconds; no Nemotron calls.">Test it: knock the ${esc((S.scene && S.scene.summary.object.name) || "object")} mid-task</button>
+      <span class="tiny muted grow" id="robust-${esc(p.learned)}"></span></div></div></div>` : ""}
+    ${S.goal && !p.learned && !noGait && (p.plan === "learn_policy" || readyFailed(r) || recipeWorks(r)) ? learnCard(r, i, readyFailed(r)) : ""}
     ${noGait ? `<div class="sec"><h4>Teach it to walk</h4><div class="card small">
       <div class="muted">${esc(r.name)} has no walking skill yet. Morph can train one in simulation (300M practice steps), then use it for pushing goals.</div>
       <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
@@ -708,14 +729,25 @@ function readyFailed(r) {  // the ready-made skill ran here but couldn't be set 
   const done = R.trials.filter(t => t && t !== "run");
   return R.skip || (done.length > 0 && done.filter(t => t.success).length / done.length < 0.5);
 }
+function recipeWorks(r) {  // Nemotron's program already reached the goal in most of this robot's trials
+  const R = S.results[r.path.split("/").pop().replace(/(\.urdf)?\.(xml|urdf|xacro)$/, "")]; if (!R || !(R.programs || []).some(pg => pg.success)) return false;
+  const done = R.trials.filter(t => t && t !== "run");
+  return done.length > 0 && done.filter(t => t.success).length / done.length >= 0.5;
+}
 function learnCard(r, i, failed) {
   const e = S.test, c = S.compute; if (!e) return "";
-  const g = e.cloud[c.gpu];
-  return `<div class="sec"><h4>Learn this task</h4><div class="card small">
-    <div class="muted">${failed ? `Morph's ready-made skill didn't work for ${esc(r.name)} here` : `None of Morph's ready-made skills fit ${esc(r.name)} for this goal`}, so it can learn one: it practises in
-      simulation thousands of times at once, scored by the goal checklist (${(e.steps / 1e6).toFixed(0)}M practice steps), then tries it here.
-      For an arm with a gripper, Nemotron first writes a program that does it; the learner copies that, then practises to make it its own.
-      Between rounds, Nemotron reads what the robot actually did and adjusts the steps.</div>
+  const g = e.cloud[c.gpu], ok = recipeWorks(r);
+  const p = S.profiles[r.path] || {}, at = p.attempt;
+  const prev = !at ? "" : at.state === "learning"
+    ? `<div class="why" style="margin-bottom:8px">An earlier learning attempt for this goal didn't finish (it was stopped part-way), so runs don't use it.</div>`
+    : `<div class="why" style="margin-bottom:8px">An earlier learning attempt only succeeded in ${at.success} of ${at.n} tries, so runs don't use it. Learning again continues from the program, not from that attempt.</div>`;
+  return `<div class="sec"><h4>${ok ? "Make it robust" : "Learn this task"}</h4><div class="card small">${prev}
+    <div class="muted">${ok ? `Nemotron's program already works for ${esc(r.name)} here, and runs use it as it is. It follows fixed moves, though: if the parcel
+      slips or starts somewhere else, it doesn't notice. Learning turns it into a skill that reacts: the learner starts from the program and practises
+      only corrections on top of it, with varied physics,` : `${failed ? `Morph's ready-made skill didn't work for ${esc(r.name)} here` : `None of Morph's ready-made skills fit ${esc(r.name)} for this goal`}, so it can learn one: it practises in
+      simulation thousands of times at once, scored by the goal checklist,`} (${(e.steps / 1e6).toFixed(0)}M practice steps), then tries it here.
+      ${ok ? "" : `Nemotron first writes a program that does it (any robot that stands still, and arms with or without a gripper); the learner starts from it and practises corrections on top.`}
+      Practice starts near the end of the task and works back; between rounds Nemotron reads what the robot actually did and adjusts the steps and reward terms.</div>
     <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
       : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your Nebius account.`}
       <a href="#" onclick="showTab('compute');return false">Change</a></div>
@@ -726,8 +758,24 @@ function learnCard(r, i, failed) {
     <div id="stepsbox" style="margin-bottom:10px">${S.planned && S.planned.path === r.path ? stepsHtml(S.planned, 0, false)
       : `<button class="xs" onclick="planSteps(${i})" data-tip="${$("usellm").checked ? "Nemotron" : "Morph"} writes the steps a person would take without thinking, for this robot's body (which parts it uses, from which side, what to keep steady). The learner is rewarded for reaching each step in order. Costs about $0.002 with Nemotron.">Plan the steps first</button>
          <span class="tiny faint">or Morph plans them when you start</span>`}</div>
-    <button class="primary" onclick="learn(${i})">${c.mode === "local" ? "Learn on this computer" : "Prepare cloud job"}</button>
+    <button class="primary" onclick="learn(${i})">${c.mode === "local" ? (ok ? "Train a robust skill on this computer" : "Learn on this computer") : "Prepare cloud job"}</button>
     <div class="tiny faint" style="margin-top:8px">When it's done you can export the learned policy to use outside Morph.</div></div></div>`;
+}
+async function suggest(now) {
+  const t = $("suggest").value.trim(); if (!t) { toast("Say what it's doing wrong first", true); return; }
+  try { await api("/api/suggest", {text: t, now});
+        $("suggest").value = "";
+        $("suggested").innerHTML += `<div>✓ sent${now ? ", ending this round early" : ", for the end of this round"}: “${esc(t)}”</div>`; }
+  catch (e) { toast(e.message, true); }
+}
+async function robustTest(btn, task) {
+  const out = document.getElementById("robust-" + task);
+  btn.disabled = true; out.innerHTML = `<span class="spin"></span> knocking it about…`;
+  try { const r = await api("/api/robustness", {task});
+        out.innerHTML = (r["recipe alone"] !== undefined ? `program alone: <b>${r["recipe alone"]}/${r.n}</b> · ` : "")
+          + `learned skill: <b>${r["learned skill"]}/${r.n}</b> <span class="faint">(${esc(r.bump)})</span>`; }
+  catch (e) { out.textContent = ""; toast(e.message, true); }
+  btn.disabled = false;
 }
 async function learn(i) {
   const rs = document.getElementById("randomize");
@@ -905,7 +953,9 @@ function events() {
         caption("Done. Click any square on the right to replay a try."); refreshCosts(); break;
       case "stopped": setRunning(false); progress("plan", "Stopped"); caption("Stopped"); break;
       case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
-      case "training_start": $("trainbox").classList.remove("hidden"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = "";
+      case "training_round_start": S.curve = []; S.trainSteps = e.steps; trainLabel(); break;
+      case "suggestion": caption(e.now ? "Ending this round early to use your suggestion" : "Got it: Nemotron will use your suggestion at the end of this round"); break;
+      case "training_start": $("trainbox").classList.remove("hidden"); $("tab-learning").classList.remove("hidden"); showTab("learning"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = ""; trainLabel();
         $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
           : "Score per practice run: higher means it walks and follows directions better.";
         if (e.kind !== "task") $("trainsteps").innerHTML = "";
@@ -939,14 +989,20 @@ function events() {
         if (e.stage === "candidates") caption(`Nemotron proposed ${e.ideas.length - 1} new plans: trying each briefly, keeping the best`);
         if (e.stage === "practice") caption(`Round ${e.round} of ${e.rounds}: practising (${(e.steps / 1e6).toFixed(0)}M steps)`);
         if (e.stage === "revised") caption(`Nemotron revised the steps from what it saw in round ${e.round}`);
+        if (e.stage === "remounted") caption(`It couldn't reach the parcel: moving it closer and starting again`);
+        if (e.stage === "advice") { caption(`Nemotron changed the plan from what you said`); $("suggested").innerHTML = ""; }
         $("trainrounds").innerHTML = Object.values(S.rounds).map(x => {
           const d = x.diagnosis || {}, st = d.stuck_at, did = d.what_the_robot_did || {};
           return `<div class="note" style="margin:4px 0"><b>${x.round === 0 ? "Copy of Nemotron's program" : "Round " + x.round}</b>${x.n ? ` · tried it: ${x.success}/${x.n}` : x.round === 0 ? " · copying…" : " · practising…"}
+            ${x.round === 0 && x.n ? `<br><span class="faint">it follows the program; practice then only learns corrections on top of it, and keeps a pull towards the program so it can't forget it</span>` : ""}
+            ${x.text ? `<br><span class="muted">${esc(x.text)}</span>` : ""}
+            ${x.said ? `<br><span>You said: “${esc(x.said.join(" / "))}”</span>` : ""}
             ${st ? `<br><span class="muted">stuck at step ${st.step} (${esc(st.name)}); closest its end parts got to the parcel: ${did["closest any of its end parts got to the object's surface (cm)"]} cm, best grip ${did["best grip score (0..1; 1 = held from opposite sides and lifted)"]}</span>` : ""}
             ${d.practice_from ? `<br><span class="faint">next round also practises from ${esc(d.practice_from)}</span>` : ""}
             ${x.rationale ? `<br><span class="faint">Nemotron: ${esc(x.rationale)}</span>` : ""}
             ${x.ideas ? `<br><span class="muted">Plans tried after this round:</span>${x.ideas.map((idea, k) => { const c = (x.cands || []).find(c => c.index === k), won = x.chosen && x.chosen.index === k;
-              return `<br><span class="${won ? "" : "faint"}">${won ? "✓" : "·"} ${esc(idea)}${c ? ` (${c.success}/${c.n}, ${c.in_goal} moments in the goal state)` : " (practising…)"}</span>`; }).join("")}` : ""}</div>`; }).join("");
+              return `<br><span class="${won ? "" : "faint"}">${won ? "✓" : "·"} ${esc(idea)}${c ? ` (${c.success}/${c.n}, ${c.in_goal} moments in the goal state)` : " (practising…)"}</span>`; }).join("")}` : ""}
+            ${x.chosen && (x.chosen.reward_terms || []).length ? `<br><span class="faint">its reward terms: ${x.chosen.reward_terms.map(t => `${esc(t.name)} (${esc(t.formula)}, ×${t.weight})`).join("; ")}</span>` : ""}</div>`; }).join("");
         break; }
       case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true); break;
       case "training_retry": toast(`Out of GPU memory: retrying with ${e.envs} practice copies at once`); break;
@@ -956,7 +1012,8 @@ function events() {
       case "robot_start_learn": break;
       case "learn_done":
         S.profiles = {}; renderRobots();
-        toast(`${e.robot}: learned skill succeeded ${e.success}/${e.n} tries. Export it from the Robot tab.`);
+        if (e.n && 2 * e.success >= e.n) toast(`${e.robot} learned it: ${e.success}/${e.n} tries succeeded. Runs now use it; export it from the Robot tab.`);
+        else toast(`${e.robot} didn't learn it well enough: ${e.success}/${e.n} tries succeeded, so runs won't use it. Try learning again, give it suggestions while it learns, or move the robot.`, true);
         S.lastLearn = e.folder;
         $("results").insertAdjacentHTML("beforeend", `<div class="res"><b>Learned skill</b> <span class="muted small">${esc(e.folder)}</span>
           <div class="row" style="margin-top:8px"><a href="/api/export?task=${encodeURIComponent(e.folder)}" download><button class="primary xs">Export policy (.zip)</button></a></div></div>`);
@@ -965,16 +1022,22 @@ function events() {
     }
   };
 }
+function trainLabel() {  // before any practice step of a round is logged
+  $("trainbar").style.width = "0%";
+  $("trainpct").textContent = S.trainSteps ? `this round: starting ${(S.trainSteps / 1e6).toFixed(0)}M practice steps…`
+    : "copying Nemotron's program first (no practice steps yet)";
+}
 function drawCurve() {
   const c = $("curve"), g = c.getContext("2d"), pts = S.curve, last = pts[pts.length - 1];
+  if (!S.trainSteps) return trainLabel();
   $("trainbar").style.width = Math.min(100, 100 * last.step / S.trainSteps) + "%";
-  $("trainpct").textContent = `${(last.step / 1e6).toFixed(0)}M of ${(S.trainSteps / 1e6).toFixed(0)}M steps · ${Math.round(last.wall_s / 60)} min · score ${last.reward.toFixed(1)}`;
+  $("trainpct").textContent = `this round: ${(last.step / 1e6).toFixed(1)}M of ${(S.trainSteps / 1e6).toFixed(0)}M practice steps · ${Math.round(last.wall_s / 60)} min · score ${last.reward.toFixed(1)}`;
   g.clearRect(0, 0, c.width, c.height);
   const maxR = Math.max(1, ...pts.map(p => p.reward)), W = c.width, H = c.height;
   g.strokeStyle = "rgba(148,163,184,.2)"; g.beginPath(); g.moveTo(0, H - 1); g.lineTo(W, H - 1); g.stroke();
   const grd = g.createLinearGradient(0, 0, W, 0); grd.addColorStop(0, "#6aa8ff"); grd.addColorStop(1, "#8b7bff");
   g.strokeStyle = grd; g.lineWidth = 3; g.beginPath();
-  pts.forEach((p, i) => { const x = W * p.step / S.trainSteps, y = H - 8 - (H - 16) * p.reward / maxR; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  pts.forEach((p, i) => { const x = W * p.step / (S.trainSteps || 1), y = H - 8 - (H - 16) * p.reward / maxR; i ? g.lineTo(x, y) : g.moveTo(x, y); });
   g.stroke();
 }
 

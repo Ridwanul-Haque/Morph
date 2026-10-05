@@ -1,0 +1,13 @@
+# The parcel cell with a ball instead of the parcel: a 6 cm ball that rolls. Same bin, shelf and wall.
+#
+#   morph do examples/ball "put the ball into the bin"
+#   morph do examples/ball "roll the ball against the wall"
+
+[project]
+name = "ball"
+scene = "scene.xml"
+object = "ball"
+robot = "../../third_party/mujoco_menagerie/franka_emika_panda/panda.xml"
+
+[task]
+description = "put the ball into the bin"

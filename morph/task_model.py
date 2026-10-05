@@ -46,7 +46,9 @@ def next_ctrl(xp, prev, action, q0, scale, lo, hi, step=MAX_STEP):
 
 
 def load_task(path: str | Path) -> dict:
-    return json.loads(Path(path).read_text())
+    task = json.loads(Path(path).read_text())
+    task["_dir"] = str(Path(path).resolve().parent)  # where its files are (demo.npz, starts.npz): always its own folder
+    return task
 
 
 def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
@@ -262,11 +264,36 @@ def observe(xp, qvel, act_len, act_vel, xpos, xmat, last_act, ix: Indices, targe
     return xp.concatenate(parts)
 
 
+class Residual:
+    """Learning corrections on top of a recipe (residual learning): the action sent is the recipe's action at
+    this moment plus `scale` x the policy's output, so a policy that outputs nothing replays the recipe, and
+    practice can only add fixes to it (follow the object when it's a little off, grip a bit lower). The policy
+    also sees how far through the recipe it is (phase). Same code for JAX and NumPy."""
+
+    def __init__(self, base, scale: float):
+        self.base, self.scale, self.T = np.asarray(base, dtype=np.float32), float(scale), len(base)
+
+    @classmethod
+    def of(cls, task: dict, folder) -> "Residual | None":
+        r = task.get("residual")
+        if not r or not task.get("demo") or not (Path(folder) / task["demo"]).exists():
+            return None
+        z = np.load(Path(folder) / task["demo"])
+        return cls(z["base"], r.get("scale", 0.3)) if "base" in z else None
+
+    def action(self, xp, t, a):
+        base = xp.asarray(self.base)[xp.minimum(t, self.T - 1)]
+        return xp.clip(base + self.scale * a, -1.0, 1.0)
+
+    def phase(self, xp, t):
+        return xp.reshape(xp.minimum(xp.asarray(t, dtype=xp.float32) / self.T, 1.5), (1,))
+
+
 def write_task(path: Path, *, robot_xml: str, block: BlockSpec, start, target: dict, mount, floating: bool,
                q0, conditions: list[dict], scene_path: str, robot_name: str, home: dict | None = None,
                fixtures: dict | None = None) -> dict:
     task = {"robot_xml": robot_xml, "robot": robot_name, "scene": scene_path,
-            "block": {k: getattr(block, k) for k in ("half_x", "half_y", "half_z", "mass", "friction", "fixtures_xml")},
+            "block": {k: getattr(block, k) for k in ("half_x", "half_y", "half_z", "mass", "friction", "fixtures_xml", "shape")},
             "start": list(start), "target": target, "mount": list(mount), "floating": floating, "q0": list(map(float, q0)),
             "home": home or {}, "fixtures": fixtures or {}, "conditions": conditions, "action_scale": 0.5 if floating else 0.8, "episode_s": 8.0,
             "ctrl_dt": CTRL_DT, "sim_dt": SIM_DT}
@@ -385,7 +412,8 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None)
         robot, base_z, base_up = xpos[ix.base][:2], xpos[ix.base][2], xmat[ix.base].reshape(3, 3)[2, 2]
     else:
         robot, base_z, base_up = xp.asarray(task["mount"][:2]), xp.asarray(0.0), xp.asarray(1.0)
-    v = quantities(xp, pos=bp, R=R, vel=qvel[ix.block_v:ix.block_v + 3], start=task["start"][:2], half=half,
+    v = quantities(xp, pos=bp, R=R, vel=qvel[ix.block_v:ix.block_v + 3], ang=qvel[ix.block_v + 3:ix.block_v + 6],
+                   start=task["start"][:2], half=half,
                    fixtures=task.get("fixtures", {}), held=held, robot_xy=robot, hand_dist=hand, hand_pos=hand_pos,
                    base_z=base_z, base_up=base_up)
     closure = None

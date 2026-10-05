@@ -98,3 +98,10 @@ def test_held_means_a_real_two_sided_grip_with_nothing_else_carrying_it():
     assert contact_held(*_pinch_world(on_floor=False)) == 1.0  # pinched from both sides, in the air
     assert contact_held(*_pinch_world(on_floor=True)) == 0.0  # fingers on it, but the floor carries it
     assert contact_held(*_pinch_world(on_floor=False, two_sides=False)) == 0.0  # touched on one side only
+
+
+def test_a_loosely_written_step_is_still_a_step():
+    """keep: false, a word for body_parts, a name a little too long: a model's reply shouldn't lose a whole plan."""
+    from morph.skill_steps import Step
+    s = Step(name="x" * 120, done_when="touch_dist < 0.02", keep=False, body_parts="gripper", how=None)
+    assert s.keep == "" and s.body_parts == ["gripper"] and len(s.name) == 80 and s.how == ""

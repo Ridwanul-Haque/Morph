@@ -102,13 +102,26 @@ class GoalProposal(BaseModel):
     suggestion: str = Field(default="", max_length=400)
 
 
+REWARD_TERMS_DOC = (
+    "You may also add up to 4 reward_terms: extra shaping on top of the steps, as Eureka does: each {\"name\", "
+    "\"formula\", \"weight\", \"why\"}. formula is a NUMBER formula over the same quantities (e.g. \"closure * "
+    "(touch_dist < 0.03)\" rewards closing only with the fingers at the object, \"-speed\" penalises flinging it, "
+    "\"min(lifted, 0.1)\" rewards lifting up to 10 cm), or a condition (then its graded distance from true counts, 0 "
+    "when it holds). weight -5..5: > 0 rewards the value, < 0 penalises it; the value is clipped to -3..3 and earned "
+    "every tick (about 1 per second of weight x value). measured.reward_terms says how each current term behaved in "
+    "the last practice (its average value per tick at the start and end): a term that never moves is not helping; one "
+    "that rose while the steps stayed stuck may be rewarding the wrong thing (fix or drop it). "
+)
+
+
 class SkillStepsProposal(BaseModel):
     steps: list[dict] = Field(default_factory=list, max_length=8)
+    reward_terms: list[dict] = Field(default_factory=list, max_length=6)  # Eureka-style shaping (revisions only)
     rationale: str = Field(default="", max_length=1200)
 
 
 class StepCandidates(BaseModel):
-    candidates: list[dict] = Field(default_factory=list, max_length=4)  # each: {"idea", "steps": [...]}
+    candidates: list[dict] = Field(default_factory=list, max_length=4)  # each: {"idea", "steps": [...], "reward_terms"}
     rationale: str = Field(default="", max_length=1500)
 
 
@@ -357,8 +370,12 @@ class ReasoningService:
             "and y from the fixtures' extents; \"bring it to the robot\" -> \"hand_dist < 0.15\". "
             "Any condition can also say WHEN it must hold with \"when\": \"end\" (default: the final resting state), "
             "\"release\" (at the moment the robot lets go of the object: throwing, dropping, tossing), \"always\" (at "
-            "every moment: keep it upright the whole way, never touch the wall) or \"ever\" (at some point: lift it "
-            "above 30 cm at least once). Any condition kind can have a when; the object can end up in only one "
+            "every moment: keep it upright the whole way, never touch the wall), \"ever\" (at some point: lift it "
+            "above 30 cm at least once) or \"last\" with \"seconds\" (without a break for the last N seconds: keep "
+            "it spinning, keep it balanced, keep holding it up), e.g. \"spin the ball\" -> {\"kind\": \"expression\", "
+            "\"when\": \"last\", \"seconds\": 2, \"expr\": \"spin_dps > 180\", \"text\": \"spinning at over half a "
+            "turn per second\"}; spin_dps is how fast the object turns (deg/s), spin_z_dps its turn about the vertical "
+            "(+ anticlockwise from above). Any condition kind can have a when; the object can end up in only one "
             "place, so other places on the way take when \"ever\". Requests about how it gets there are part of the goal, never "
             "drop them: \"throw the parcel into the bin from 1 m north of the bin\" means inside bin (end) AND, at "
             "release, the parcel is at least 1 m north of the bin, e.g. {\"kind\": \"expression\", \"when\": "
@@ -443,7 +460,8 @@ class ReasoningService:
         return self._chat("skill_steps", system, user, SkillStepsProposal)
 
     def revise_steps(self, robot: dict, goal: list[str], steps: list[dict], diagnosis: dict, scales: dict,
-                     rounds: list[dict], fix: dict | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
+                     rounds: list[dict], fix: dict | None = None, advice: list[str] | None = None
+                     ) -> tuple[SkillStepsProposal, InferenceRecord]:
         system = (
             "You coach a robot that is learning a task by trial and error in simulation (reinforcement learning). It "
             "is rewarded for reaching each step of a plan in order, and for getting closer to the current step. You get "
@@ -462,14 +480,24 @@ class ReasoningService:
             "speed, vx, vy, vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), "
             "robot_x, robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; functions abs, min, max, "
             "sqrt, hypot; Python syntax (and, or, not). 2 to 6 steps; the goal checklist is checked after them. "
+            + REWARD_TERMS_DOC +
             "Reply with ONLY one JSON object: {\"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", "
-            "\"done_when\", \"keep\"}], \"rationale\": what you changed and why, from the measurements}."
+            "\"done_when\", \"keep\"}], \"reward_terms\": [...] (optional), \"rationale\": what you changed and why, "
+            "from the measurements}."
         )
         payload = {"robot": robot, "goal_checklist": goal, "current_steps": steps, "measured": diagnosis,
                    "realistic_scales": scales, "earlier_rounds": [{k: v for k, v in r.items() if k != "diagnosis"}
                                                                   for r in rounds[:-1]]}
         if fix:
             payload["fix_these"] = fix
+        if advice:  # what the person watching the practice runs says it's doing wrong
+            payload["person_watching_says"] = advice
+            system += (" A person is watching the practice runs and told you what they see it doing wrong "
+                       "(person_watching_says). Take it seriously: people spot in seconds what the numbers hide. Turn it "
+                       "into measurable steps and reward terms (e.g. 'grab it lower' -> a step with hand_z near obj_z and a "
+                       "term rewarding it), check it against the measurements, and say in the rationale how you used it, "
+                       "starting with 'You said: ...'. If it can't be measured with these quantities, or it contradicts the "
+                       "goal, say so plainly and do what the measurements support instead.")
         user = json.dumps(payload, separators=(",", ":"), default=str)
         return self._chat("revise_steps", system, user, SkillStepsProposal)
 
@@ -486,9 +514,10 @@ class ReasoningService:
             "vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), robot_x, "
             "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; abs, min, max, sqrt, hypot; Python "
             "syntax. grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
-            "how far the gripper is commanded shut. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
-            "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}]}], "
-            "\"rationale\": what the measurements suggest}."
+            "how far the gripper is commanded shut. " + REWARD_TERMS_DOC + "A candidate can differ in its steps, its "
+            "reward_terms, or both. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
+            "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}], "
+            "\"reward_terms\": [...] (optional)}], \"rationale\": what the measurements suggest}."
         )
         payload = {"robot": robot, "goal_checklist": goal, "current_steps": steps, "measured": diagnosis,
                    "realistic_scales": scales, "earlier_rounds": [{k2: v for k2, v in r.items() if k2 != "diagnosis"}
@@ -498,7 +527,27 @@ class ReasoningService:
         return self._chat("step_candidates", system, json.dumps(payload, separators=(",", ":"), default=str), StepCandidates)
 
     def write_program(self, robot: dict, goal: list[str], scene: dict, facts: dict, blocks: str,
-                      attempts: list[dict]) -> tuple[ProgramProposal, InferenceRecord]:
+                      attempts: list[dict], body: str = "arm") -> tuple[ProgramProposal, InferenceRecord]:
+        if body != "arm":  # any other body: the same loop, guidance that doesn't assume a hand pointing down
+            system = (
+                "You are the motion-programming module of Morph. Write a short program that makes THIS robot reach the "
+                "goal in a physics simulation, using only these building blocks: " + blocks + " First decide which part of "
+                "its body to use for what (facts.parts lists an arm's parts), as a person or an animal would with this "
+                "body: a gripping part to pick things up, a tip or a flat tool to push or poke, a foot or the whole body "
+                "of a walking robot to nudge or push, two parts on opposite sides to squeeze. Then the order: get the part into position clear of the object, approach slowly for the "
+                "last few cm, act, and keep or release contact as the goal needs. Use the facts (where each part is now, "
+                "about how far it reaches, the object's size and where it must end, the fixtures) to pick reachable, "
+                "concrete numbers; use formulas such as obj_x or obj_top + 0.05 where it should follow the object. "
+                "Pushing: put the part against the object's far side from where it must go, low on its face, and push "
+                "along the line to the goal; pushing high tips it over. The checklist is judged at the end of the run "
+                "(and at release for 'when it lets go' items), after the object settles. If earlier attempts are given, "
+                "read exactly what happened in each step and fix the cause; never repeat a program that failed. Reply "
+                "with ONLY one JSON object: {\"steps\": [{\"do\": <building block>, <its arguments>}, ...], "
+                "\"rationale\": which parts you use for what, and what you changed from the last attempt}."
+            )
+            user = json.dumps({"robot": robot, "goal_checklist": goal, "scene": scene, "facts": facts,
+                               "earlier_attempts": attempts[-3:]}, separators=(",", ":"), default=str)
+            return self._chat("write_program", system, user, ProgramProposal)
         system = (
             "You are the motion-programming module of Morph. Write a short program that makes THIS robot reach the goal "
             "in a physics simulation, using only these building blocks: " + blocks + " Think like a person doing the "

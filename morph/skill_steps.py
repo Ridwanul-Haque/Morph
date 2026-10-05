@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .goal_terms import HOLD_TICKS, ExprError, parse  # noqa: F401  (HOLD_TICKS: also used by the trainer)
 
@@ -30,6 +30,30 @@ class Step(BaseModel):
     body_parts: list[str] = Field(default_factory=list, max_length=6)
     done_when: str = Field(max_length=300)  # a formula (goal_terms), or "goal" for the last step
     keep: str = Field(default="", max_length=300)  # a formula that should stay true during this step
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lenient(cls, d):
+        """The same step written loosely (a model's reply): keep false / null for "nothing to keep", a word where a
+        list is expected, text a little over the length limits. None of that should throw a whole plan away."""
+        if not isinstance(d, dict):
+            return d
+        d = dict(d)
+        for k, n in (("name", 80), ("how", 400), ("why", 240), ("done_when", 300), ("keep", 300)):
+            v = d.get(k)
+            if v is None or isinstance(v, bool):
+                d[k] = "" if k != "name" else "step"
+            elif not isinstance(v, str):
+                d[k] = str(v)
+            d[k] = d[k][:n]
+        bp = d.get("body_parts")
+        if isinstance(bp, str):
+            d["body_parts"] = [bp]
+        elif bp is None:
+            d["body_parts"] = []
+        if isinstance(d.get("body_parts"), list):
+            d["body_parts"] = [str(x)[:60] for x in d["body_parts"]][:6]
+        return d
 
 
 def robot_brief(prof) -> dict:
@@ -51,6 +75,31 @@ def robot_brief(prof) -> dict:
             "degrees_of_freedom": prof.dof, "height_m": round(prof.size_m.get("height", 0), 2),
             "arm_reach_m": round(reach, 2), "mass_kg": round(prof.mass_kg, 1),
             "stands_on_the_floor": prof.base == "floating" and prof.n_legs > 0}
+
+
+MAX_TERMS = 4
+
+
+def check_terms(raw, fixtures, object_name: str = "") -> tuple[list[dict], list[str]]:
+    """Reward terms Nemotron proposes (Eureka-style shaping on top of the steps): each {name, formula, weight}. formula is
+    a number formula over the measured quantities (or a condition: then minus how far from true it is); weight in
+    -5..5 (> 0 rewards it, < 0 penalises). Returns the terms in Morph's form and the problems with any it can't use."""
+    from .goal_terms import normalize
+    out, errors = [], []
+    for t in (raw or [])[:MAX_TERMS]:
+        if not isinstance(t, dict) or not t.get("formula"):
+            errors.append(f"a reward term needs a formula: {t!r}")
+            continue
+        try:
+            f = normalize(str(t["formula"]), object_name)
+            parse(f, fixtures, object_name)
+            w = float(t.get("weight", 1.0))
+        except (ExprError, ValueError, TypeError) as e:
+            errors.append(f"reward term {t.get('name', t['formula'])!r}: {e}")
+            continue
+        out.append({"name": str(t.get("name") or f)[:40], "formula": f, "weight": max(-5.0, min(5.0, w)),
+                    "why": str(t.get("why", ""))[:200]})
+    return out, errors
 
 
 def check_steps(steps: list[Step], fixtures, object_name: str = "") -> tuple[list[Step], list[str]]:
