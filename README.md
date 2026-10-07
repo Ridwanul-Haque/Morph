@@ -142,9 +142,14 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in training. When progress
   stalls it proposes several different plans; each practises briefly and the best is kept.
 * **You can coach it too:** while it practises, type what you see it doing wrong in the Learning tab ("it grabs the
-  top edge and it slips; grab it lower"). At the end of the round (or right away, keeping what it learned so far)
-  Nemotron reads your words together with Morph's measurements and changes the steps and reward terms. Your words are
-  advice: the measurements still decide what is kept.
+  top edge and it slips; grab it lower"), or rate the practice try you just watched 👍 / 👎. At the end of the round
+  (or right away, keeping what it learned so far) Nemotron reads your words, and compares what the tries you liked
+  did with the ones you didn't (preference feedback, Christiano et al. 2017), together with Morph's measurements, and
+  changes the steps and reward terms. Your input is advice: the measurements still decide what is kept. When you give
+  it, or when the copied program doesn't work, practice is allowed to move further away from the program.
+* **A critic that sees more** (asymmetric actor-critic, Pinto et al. 2018): during training, the part that judges its
+  moves also sees how well it really grips, how far through the steps it is, and each practice copy's true object
+  weight and friction. The exported policy only uses what a robot can sense.
 * **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept.
 * **Out of reach:** a bolted-down robot that never gets near the object because it stands too far away is moved
   closer, once (not if you placed it yourself).
@@ -194,7 +199,8 @@ matches. Learning from legged programs isn't supported yet: legged robots learn 
   everyday tasks from a sentence, for any robot file, on one GPU.
 * **Code as Policies** (Liang et al. 2022), **RoboGen** (Wang et al. 2023), **GenSim** (Wang et al. 2023): language
   models writing robot programs, and using them to make training data. Morph's programs follow this idea.
-* **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
+* **Deep RL from human preferences** (Christiano et al. 2017), **asymmetric actor-critic** (Pinto et al. 2018),
+  **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
   **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017): the learning methods above.
 
 ## Robots and assets
@@ -219,7 +225,7 @@ can train one for another legged robot.
 ## Reproduce
 
 ```bash
-.venv/bin/python -m pytest -q                       # 133 tests, ~1 min (CPU)
+.venv/bin/python -m pytest -q                       # 137 tests, ~1 min (CPU)
 .venv/bin/morph goal-bench                          # request understanding: Nemotron vs rules (~$0.07)
 .venv/bin/morph do examples/parcel "<task>" --robot <model> --run 5 --yes   # each cell of the programs table
 ```

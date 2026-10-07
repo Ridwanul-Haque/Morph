@@ -102,9 +102,13 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         task["base_z"] = float(q[m.jnt_qposadr[fj] + 2]) or 0.4
     if gripper:
         task["gripper"] = gripper
+        # a gripper snaps shut (0.2 s), as on the arm the programs run on; at the old 1 s the arm lifted before the
+        # fingers had closed and every copied grasp slipped (xArm7 lift: 0/5 replayed, 4/5 with this)
+        task["gripper_ticks"] = 10
     if not floating:  # like the arm the programs run on (and real arm controllers): gravity compensated
         task["gravcomp"] = True
     task["placed_by_user"] = placed
+    task["critic_extras"] = True  # the critic sees grip, progress and this copy's physics (train_task._critic_extras)
     if plan:
         steps, info = plan_steps(prof, goal, pj.scene, p, llm, log)
         task["steps"] = [st.model_dump() for st in steps[:-1]]  # the last step is the goal itself
@@ -239,12 +243,20 @@ def practice_run(task_path: Path, policy_path: Path, seed: int = 0, stop=None, o
     env = SimulationEnvironment(m, control_dt=CTRL_DT)
     from .sim import PhysicalParams
     tr = StepTracker(task.get("steps", []), task.get("fixtures", {}), on_step)
-    blew = rollout(env, m, ix, task, NumpyPolicy(policy_path), task["start"], PhysicalParams(), seed, stop, (tr,))
+    w = _Watch(task)
+    blew = rollout(env, m, ix, task, NumpyPolicy(policy_path), task["start"], PhysicalParams(), seed, stop, (tr, w))
     p = env.block_pose()
     t = task["target"]
+    e = w.ext
     return {"dist_cm": round(math.hypot(p.x - t["x"], p.y - t["y"]) * 100, 1), "blew_up": blew,
             "tilt_deg": round(math.degrees(p.tilt)), "steps_reached": tr.reached, "steps_total": len(tr.steps),
-            "stuck_at": tr.steps[tr.reached][0] if tr.reached < len(tr.steps) else ""}
+            "stuck_at": tr.steps[tr.reached][0] if tr.reached < len(tr.steps) else "",
+            # what it did, in numbers (for comparing the tries a person liked with the ones they didn't)
+            "did": {"closest_to_object_cm": round(e["touch"] * 100, 1), "best_grip_0_to_1": round(e["grip"], 2),
+                    "seconds_really_held": round(e["held_s"], 1), "highest_lift_cm": round(e["lifted"] * 100, 1),
+                    "moved_object_cm": round(e["moved"] * 100, 1), "fastest_object_m_s": round(e["speed"], 2),
+                    "ended_cm_from_target": round(math.hypot(p.x - t["x"], p.y - t["y"]) * 100, 1),
+                    "object_tilt_deg": round(math.degrees(p.tilt)), "steps_reached": tr.reached}}
 
 
 def try_policy(pj: Project, goal: GoalSpec, task_path: Path, n: int = 5, log=print, emit=None) -> dict:
@@ -608,7 +620,7 @@ def term_stats(folder: Path, task: dict) -> list[dict]:
 
 
 def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, scene, rounds: list, log=print,
-                      advice: list[str] | None = None) -> dict | None:
+                      advice: list[str] | None = None, ratings: list[dict] | None = None) -> dict | None:
     """Nemotron reads what the learner actually did and rewrites the steps (smaller first steps, reachable
     thresholds, graded quantities); Morph checks the new steps and writes them into the task."""
     from .introspect import profile_robot
@@ -619,7 +631,7 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
     errors, fix = [], None
     for _ in range(2):
         prop, rec = llm.revise_steps(robot_brief(prof), [c.describe() for c in goal.conditions], task.get("steps", []),
-                                     diagnosis, scales(scene, p), rounds, fix, advice=advice)
+                                     diagnosis, scales(scene, p), rounds, fix, advice=advice, ratings=ratings)
         raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
         new, errors = check_steps(raw, list(scene.fixtures), scene.object_name)
         terms, t_err = check_terms(prop.reward_terms, list(scene.fixtures), scene.object_name)
@@ -664,7 +676,12 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
     emit = emit or (lambda **e: None)
 
     def take_advice(r: int, history: list) -> bool:
-        said = [a.strip() for a in (advice() if advice else []) if a and a.strip()]
+        got = advice() if advice else []
+        said = [a.strip() for a in got if isinstance(a, str) and a.strip()]
+        rated = [a for a in got if isinstance(a, dict) and a.get("rating") in ("good", "bad")]
+        if rated and not said:
+            g, b = sum(a["rating"] == "good" for a in rated), sum(a["rating"] == "bad" for a in rated)
+            said = [f"(no words: rated {g} practice tries as looking right and {b} as looking wrong)"]
         if not said:
             return False
         if llm is None or not getattr(llm, "available", False):
@@ -675,7 +692,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         history.append({"round": r, "tries_succeeded": f"{res['success']}/{res['n']}", "diagnosis": diag, "person_said": said})
         log(f"  you said: {' / '.join(said)}")
         try:
-            rev = revise_task_steps(task_path, llm, diag, goal, pj.scene, history, log, advice=said)
+            rev = revise_task_steps(task_path, llm, diag, goal, pj.scene, history, log, advice=said, ratings=rated)
         except Exception as e:  # noqa: BLE001
             rev = None
             log(f"  (Nemotron's revision couldn't be used: {e})")

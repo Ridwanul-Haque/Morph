@@ -165,7 +165,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 /* learning shows below the view: it scrolls inside a capped height, so the view never shrinks below ~60% */
 /* learning shows as one slim strip under the view (details in the Learning tab), so the view keeps its size */
 .trainbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 10px 14px 12px; flex: none; }
-.trainbox .trainhead .row { gap: 10px; }
+.trainbox .trainhead .row { gap: 6px 12px; flex-wrap: wrap; }
+.trainbox #traintitle { white-space: nowrap; }
 .bar { height: 8px; background: var(--raise); border-radius: 99px; overflow: hidden; }
 .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .4s; }
 canvas { width: 100%; height: 160px; display: block; }
@@ -344,6 +345,9 @@ header [data-tip]:hover::after { left: auto; right: 0; }
 
   <div class="trainbox hidden" id="trainbox">
     <div class="trainhead"><div class="row"><b id="traintitle" class="grow">Learning to walk</b><span class="small muted" id="trainpct"></span>
+      <span id="rateBox" class="hidden small muted" data-tip="Rate the practice try you just watched. At the end of the round, Nemotron compares what the tries you liked did with the ones you didn't (how high, how firmly, how far) and changes the steps and rewards towards what you want.">This try:
+        <button class="xs ghost" onclick="rate(true)">👍 looks right</button><button class="xs ghost" onclick="rate(false)">👎 looks wrong</button>
+        <span id="rated" class="faint"></span></span>
       <button class="xs ghost" onclick="showTab('learning')" data-tip="The score curve, each round, and the steps it is learning, in the Learning tab">Details</button></div>
     <div class="bar" style="margin:10px 0 0"><div id="trainbar"></div></div></div>
   </div>
@@ -761,6 +765,12 @@ function learnCard(r, i, failed) {
     <button class="primary" onclick="learn(${i})">${c.mode === "local" ? (ok ? "Train a robust skill on this computer" : "Learn on this computer") : "Prepare cloud job"}</button>
     <div class="tiny faint" style="margin-top:8px">When it's done you can export the learned policy to use outside Morph.</div></div></div>`;
 }
+async function rate(good) {
+  if (S.lastTry === undefined) return;
+  try { await api("/api/rate", {id: S.lastTry, good}); S.rateCount = (S.rateCount || 0) + 1;
+        $("rated").textContent = `${good ? "👍" : "👎"} noted (${S.rateCount} this round)`; }
+  catch (e) { toast(e.message, true); }
+}
 async function suggest(now) {
   const t = $("suggest").value.trim(); if (!t) { toast("Say what it's doing wrong first", true); return; }
   try { await api("/api/suggest", {text: t, now});
@@ -959,17 +969,19 @@ function events() {
         $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
           : "Score per practice run: higher means it walks and follows directions better.";
         if (e.kind !== "task") $("trainsteps").innerHTML = "";
-        $("traintitle").textContent = e.kind === "task" ? `${e.robot} is learning the task (on this computer)` : `Teaching ${e.robot} to walk (on this computer)`;
+        $("traintitle").textContent = e.kind === "task" ? `${e.robot} is learning` : `Teaching ${e.robot} to walk`;
         $("trainpct").textContent = "starting: compiling the simulation for the GPU (a couple of minutes)…"; setRunning(true);
         S.results = {}; S.order = []; renderResults();
         if (e.kind === "task") { showLive(); cur = {robot: e.robot, i: 0, n: 0}; $("hudr1").textContent = `${e.robot} · learning`;
           caption("Getting ready to practise. The first practice run appears after the first checkpoint (a few minutes)."); }
         break;
       case "practice": {
-        $("hudr1").textContent = `${e.robot} · practice after ${(e.step / 1e6).toFixed(0)}M steps`;
+        const when = e.step ? `after ${(e.step / 1e6).toFixed(1)}M practice steps this round` : "before this round's practice";
+        $("hudr1").textContent = `${e.robot} · practice try ${e.id + 1}, ${when}`;
         const far = e.steps_total ? ` · got through ${e.steps_reached} of ${e.steps_total} steps` : "";
-        caption(e.blew_up ? `Practice after ${(e.step / 1e6).toFixed(0)}M steps: still flailing (knocked the object away)`
-          : `Practice after ${(e.step / 1e6).toFixed(0)}M steps: ended ${e.dist_cm} cm from the target${e.tilt_deg > 10 ? ", tipped over" : ""}${far}`);
+        caption(e.blew_up ? `Practice try ${e.id + 1} (${when}): still flailing (knocked the object away)`
+          : `Practice try ${e.id + 1} (${when}): ended ${e.dist_cm} cm from the target${e.tilt_deg > 10 ? ", tipped over" : ""}${far}`);
+        S.lastTry = e.id; $("rateBox").classList.remove("hidden"); $("rated").textContent = "";
         if (S.skillSteps && e.steps_total) { S.bestStep = Math.max(S.bestStep || 0, e.steps_reached);
           $("trainsteps").innerHTML = stepsHtml(S.skillSteps, S.bestStep, true); }
         break; }
@@ -990,7 +1002,7 @@ function events() {
         if (e.stage === "practice") caption(`Round ${e.round} of ${e.rounds}: practising (${(e.steps / 1e6).toFixed(0)}M steps)`);
         if (e.stage === "revised") caption(`Nemotron revised the steps from what it saw in round ${e.round}`);
         if (e.stage === "remounted") caption(`It couldn't reach the parcel: moving it closer and starting again`);
-        if (e.stage === "advice") { caption(`Nemotron changed the plan from what you said`); $("suggested").innerHTML = ""; }
+        if (e.stage === "advice") { caption(`Nemotron changed the plan from what you said and rated`); $("suggested").innerHTML = ""; S.rateCount = 0; }
         $("trainrounds").innerHTML = Object.values(S.rounds).map(x => {
           const d = x.diagnosis || {}, st = d.stuck_at, did = d.what_the_robot_did || {};
           return `<div class="note" style="margin:4px 0"><b>${x.round === 0 ? "Copy of Nemotron's program" : "Round " + x.round}</b>${x.n ? ` · tried it: ${x.success}/${x.n}` : x.round === 0 ? " · copying…" : " · practising…"}

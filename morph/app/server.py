@@ -196,7 +196,8 @@ class App:
         self.proc: subprocess.Popen | None = None
         self.compute = {"mode": "local", "gpu": "H100"}  # where gait training runs
         self.training_task: Path | None = None  # task being learned (for practice runs of checkpoints)
-        self.suggestions: list[str] = []  # what the person watching says while it learns (taken at the end of a round)
+        self.suggestions: list = []  # what the person watching says (text) or rates (dicts), taken at the end of a round
+        self.practice_seen: dict[int, dict] = {}  # practice replay id -> what it did
         self.suggest_lock = threading.Lock()
         self.planned: dict = {}  # (robot path, goal) -> task.json whose steps were already planned and shown
         self.placements: dict = {}  # robot path -> (x, y, heading rad) where the user put it; else Morph chooses
@@ -293,7 +294,8 @@ class App:
                 self.send(type="log", robot=robot, text=f"practice run skipped: {ex}")
                 time.sleep(2)
                 continue
-            self.send(type="practice", robot=robot, step=step, **r)
+            self.practice_seen[k] = r.get("did", {})  # so a rating of this try can say what it did
+            self.send(type="practice", robot=robot, step=step, id=k, **r)
             k += 1
         self.live.pace = False
 
@@ -784,6 +786,16 @@ class Handler(BaseHTTPRequestHandler):
                     (Path(APP.training_task).parent / "stop_round").write_text("1")
                 APP.send(type="suggestion", text=text, now=now)
                 self._json({"ok": True, "now": now})
+            elif u.path == "/api/rate":  # 👍 / 👎 on the practice try just watched
+                if APP.training_task is None:
+                    raise ValueError("nothing is learning right now")
+                k = int(b.get("id", -1))
+                if k not in APP.practice_seen:
+                    raise ValueError("that practice try is no longer known")
+                rating = "good" if b.get("good") else "bad"
+                with APP.suggest_lock:
+                    APP.suggestions.append({"rating": rating, "did": APP.practice_seen[k], "id": k})
+                self._json({"ok": True, "rating": rating})
             elif u.path == "/api/robustness":  # knock the object mid-task: the recipe alone vs the learned skill
                 from ..learn_task import LEARNED, robustness
                 if APP.goal is None or APP.project is None:
@@ -928,21 +940,56 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(1 / 25)
 
 
+def _open_browser(url: str) -> None:
+    """The default browser; on WSL that's the Windows one (Linux's opener there only prints "gio: Operation not
+    supported")."""
+    try:
+        wsl = "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        wsl = False
+    if wsl:
+        try:
+            subprocess.Popen(["explorer.exe", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            pass
+    import webbrowser
+    webbrowser.open(url)
+
+
 def serve(port: int = 8765, open_browser: bool = True) -> None:
     global APP
     APP = App()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        if e.errno == 98:  # address in use
+            print(f"Port {port} is already in use: Morph (or something else) is still running there.\n"
+                  f"  Open http://127.0.0.1:{port} if it's Morph, or stop it first:\n"
+                  f"    fuser -k {port}/tcp        (or: kill %1, if you paused it with Ctrl+Z)\n"
+                  f"  or start this one on another port:  morph app --port {port + 1}")
+            sys.exit(1)
+        raise
     srv.daemon_threads = True
     url = f"http://127.0.0.1:{port}"
     print(f"Morph app: {url}   (Ctrl+C to stop)")
     if open_browser:
-        import webbrowser
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.8, lambda: _open_browser(url)).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
         APP.live.cancel = True
+        proc = getattr(APP, "proc", None)
+        if proc is not None and proc.poll() is None:  # a training run it started: don't leave it on the GPU
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         srv.server_close()
-        sys.exit(0)
+        sys.stdout.flush()
+        # skip Python's exit-time cleanup: the GPU renderer's (EGL on WSL's D3D12) and PyTorch's can hang there,
+        # which left Ctrl+C stuck at "stopped"
+        os._exit(0)

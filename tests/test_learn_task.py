@@ -273,3 +273,49 @@ def test_only_a_finished_skill_that_works_is_used(tmp_path):
     assert learning_status(d)["good"]
     (d / "candidate_0").mkdir()  # an interrupted plan search
     assert not learning_status(d)["good"]
+
+
+def test_rated_practice_tries_reach_nemotron_with_what_each_did(tmp_path, monkeypatch):
+    """👍 / 👎 on practice tries, with no words: Nemotron gets each rating with the try's measurements."""
+    import json as _json
+    import morph.learn_task as lt
+    from morph.reasoning import SkillStepsProposal
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"))
+    m = build_task_model(load_task(task_path))
+    n_obs, n_act = obs_size(indices(m, load_task(task_path))), m.nu
+    got = {}
+
+    class FakeLLM:
+        available = True
+
+        def revise_steps(self, *a, advice=None, ratings=None, **k):
+            got.update(advice=advice, ratings=ratings)
+            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"}],
+                                      rationale="The tries you liked moved it further."), None
+
+    def fake_train(tp, n, restore):
+        _random_policy(tp.parent, n_obs, n_act)
+        (tp.parent / "train_meta.json").write_text(_json.dumps({"curve": [{"success": 0.0, "dist": 1.0}]}))
+        return True
+
+    rated = [[{"rating": "good", "did": {"moved_object_cm": 20}}, {"rating": "bad", "did": {"moved_object_cm": 2}}]]
+    lt.learn_in_rounds(pj, goal, task_path, fake_train, llm=FakeLLM(), log=lambda s: None, total_steps=10_000_000,
+                       rounds=2, tries=1, candidates=0, advice=lambda: rated.pop() if rated else [])
+    assert [r["rating"] for r in got["ratings"]] == ["good", "bad"] and got["ratings"][0]["did"]["moved_object_cm"] == 20
+    assert "rated 1 practice tries as looking right and 1 as looking wrong" in got["advice"][0]
+    assert lt.learning_status(task_path.parent)["state"] == "done"
+
+
+def test_practice_run_says_what_the_try_did(tmp_path, monkeypatch):
+    import morph.learn_task as lt
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"), plan=False)
+    m = build_task_model(load_task(task_path))
+    _random_policy(task_path.parent, obs_size(indices(m, load_task(task_path))), m.nu)
+    r = lt.practice_run(task_path, task_path.parent / "policy.npz")
+    assert {"closest_to_object_cm", "best_grip_0_to_1", "highest_lift_cm", "moved_object_cm"} <= set(r["did"])

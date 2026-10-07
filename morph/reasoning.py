@@ -460,8 +460,8 @@ class ReasoningService:
         return self._chat("skill_steps", system, user, SkillStepsProposal)
 
     def revise_steps(self, robot: dict, goal: list[str], steps: list[dict], diagnosis: dict, scales: dict,
-                     rounds: list[dict], fix: dict | None = None, advice: list[str] | None = None
-                     ) -> tuple[SkillStepsProposal, InferenceRecord]:
+                     rounds: list[dict], fix: dict | None = None, advice: list[str] | None = None,
+                     ratings: list[dict] | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
         system = (
             "You coach a robot that is learning a task by trial and error in simulation (reinforcement learning). It "
             "is rewarded for reaching each step of a plan in order, and for getting closer to the current step. You get "
@@ -498,6 +498,12 @@ class ReasoningService:
                        "term rewarding it), check it against the measurements, and say in the rationale how you used it, "
                        "starting with 'You said: ...'. If it can't be measured with these quantities, or it contradicts the "
                        "goal, say so plainly and do what the measurements support instead.")
+        if ratings:  # practice tries the person marked as looking right / wrong, each with what it measurably did
+            payload["person_rated_tries"] = [{"rating": a["rating"], "what_it_did": a.get("did", {})} for a in ratings][-12:]
+            system += (" The person also rated practice tries they watched (person_rated_tries: good = looks right, bad = "
+                       "looks wrong), each with what that try measurably did. Compare the good ones with the bad ones to "
+                       "work out what they want (e.g. the liked tries lifted it higher, or held it longer) and reward that; "
+                       "say in the rationale what difference you saw.")
         user = json.dumps(payload, separators=(",", ":"), default=str)
         return self._chat("revise_steps", system, user, SkillStepsProposal)
 

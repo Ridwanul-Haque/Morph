@@ -183,6 +183,13 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
         base, base_q, base_v = int(m.jnt_bodyid[fj]), int(m.jnt_qposadr[fj]), int(m.jnt_dofadr[fj])
     tip_off = _tip_points(m, task, np.array(tips), home_adr, np.array(vals, dtype=float))
     act_scale, act_step = action_units(m, task.get("action_scale", 0.8))
+    g_ticks = task.get("gripper_ticks")  # how many control ticks the gripper takes to cross its range
+    if g_ticks and task.get("gripper"):
+        try:
+            a = int(m.actuator("robot_" + task["gripper"]["actuator"]).id)
+            act_step[a] = act_scale[a] / float(g_ticks)
+        except KeyError:
+            pass
     g = task.get("gripper") or {}
     try:
         grip = (int(m.actuator("robot_" + g["actuator"]).id), float(g["open"]), float(g["close"])) if g else (-1, 0.0, 1.0)

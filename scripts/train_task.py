@@ -158,6 +158,12 @@ class TaskLearn(mjx_env.MjxEnv):
             self._demo = (jp.array(mu), jp.array(sd), jp.array((o - mu) / sd), jp.array(act))
         # corrections on top of the recipe: the action is the recipe's at this moment plus a learned correction
         self.residual = Residual.of(task, task.get("_dir", "."))
+        # asymmetric actor-critic (Pinto et al. 2018): the critic also sees what the robot can't (how well it really
+        # grips, how far through the steps it is, this copy's true parcel weight and friction); the policy is unchanged
+        self.n_extra = 9 if task.get("critic_extras") else 0
+        self._obj_geom = int(np.flatnonzero(np.asarray(self._mj_model.geom_bodyid) == self.ix.block)[0])
+        self._mass0 = float(self._mj_model.body_mass[self.ix.block])
+        self._fric0 = float(self._mj_model.geom_friction[self._obj_geom, 0])
 
     def _dist(self, data, info=None):
         """How far from done, in metres: distance to the place (if the goal has one) plus how unmet the
@@ -268,16 +274,26 @@ class TaskLearn(mjx_env.MjxEnv):
                     self.ix, self.target)
         if self.residual is not None:
             o = jp.concatenate([o, self.residual.phase(jp, info["t"])])
+        priv = jp.concatenate([o, self._critic_extras(data, info)]) if self.n_extra else o
         if not self.rand:
-            return {"state": o, "privileged_state": o}
+            return {"state": o, "privileged_state": priv}
         info["rng"], k = jax.random.split(info["rng"])
-        return {"state": o + self.rand["obs_noise"] * jax.random.normal(k, o.shape), "privileged_state": o}
+        return {"state": o + self.rand["obs_noise"] * jax.random.normal(k, o.shape), "privileged_state": priv}
+
+    def _critic_extras(self, data, info):
+        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl)
+        n = max(len(self.steps), 1)
+        m = self._mjx_model  # this copy's own physics (domain randomisation swaps it in)
+        return jp.stack([v["grip"], jp.minimum(v["touch_dist"], 0.5) * 4.0, jp.minimum(v["lifted"], 0.5) * 4.0,
+                         v["closure"], jp.asarray(v["held"], jp.float32), info["step"].astype(jp.float32) / n,
+                         info["t"].astype(jp.float32) * CTRL_DT / self.task["episode_s"],
+                         m.body_mass[self.ix.block] / self._mass0, m.geom_friction[self._obj_geom, 0] / self._fric0])
 
     def _demo_reward(self, obs, action):
         """How much this action looks like the demonstration's, in the most similar situation it went through
         (and only to the extent the situation is similar)."""
         mu, sd, dobs, dact = self._demo
-        x = (obs - mu) / sd
+        x = (obs[:mu.shape[0]] - mu) / sd  # the robot's own view (the critic's extras come after it)
         d2 = jp.mean(jp.square(dobs - x), axis=1)
         i = jp.argmin(d2)
         near = jp.exp(-d2[i] / 0.5)
@@ -377,8 +393,9 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: 
     z = np.load(demo)
     obs = jp.array(z["obs"], dtype=jp.float32)
     act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32)
-    od = {"state": obs, "privileged_state": obs}
-    shape = {k: (obs.shape[1],) for k in od}
+    priv = jp.concatenate([obs, jp.zeros((obs.shape[0], env.n_extra))], axis=1) if env.n_extra else obs
+    od = {"state": obs, "privileged_state": priv}
+    shape = {k: (v.shape[1],) for k, v in od.items()}
     netw = ppo_networks.make_ppo_networks(shape, env.action_size, preprocess_observations_fn=running_statistics.normalize, **net)
     kp, kv, kn = jax.random.split(jax.random.PRNGKey(seed), 3)
     pol, val = netw.policy_network.init(kp), netw.value_network.init(kv)
@@ -387,7 +404,7 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: 
         k, b = pol["params"][last]["kernel"], pol["params"][last]["bias"]
         pol = {"params": dict(pol["params"], **{last: {"kernel": k.at[:, :env.action_size].set(0.0),
                                                        "bias": b.at[:env.action_size].set(0.0)}})}
-    norm = running_statistics.init_state({k: specs.Array((obs.shape[1],), jp.dtype("float32")) for k in od})
+    norm = running_statistics.init_state({k: specs.Array((v.shape[1],), jp.dtype("float32")) for k, v in od.items()})
     # a reading that never changes along the demonstration (a joint it doesn't use) has ~0 spread: dividing by it
     # turns a tiny difference at test time into a huge input. A floor of 2 cm / 0.02 rad keeps the copy sane.
     norm = running_statistics.update(norm, od, std_min_value=0.02)
@@ -399,7 +416,7 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: 
         # the same situations, slightly off (DART-style noise): the copy has to answer sensibly near the recorded path
         # too, not only exactly on it; otherwise its first small slip feeds back (it sees its own last action) and grows
         o = obs + 0.3 * spread * jax.random.normal(key, obs.shape)
-        out = netw.policy_network.apply(norm, params, {"state": o, "privileged_state": o})
+        out = netw.policy_network.apply(norm, params, {"state": o, "privileged_state": priv})
         mean = jp.tanh(out[:, :n])
         std = jax.nn.softplus(out[:, n:])
         # match the program's actions; keep the exploration noise moderate so practice doesn't wreck it at once
@@ -421,7 +438,7 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: 
     return (norm, pol, val)
 
 
-def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512):
+def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512, n_extra: int = 0):
     """DAPG-style: while it practises, keep a pull towards the demonstration's actions in the situations the
     demonstration went through (an extra term in PPO's loss), so practice refines a working copy instead of
     slowly forgetting it. Rajeswaran et al. 2018 ("Learning Complex Dexterous Manipulation with Deep RL and
@@ -436,7 +453,8 @@ def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512):
         total, metrics = original(params, normalizer_params, data, rng, ppo_network, *a, **kw)
         i = jax.random.randint(jax.random.fold_in(rng, 7), (min(batch, obs.shape[0]),), 0, obs.shape[0])
         o = obs[i]
-        out = ppo_network.policy_network.apply(normalizer_params, params.policy, {"state": o, "privileged_state": o})
+        priv = jp.concatenate([o, jp.zeros((o.shape[0], n_extra))], axis=1) if n_extra else o
+        out = ppo_network.policy_network.apply(normalizer_params, params.policy, {"state": o, "privileged_state": priv})
         bc = jp.mean(jp.square(jp.tanh(out[:, :n_act]) - act[i]))
         metrics = dict(metrics, copy_loss=bc)
         return total + weight * bc, metrics
@@ -523,7 +541,7 @@ def main():
         kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) / (1 + 9 * trust)
         weight = a.keep_copying * max(trust, 0.2)
         if weight > 0 and (out / task["demo"]).exists():
-            keep_copying(out / task["demo"], env.nu, weight)
+            keep_copying(out / task["demo"], env.nu, weight, n_extra=env.n_extra)
     if a.restore and Path(a.restore).exists():  # a later round: continue from where the last one got to
         restore = pickle.loads(Path(a.restore).read_bytes())
         print(json.dumps({"restored": a.restore}), flush=True)

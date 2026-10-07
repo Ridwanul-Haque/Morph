@@ -77,6 +77,9 @@ XARM7 = MenagerieArmConfig(
 MENAGERIE_ARMS = {"franka_panda": PANDA, "ufactory_xarm7": XARM7}
 
 
+NOSLIP = int(__import__("os").environ.get("MORPH_ARM_NOSLIP", "4"))  # anti-slip contact passes (experiment switch)
+
+
 def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujoco.MjModel:
     from ..introspect import floor_offset  # the base rests on the floor whatever the file's origin
     path = MENAGERIE / cfg.xml
@@ -91,7 +94,7 @@ def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujo
                  group=4)
     scene = mujoco.MjSpec.from_string(f"""<mujoco model="morph_{cfg.name}">
   <compiler angle="radian" autolimits="true"/>
-  <option timestep="{TIMESTEP}" integrator="implicit" cone="elliptic" impratio="10" noslip_iterations="4"/>
+  <option timestep="{TIMESTEP}" integrator="implicit" cone="elliptic" impratio="10" noslip_iterations="{NOSLIP}"/>
   {_common_assets()}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
