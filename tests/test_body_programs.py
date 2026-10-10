@@ -60,7 +60,7 @@ def test_a_general_program_lifts_the_parcel_and_reports_each_step(panda):
     rec = []
     run = run_body_program(rn, prog, goal, pj.scene, names=names, record=rec)
     assert run["success"], run["report"]
-    assert "the fingers are on the object" in run["report"][3]
+    assert "closed on the object from opposite sides" in run["report"][3]
     assert len(rec) > 100 and len(rec[0]) == 3  # recorded on the learner's model: (qpos, qvel, ctrl) per tick
 
 
@@ -122,3 +122,80 @@ def test_steps_written_other_common_ways_are_understood():
     s = normalize_step({"do": "move", "args": {"part": "hand", "x": "where_it_must_end.x", "z": "bin.top + 0.02"}})
     assert s == {"do": "move", "part": "hand", "x": "goal_x", "z": "bin_top + 0.02"}
     assert normalize_step({"op": "wait", "seconds": 1})["do"] == "wait"
+
+
+def test_grasp_planning_finds_a_grip_that_holds(panda):
+    """Several ways to grip are tried in simulation (sides, places, heights, from above or the side); the best holds
+    after lifting and shaking, and pick uses it."""
+    from morph.contact_plan import plan_grasp
+    pj, goal, rn, names = panda
+    g = plan_grasp(rn, pj.scene)
+    assert g["tried"] >= 10 and g["held"], g["ranking"]
+    from morph.body_programs import ContactPlanner
+    prog = check_body_program([{"do": "pick", "part": "hand"}, {"do": "move", "part": "hand", "z": "hand_z + 0.1", "speed": "slow"},
+                               {"do": "wait", "seconds": 1}], rn.parts, [], set(names), None, ContactPlanner(rn, pj.scene))
+    assert prog[0].get("pick") == 1 and len(prog) == len(g["steps"]) + 2
+    rn.reset(0, pj.scene.start, _params(0))
+    assert run_body_program(rn, prog, goal, pj.scene, names=names)["success"]  # lifted and held
+
+
+def test_push_planning_slides_it_straight_with_a_gripperless_arm(tmp_path):
+    from morph.body_programs import ContactPlanner
+    from morph.learn_task import make_task
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel 15 cm east", pj.scene)
+    rn = BodyRunner(load_task(make_task(pj, goal, str(ROOT / "third_party/mujoco_menagerie/universal_robots_ur5e/ur5e.xml"),
+                                        plan=False, folder=tmp_path / "ur5e")))
+    names = scene_names(pj.scene, 0.2, 0.01)
+    prog = check_body_program([{"do": "push_object", "part": "wrist_3_link", "direction": 0, "distance": 0.16}],
+                              rn.parts, [], set(names), None, ContactPlanner(rn, pj.scene))
+    rn.reset(0, pj.scene.start, _params(0))
+    assert run_body_program(rn, prog, goal, pj.scene, names=names)["success"]
+
+
+def test_the_planned_grip_is_measured_for_the_learner(panda):
+    """The winning grip, measured on the robot in the object's frame: where the point between the fingers is, which way
+    they close, which way the hand comes in (from above here). The learner aims for it (train_task: _grasp_aim)."""
+    from morph.contact_plan import plan_grasp
+    pj, _, rn, _ = panda
+    g = plan_grasp(rn, pj.scene)["geom"]
+    assert np.linalg.norm(g["point"]) < 0.03  # around the parcel's middle
+    assert g["approach"][2] < -0.9  # pointing down: from above
+    assert abs(g["close"][2]) < 0.3  # the fingers close sideways across it, not top to bottom
+    assert len(g["fingers"]) == 2 and g["body"].startswith("robot_")
+
+
+def test_fingers_resting_on_top_are_not_a_grip(panda):
+    """Both fingers touching it isn't holding it: only fingers on opposite sides are (a flat pen once fooled Nemotron:
+    'holding the object' while the fingers pressed on its top)."""
+    from morph.task_model import opposite_sides
+    pj, goal, rn, names = panda
+    prog = check_body_program([{"do": "grip", "how": "close"},
+                               {"do": "move", "part": "hand", "x": "obj_x", "y": "obj_y", "z": "obj_top + 0.05", "point": "down"},
+                               {"do": "move", "part": "hand", "z": "obj_top - 0.002", "speed": "slow"},
+                               {"do": "grip", "how": "close"}], rn.parts, [], set(names))
+    rn.reset(0, pj.scene.start, _params(0))
+    run = run_body_program(rn, prog, goal, pj.scene, names=names, settle_s=0)
+    hand = {g for g in range(rn.m.ngeom) if int(rn.m.geom_bodyid[g]) in rn.parts["hand"].bodies}
+    assert not opposite_sides(rn.d, set(rn.ix.block_geoms.tolist()), hand, rn.d.xpos[rn.ix.block])
+    assert "it is not held" in run["report"][3]
+
+
+def test_a_throw_is_a_backswing_and_a_fast_swing_that_lets_go(panda):
+    pj, _, rn, names = panda
+    prog = check_body_program([{"do": "throw", "part": "hand", "x": 0.42, "y": 0.18}], rn.parts, [], set(names))
+    assert [s.get("throw") for s in prog] == [1, 1] and "release_at" not in prog[0] and 0 < prog[1]["release_at"] < 1
+    assert prog[1]["speed"] == "fast" and prog[0]["point"] == "keep"
+    with pytest.raises(ProgramError, match="release_at"):
+        check_body_program([{"do": "move", "part": "hand", "z": 0.2, "release_at": 2}], rn.parts, [], set(names))
+
+
+def test_keep_pointing_holds_the_hand_level_while_it_carries(panda):
+    """'keep' keeps the pointing on a move (it once let the hand tip 60° on the way, and a pen slid out)."""
+    pj, goal, rn, names = panda
+    prog = check_body_program([{"do": "move", "part": "hand", "x": "obj_x", "y": "obj_y", "z": 0.25, "point": "down"},
+                               {"do": "move", "part": "hand", "x": "obj_x", "y": "obj_y - 0.2", "z": 0.25}],
+                              rn.parts, [], set(names))
+    rn.reset(0, pj.scene.start, _params(0))
+    run_body_program(rn, prog, goal, pj.scene, names=names, settle_s=0)
+    assert rn.pointing(rn.parts["hand"])[2] < -0.95  # still pointing down

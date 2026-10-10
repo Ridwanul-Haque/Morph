@@ -31,11 +31,14 @@ import numpy as np
 
 from .goals import GoalSpec, check
 from .goal_terms import History
+from .task_model import opposite_sides
 
-SPEEDS = {"slow": 0.003, "normal": 0.008, "fast": 0.03}  # metres per 20 ms control tick: 0.15, 0.4, 1.5 m/s
+# metres per 20 ms control tick: 0.15, 0.4, 1.5 m/s; whip (2.5 m/s) only for the throw tuner's swing
+SPEEDS = {"slow": 0.003, "normal": 0.008, "fast": 0.03, "whip": 0.05}
 OPS = {"move_hand", "open_hand", "close_hand", "wait", "throw_to", "repeat_if"}
 NAMES = {"obj_x", "obj_y", "obj_z", "obj_top", "obj_bottom", "obj_yaw_deg", "hand_x", "hand_y", "hand_z"}
 MAX_STEPS = 24
+FUNCS = {"abs", "min", "max", "hypot", "sqrt", "cosd", "sind"}  # cosd / sind: of an angle in degrees
 MAX_TIME = 30.0  # seconds of simulation per program run
 
 BLOCKS_DOC = (
@@ -66,12 +69,14 @@ class ProgramError(ValueError):
 
 
 # ------------------------------------------------------------------ checking a program
-def scene_names(scene, carry_z: float, lowest_z: float, goal_xy=None) -> dict:
+def scene_names(scene, carry_z: float, lowest_z: float, goal_xy=None, goal_z=None) -> dict:
     """Numbers a formula can use by name: where each fixture is (centre x, y; its top; for containers the floor
     things rest on inside), the comfortable carry height and the lowest the hand can go."""
     out = {"carry_z": float(carry_z), "lowest_z": float(lowest_z)}
-    if goal_xy is not None:  # where the goal puts the object (if it has a place)
+    if goal_xy is not None:  # where the goal puts the object (if it has a place): its centre, resting there
         out["goal_x"], out["goal_y"] = float(goal_xy[0]), float(goal_xy[1])
+        if goal_z is not None:
+            out["goal_z"] = float(goal_z)
     for n, f in scene.fixtures.items():
         key = "".join(ch if ch.isalnum() else "_" for ch in n.lower())
         out[f"{key}_x"] = float((f.lo[0] + f.hi[0]) / 2)
@@ -93,13 +98,13 @@ def _formula(v, what: str, known: set = frozenset()):
     except SyntaxError:
         raise ProgramError(f"{what}: can't read {v!r}") from None
     for n in ast.walk(tree):
-        if isinstance(n, ast.Name) and n.id not in NAMES | set(known) | {"abs", "min", "max", "hypot", "sqrt"}:
+        if isinstance(n, ast.Name) and n.id not in NAMES | set(known) | FUNCS:
             raise ProgramError(f"{what}: unknown name {n.id!r} (known: {', '.join(sorted(NAMES | set(known)))})")
         if not isinstance(n, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub,
                               ast.UAdd, ast.Call, ast.Name, ast.Constant, ast.Load)):
             raise ProgramError(f"{what}: {type(n).__name__} isn't allowed in {v!r}")
-        if isinstance(n, ast.Call) and not (isinstance(n.func, ast.Name) and n.func.id in ("abs", "min", "max", "hypot", "sqrt")):
-            raise ProgramError(f"{what}: only abs, min, max, hypot and sqrt can be called")
+        if isinstance(n, ast.Call) and not (isinstance(n.func, ast.Name) and n.func.id in FUNCS):
+            raise ProgramError(f"{what}: only {', '.join(sorted(FUNCS))} can be called")
     return v
 
 
@@ -236,7 +241,9 @@ class _Values:
                 return {ast.Add: a + b, ast.Sub: a - b, ast.Mult: a * b, ast.Div: a / b if b else 0.0}[type(n.op)]
             args = [ev(x) for x in n.args]
             return {"abs": lambda: abs(args[0]), "min": lambda: min(args), "max": lambda: max(args),
-                    "hypot": lambda: math.hypot(*args), "sqrt": lambda: math.sqrt(max(args[0], 0.0))}[n.func.id]()
+                    "hypot": lambda: math.hypot(*args), "sqrt": lambda: math.sqrt(max(args[0], 0.0)),
+                    "cosd": lambda: math.cos(math.radians(args[0])),
+                    "sind": lambda: math.sin(math.radians(args[0]))}[n.func.id]()
         return ev(ast.parse(f, mode="eval"))
 
 
@@ -267,7 +274,7 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
     bodies = {m.body(n).id: n for n in scene.fixtures if _has_body(m, n)}
     bodies[m.body("block").id] = scene.object_name
     hist = History([c.model_dump() for c in goal.conditions], fixtures_geometry(scene), (b.half_x, b.half_y, b.half_z))
-    floor_z = GRASP_Z - 0.015
+    floor_z = lowest_hand_z(scene)
     state = {"close": False, "q": ad.q(), "t": 0.0, "touched": set()}
 
     def tick():
@@ -321,9 +328,13 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
             y0 = ad.hand_yaw()
             if st["yaw"] == "keep":
                 yaw = y0
-            elif st["yaw"] == "object":  # the object side nearest the hand's current turn
+            elif st["yaw"] == "object":  # lined up with the object's sides
                 oy = before.yaw
-                yaw = oy + round((y0 - oy) / (math.pi / 2)) * (math.pi / 2)
+                if max(b.half_x, b.half_y) > 1.3 * min(b.half_x, b.half_y):  # long and thin: close across the narrow side
+                    base = oy if b.half_x < b.half_y else oy + math.pi / 2
+                    yaw = base + round((y0 - base) / math.pi) * math.pi
+                else:  # about square: the side nearest the hand's current turn
+                    yaw = oy + round((y0 - oy) / (math.pi / 2)) * (math.pi / 2)
             else:
                 yaw = math.radians(val(st["yaw"]))
             dyaw = math.remainder(yaw - y0, math.tau)
@@ -377,12 +388,22 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
                 # both fingers touching at some moment just now (pad contacts flicker), or the fingers stopped
                 # part-way with the object between them
                 p_now = env.block_pose()
-                between = np.linalg.norm(ad.tcp() - np.array([p_now.x, p_now.y, p_now.z])) < 0.03
-                holding = any(gripped) or (between and ad.aperture() > 0.08)
-                note = ("it's holding the object (both fingers on it)" if holding else
-                        f"the fingers closed on nothing (aperture {ad.aperture():.0%}); the object is "
-                        f"{np.linalg.norm(ad.tcp() - np.array([before.x, before.y, before.z])) * 100:.0f} cm from the "
-                        f"grasp point")
+                centre = np.array([p_now.x, p_now.y, p_now.z])
+                between = np.linalg.norm(ad.tcp() - centre) < 0.03
+                # fingers on opposite sides of it, not merely both touching it (two fingertips resting on top of a
+                # flat object both touch it and hold nothing)
+                pinched = opposite_sides(env.data, {ad._block_geom}, ad.finger_geoms, centre)
+                holding = pinched or (between and ad.aperture() > 0.08)
+                if holding:
+                    note = "the fingers closed on it from opposite sides (lift it to see whether it holds)"
+                elif any(gripped):
+                    note = (f"the fingers are touching it but not from opposite sides (pressing on its top or one side): "
+                            f"it is not held. The {scene.object_name} is {2 * scene.block.half_z * 100:.1f} cm tall; the "
+                            "fingertips must get down beside it, around its sides")
+                else:
+                    note = (f"the fingers closed on nothing (aperture {ad.aperture():.0%}); the object is "
+                            f"{np.linalg.norm(ad.tcp() - np.array([before.x, before.y, before.z])) * 100:.0f} cm from the "
+                            f"grasp point")
             else:
                 note = "the hand is open" + ("" if released(ad) else ", but still touching the object")
         else:
@@ -402,6 +423,10 @@ def run_program(ad, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 
             obj += f"; the hand touched: {', '.join(hit)}"
         report.append(f"{i}. {describe_step(st)}: {note}{obj}")
     for _ in range(int(settle_s / env.control_dt)):  # let it settle where it ends up
+        tick()
+    for _ in range(100):  # a round or light object (a pen, a ball) may still roll: up to 2 s more for it to come to rest
+        if env.block_speed() < 0.015:
+            break
         tick()
     pose = env.block_pose()
     res = check(goal, scene, m, d, pose, env.block_speed(), released(ad), history=hist)
@@ -474,6 +499,19 @@ def tune(ad, steps: list[dict], goal: GoalSpec, scene, names: dict, params, log=
     return None if best is None else (best[1], best[2])
 
 
+def too_flat_for_hand_down(scene) -> bool:
+    """A flat object (a pen, a phone, under 3 cm tall): the hand-down blocks can't get the fingertips low enough around
+    it; the general blocks' pick (Morph's planned grip, fingertips 3 mm off the floor) can."""
+    return 2 * scene.block.half_z < 0.03
+
+
+def lowest_hand_z(scene) -> float:
+    """How low the grasp point may go: 2.5 cm (as tuned for the 6 cm parcel), lower for a flatter object (a pen lying
+    down is 1.2 cm tall), never below 1.2 cm (the fingertips would scrape the floor)."""
+    from .robots.arm import GRASP_Z
+    return float(min(GRASP_Z - 0.015, max(0.012, scene.block.half_z)))
+
+
 def _fx(scene) -> dict:
     from .goal_terms import fixtures_geometry
     return fixtures_geometry(scene)
@@ -534,7 +572,7 @@ def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=l
     prof = profile_robot(robot_path)
     facts = {"arm_base_xy_m": [round(float(v), 3) for v in ad.cfg.base_pos[:2]],
              "arm_base_facing_deg": round(math.degrees(getattr(ad.cfg, "base_yaw", 0.0)), 1),
-             "arm_reach_m": rep.get("reach_m"), "lowest_hand_z_m": round(GRASP_Z - 0.015, 3),
+             "arm_reach_m": rep.get("reach_m"), "lowest_hand_z_m": round(lowest_hand_z(scene), 3),
              "comfortable_carry_height_m": rep.get("travel_z"),
              "gripper_opening_m": round(float(prof.gripper.get("max_opening_m", 0.0)), 3),
              "object_half_size_m": [b.half_x, b.half_y, b.half_z], "object_start": [round(float(v), 3) for v in scene.start],
@@ -542,8 +580,8 @@ def solve(pj, goal: GoalSpec, robot_path: str, name: str, llm, log=print, emit=l
              "where_it_must_end": {k: round(float(p[k]), 3) for k in ("x", "y", "support_z")} if p.get("has_place") else None,
              "where_to_let_go": [round(v, 3) for v in spot] if spot else None}
     checklist = [f"{c.describe()}: {explain(c, scene)}" for c in goal.conditions]
-    names = scene_names(scene, rep.get("travel_z") or 0.15, GRASP_Z - 0.015,
-                        (p["x"], p["y"]) if p.get("has_place") else None)
+    names = scene_names(scene, rep.get("travel_z") or 0.15, lowest_hand_z(scene),
+                        (p["x"], p["y"]) if p.get("has_place") else None, p["support_z"] + b.half_z)
     facts["names_for_formulas"] = {k: round(v, 3) for k, v in names.items()}
     tries, steps, ok_run = [], None, None
     a, format_fixes = 0, 0

@@ -262,7 +262,7 @@ def cmd_learn(a) -> int:
     from .reasoning import ReasoningService
     pj = load_project(a.project)
     llm = None if a.no_llm else ReasoningService()
-    goal, _ = resolve_goal(pj, a.description, None, llm)
+    goal, _ = resolve_goal(pj, a.description, None, llm, robots=[a.robot])
     print("goal:\n" + "\n".join(f"  - {line}" for line in goal.describe()))
     task, prep = prepare_learning(pj, goal, a.robot, llm=llm)
     t = json.loads(task.read_text())
@@ -314,6 +314,14 @@ def cmd_goal_bench(a) -> int:
     return 0
 
 
+def cmd_object(a) -> int:
+    from .object_import import object_scene
+    info = object_scene(a.mesh, out=Path(a.out) if a.out else None, name=a.name, units=a.units, mass=a.mass)
+    print(info["note"])
+    print(f"scene: {info['path']}   (morph do {info['path']} \"put the {info['object']} into the bin\")")
+    return 0
+
+
 def cmd_export(a) -> int:
     from .learn_task import LEARNED, export
     folder = Path(a.learned)
@@ -347,7 +355,7 @@ def cmd_do(a) -> int:
         print(f"  note: {n}")
     if desc:
         print(f'request: "{desc}"')
-    goal, info = resolve_goal(pj, desc, demo, llm)
+    goal, info = resolve_goal(pj, desc, demo, llm, robots=robots)
     print(f"\ngoal ({info['goal_from']}):")
     for line in goal.describe():
         print(f"  - {line}")
@@ -429,6 +437,13 @@ def main(argv=None) -> int:
     s.add_argument("--only", help="run the cases whose name contains this")
     s.add_argument("--out", help="save the results as JSON")
     s.set_defaults(fn=cmd_goal_bench)
+    s = sub.add_parser("object", help="an object's 3D model (.stl / .obj) -> a scene with it in the work cell")
+    s.add_argument("mesh")
+    s.add_argument("--name", help="what to call it (default: the file name)")
+    s.add_argument("--units", choices=("mm", "cm", "m", "in"), help="the file's units (default: guessed from its size)")
+    s.add_argument("--mass", type=float, help="kg (default: from its volume, at the density of water)")
+    s.add_argument("--out", help="scene folder (default: runs/app_uploads/scenes/<name>)")
+    s.set_defaults(fn=cmd_object)
     s = sub.add_parser("export", help="export a learned policy: runner, model, and a ROS 2 package")
     s.add_argument("learned", help="folder under runs/learned (or its path)")
     s.add_argument("--out", help="export folder (default: <learned>/export)")

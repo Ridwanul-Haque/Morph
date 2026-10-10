@@ -72,6 +72,20 @@ class SimulationEnvironment:
         self._bq = jnt.qposadr[0]
         self._bv = jnt.dofadr[0]
         self._goal_mocap = model.body("goal").mocapid[0]
+        # a mesh object: its inertia scales with its mass (shape fixed), and it rests on its lowest point
+        self._inertia0 = model.body_inertia[self._block_body].copy()
+        self._mass0 = float(model.body_mass[self._block_body])
+        self._fric0 = float(model.geom_friction[self._block_geom, 0])
+        self._mesh_rest = None
+        if int(model.geom_type[self._block_geom]) == int(mujoco.mjtGeom.mjGEOM_MESH):
+            # MuJoCo's native convex collision let a thin mesh object (a pen) dropped at an angle pass through a 1 cm
+            # bin floor in 2 of 4 drops; libccd held it every time
+            model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+            g, mid = self._block_geom, int(model.geom_dataid[self._block_geom])
+            v = model.mesh_vert[model.mesh_vertadr[mid]:model.mesh_vertadr[mid] + model.mesh_vertnum[mid]]
+            R = np.zeros(9)
+            mujoco.mju_quat2Mat(R, model.geom_quat[g])
+            self._mesh_rest = float(-(model.geom_pos[g][2] + (v @ R.reshape(3, 3).T)[:, 2]).min())
         self._renderer: mujoco.Renderer | None = None
         self.track_azimuth = 150.0
         self.track_extra = None  # callable -> robot xy to keep in frame
@@ -84,12 +98,17 @@ class SimulationEnvironment:
         self.seed = seed
         self.params = params
         mujoco.mj_resetData(self.model, self.data)
-        self.model.body_mass[self._block_body] = params.block_mass
-        self.model.geom_friction[self._block_geom, 0] = params.block_friction
+        # params vary around Morph's standard 0.2 kg parcel with friction 0.6: apply them as that ratio of this scene's own
+        # object (a 10 g pen stays about 10 g; the standard parcel gets exactly the values given, as before)
+        m = params.block_mass * self._mass0 / 0.2
+        self.model.body_mass[self._block_body] = m
+        self.model.geom_friction[self._block_geom, 0] = params.block_friction * self._fric0 / 0.6
         # inertia must follow mass, for the object's own shape
-        m = params.block_mass
         size, kind = self.model.geom_size[self._block_geom], int(self.model.geom_type[self._block_geom])
-        if kind == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+        if self._mesh_rest is not None:
+            self.model.body_inertia[self._block_body] = self._inertia0 * (m / max(self._mass0, 1e-9))
+            hz = self._mesh_rest
+        elif kind == int(mujoco.mjtGeom.mjGEOM_SPHERE):
             r = size[0]
             self.model.body_inertia[self._block_body] = [0.4 * m * r * r] * 3
             hz = r

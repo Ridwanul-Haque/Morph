@@ -40,9 +40,21 @@ class BlockSpec:
     # half_z, standing up), "capsule" (radius half_x, half_z to the tip of a cap). Everything that plans or checks
     # positions treats it as its bounding box (half_x, half_y, half_z).
     shape: str = "box"
+    # shape "mesh": the object's own 3D model (an STL / OBJ, in metres after mesh_scale), placed in the object's frame
+    # by mesh_pos / mesh_quat (centred, resting flat). Collisions use its convex hull; checks use half_x/y/z.
+    mesh_file: str = ""
+    mesh_scale: tuple = (1.0, 1.0, 1.0)
+    mesh_pos: tuple = (0.0, 0.0, 0.0)
+    mesh_quat: tuple = (1.0, 0.0, 0.0, 0.0)
 
     def as_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if k != "fixtures_xml"}
+
+
+def mesh_name(block) -> str:
+    import hashlib
+    key = f"{block.mesh_file}|{tuple(round(float(v), 9) for v in block.mesh_scale)}"
+    return "objmesh_" + hashlib.sha1(key.encode()).hexdigest()[:10]
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,15 @@ def _block_xml(block: BlockSpec) -> str:
     hx, hy, hz = block.half_x, block.half_y, block.half_z
     top = hz + 0.0006
     shape = getattr(block, "shape", "box")
+    if shape == "mesh":  # the object's own 3D model (its convex hull collides)
+        pos, q = " ".join(f"{v:.6g}" for v in block.mesh_pos), " ".join(f"{v:.6g}" for v in block.mesh_quat)
+        return f"""
+    <body name="block" pos="0.45 -0.15 {hz}">
+      <freejoint name="block_free"/>
+      <geom name="block_geom" type="mesh" mesh="{mesh_name(block)}" pos="{pos}" quat="{q}" mass="{block.mass}"
+            friction="{block.friction} 0.005 0.0001" rgba="0.95 0.75 0.2 1" condim="4"/>
+      <site name="block_center" pos="0 0 0" size="0.005"/>
+    </body>{block.fixtures_xml}"""
     if shape != "box":
         size = {"sphere": f"{hz}", "cylinder": f"{hx} {hz}", "capsule": f"{hx} {max(hz - hx, 0.001)}"}[shape]
         return f"""
@@ -133,7 +154,8 @@ def _goal_xml() -> str:
     </body>"""
 
 
-def _common_assets() -> str:
+def _common_assets(block=None) -> str:
+    """The shared look of every scene, plus the object's own mesh if it is one (only this model's object)."""
     return """
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0"/>
@@ -144,7 +166,10 @@ def _common_assets() -> str:
     <texture type="skybox" builtin="gradient" rgb1="0.35 0.5 0.7" rgb2="0.05 0.05 0.1" width="256" height="1536"/>
     <texture type="2d" name="grid" builtin="checker" mark="edge" rgb1="0.60 0.64 0.68"
              rgb2="0.52 0.56 0.60" markrgb="0.35 0.35 0.38" width="300" height="300"/>
-    <material name="grid" texture="grid" texuniform="true" texrepeat="10 10" reflectance="0"/>
+    <material name="grid" texture="grid" texuniform="true" texrepeat="10 10" reflectance="0"/>""" + (
+        f'''
+    <mesh name="{mesh_name(block)}" file="{block.mesh_file}" scale="{block.mesh_scale[0]} {block.mesh_scale[1]} {block.mesh_scale[2]}" maxhullvert="64"/>'''
+        if block is not None and getattr(block, "mesh_file", "") else "") + """
   </asset>"""
 
 
@@ -215,7 +240,7 @@ def arm_scene_xml(g: ArmGeometry, block: BlockSpec) -> str:
     <joint armature="0.02" damping="1"/>
     <default class="arm"><geom contype="2" conaffinity="1"/></default>
   </default>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>
@@ -245,7 +270,7 @@ def build_quadruped_model(block: BlockSpec) -> mujoco.MjModel:
     scene_xml = f"""<mujoco model="morph_go1">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{TIMESTEP}" cone="elliptic" impratio="100"/>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>
@@ -273,7 +298,7 @@ def pusher_scene_xml(block: BlockSpec) -> str:
     return f"""<mujoco model="morph_pusher">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{TIMESTEP}" integrator="implicitfast" cone="elliptic" impratio="10"/>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>

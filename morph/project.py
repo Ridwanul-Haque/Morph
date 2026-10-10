@@ -85,7 +85,31 @@ def missing_intent(description: str, goal: GoalSpec) -> list[str]:
     return [why for pat, ok, why in _MUST if re.search(pat, t) and not any(ok(c) for c in goal.conditions)]
 
 
-def resolve_goal(pj: Project, description: str = "", demo_path: str | None = None, llm=None, log=print) -> tuple[GoalSpec, dict]:
+def robot_bodies(paths) -> list[dict]:
+    """What each robot's body has, for goals about the robot itself: its joints (with ranges, degrees) and end parts."""
+    import mujoco
+    from .robot_import import import_robot
+    out = []
+    for p in paths or []:
+        try:
+            xml, _ = import_robot(p)
+            m = mujoco.MjModel.from_xml_path(str(xml))
+        except Exception:  # noqa: BLE001  (a robot that doesn't load is reported elsewhere)
+            continue
+        joints = {}
+        for j in range(m.njnt):
+            if int(m.jnt_type[j]) in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
+                r = m.jnt_range[j] if m.jnt_limited[j] else (-math.pi, math.pi)
+                deg = int(m.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_HINGE)
+                joints[m.joint(j).name] = [round(math.degrees(v) if deg else v, 1 if deg else 3) for v in r]
+        has_child = {int(m.body_parentid[b]) for b in range(1, m.nbody)}
+        parts = [m.body(b).name for b in range(1, m.nbody) if b not in has_child]
+        out.append({"robot": Path(xml).stem, "joints": dict(list(joints.items())[:40]), "end_parts": parts[:20]})
+    return out
+
+
+def resolve_goal(pj: Project, description: str = "", demo_path: str | None = None, llm=None, log=print,
+                 robots: list[str] | None = None) -> tuple[GoalSpec, dict]:
     """Demonstration -> measured conditions; description -> conditions (Nemotron, else rules); both -> merged
     with the description taking precedence. Everything is validated against the scene."""
     info: dict = {}
@@ -106,8 +130,9 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
     if llm is not None and llm.available and (description or demo_goal):
         try:
             feedback, total_s = None, 0.0
+            bodies = robot_bodies(robots)  # so goals can be about the robots' own bodies (a fist, a raised arm)
             for attempt in range(3):  # a first reading, and up to two corrections from Morph's own checks
-                prop, rec = llm.goal_from_request(description, pj.scene.geometry(), demo_summary, feedback)
+                prop, rec = llm.goal_from_request(description, pj.scene.geometry(), demo_summary, feedback, robots=bodies)
                 total_s += rec.latency_s or 0.0
                 if not prop.feasible:
                     if prop.refusal in ("missing", "contradiction", "no_inside") or attempt == 2:
@@ -205,17 +230,17 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
     """stand_at: (x, y, heading) where the user put the robot; None: Morph chooses."""
     from .introspect import profile_robot
     from .goals import needs_learning, reach_problem
-    from .planner import check_templates, learning_only, plan_context, rule_plan
+    from .planner import body_goal, check_templates, learning_only, plan_context, rule_plan
     from .robot_import import import_robot
     robot_path, notes = import_robot(robot_path)  # URDF -> MJCF (meshes, motors, base) if needed
     robot_path = str(robot_path)
-    for n in notes:
-        log(f"  import: {n}")
+    for note in notes:  # (not n: that's the number of trials)
+        log(f"  import: {note}")
     p = placement(goal, pj.scene)
     spec = to_taskspec(goal, pj.scene)
     prof = profile_robot(robot_path)
-    checks = learning_only(check_templates(prof, spec, pj.scene.block, lift_reason=p["lift_reason"]),
-                           needs_learning(goal), reach_problem(prof, goal, pj.scene))
+    checks = body_goal(learning_only(check_templates(prof, spec, pj.scene.block, lift_reason=p["lift_reason"]),
+                                     needs_learning(goal), reach_problem(prof, goal, pj.scene)), goal)
     log(f"\n{prof.summary()}")
     for c in checks:
         log(f"  {'ok ' if c.applicable else '-- '}{c.id:20s} " + ("; ".join(c.met) if c.applicable else "missing: " + "; ".join(c.missing)))
@@ -237,7 +262,7 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
     if plan.get("how"):
         log(f"  how: {plan['how']}")
     from .learn_task import learned_for
-    learned = learned_for(prof.name, goal)
+    learned = learned_for(prof.name, goal, robot_path)
     if learned is not None and stand_at is not None:
         mx, my, myaw = json.loads(learned.read_text())["mount"]
         if math.hypot(mx - stand_at[0], my - stand_at[1]) > 0.05 or abs(math.remainder(myaw - stand_at[2], math.tau)) > 0.17:
@@ -253,10 +278,23 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         emit(type="stage", robot=prof.name, stage="trials", text="using its learned skill")
         out |= try_policy(pj, goal, learned, n=n, log=log, emit=emit)
         log(f"{prof.name}: {out['success']}/{out['n']}")
-    elif plan["plan_id"] == "grasp_place_topdown":
-        out |= _run_arm(pj, goal, spec, p, robot_path, prof.name, n, log, record_demo, stand_at)
-    elif plan["plan_id"] == "legged_foot_push":
-        out |= _run_legged(pj, goal, spec, p, prof, n, log, record_demo, stand_at)
+    elif plan["plan_id"] in ("grasp_place_topdown", "legged_foot_push"):
+        if plan["plan_id"] == "grasp_place_topdown":
+            out |= _run_arm(pj, goal, spec, p, robot_path, prof.name, n, log, record_demo, stand_at)
+        else:
+            out |= _run_legged(pj, goal, spec, p, prof, n, log, record_demo, stand_at)
+        if (out.get("n") and 2 * out.get("success", 0) < out["n"] and llm is not None and llm.available
+                and program_body(prof)):
+            # the ready-made skill mostly failed here (it's tuned for a 6 cm box; this object may be a pen, a ball):
+            # Nemotron writes a program for this object instead, and the better of the two is kept
+            log(f"  the ready-made skill worked {out['success']}/{out['n']}: Nemotron writes a program instead")
+            first = {k: out[k] for k in ("success", "n", "trials", "plan") if k in out}
+            alt = run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out)
+            if alt.get("success", 0) > first.get("success", 0):
+                out |= alt
+                plan = out["plan"]
+            else:
+                out |= first
     elif plan["plan_id"] == "learn_policy" and llm is not None and llm.available and program_body(prof):
         # no ready-made skill: Nemotron writes a program from building blocks, Morph runs and checks it, and
         # Nemotron fixes it from what happened. Seconds per try, instead of minutes of learning.
@@ -326,11 +364,17 @@ def run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out) -> d
         return plan
 
     res: dict = {}
+    from .programs import too_flat_for_hand_down
+    if kind == "arm" and too_flat_for_hand_down(pj.scene):
+        # a flat object (a pen, a phone): the general blocks grip it from just above the floor (pick) and can throw
+        # it too; the hand-down blocks can't get the fingers that low
+        kind = "body"
     if kind == "arm":
         from .programs import solve
+        plan_ = announce("arm")
         res = solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=n, stand_at=stand_at)
         res.pop("adapter", None), res.pop("demos", None)  # for learning from; not part of the result
-        res["plan"] = announce("arm")
+        res["plan"] = plan_
         if res.get("success"):
             return res
         log("  the hand-down building blocks didn't work out: trying the general ones (any part, any pointing)")
@@ -341,15 +385,17 @@ def run_program_for(pj, goal, robot_path, prof, llm, log, n, stand_at, out) -> d
         from .learn_task import make_task, slug
         folder = LEARNED.parent / "programs" / "tasks" / f"{prof.name}__{slug(' '.join(goal.describe())) or 'goal'}"
         task = make_task(pj, goal, robot_path, plan=False, stand_at=stand_at, folder=folder)
+        plan_ = announce("body")
         r = solve_body(pj, goal, task, llm, log=log, emit=emit, n=n, attempts=3 if res else 5)
         r.pop("demos", None)
-        r["plan"] = announce("body")
+        r["plan"] = plan_
         if res and not r.get("success") and not r.get("n"):
             return first  # the arm blocks got further: report those
         return r
     from .legged_programs import solve_legged
+    plan_ = announce("legged")
     r = solve_legged(pj, goal, prof, llm, log=log, emit=emit, n=n, stand_at=stand_at)
-    r["plan"] = announce("legged")
+    r["plan"] = plan_
     return r
 
 

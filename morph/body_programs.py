@@ -31,9 +31,9 @@ import numpy as np
 from .goal_terms import History
 from .goals import GoalSpec, check
 from .programs import SPEEDS, ProgramError, _formula, scene_names
-from .task_model import CTRL_DT, build_task_model, contact_held, indices, is_position
+from .task_model import CTRL_DT, build_task_model, contact_held, indices, is_position, opposite_sides
 
-BODY_OPS = {"move", "push", "grip", "joints", "home", "wait", "repeat_if"}
+BODY_OPS = {"move", "push", "grip", "joints", "home", "wait", "repeat_if", "pick", "push_object", "tip_over", "throw"}
 POINTS = {"down": (0, 0, -1), "up": (0, 0, 1), "north": (0, 1, 0), "south": (0, -1, 0), "east": (1, 0, 0),
           "west": (-1, 0, 0)}
 MAX_STEPS = 24
@@ -44,14 +44,26 @@ BLOCKS_DOC = (
     "move(part, x, y, z, point, turn, speed, until): the tip of one of the robot's parts (see facts.parts) moves in a "
     "straight line to (x, y, z) (leave one out to keep it). point (optional): which way the part's tip points while "
     "it moves: \"down\", \"up\", \"north\", \"south\", \"east\", \"west\", \"object\" (towards the object's centre), "
-    "\"keep\" (default), or [dx, dy, dz]. turn (optional, parts that grip): \"object\" lines the fingers up across "
+    "\"keep\" (default), or [dx, dy, dz]. point is the way the tip FACES, not the way it moves: moving up or away "
+    "does not need point \"up\" (that turns the part upside down); leave point out unless the facing must change. turn (optional, parts that grip): \"object\" lines the fingers up across "
     "the object's sides, or a number in degrees (0 = fingers close along east-west). speed: \"slow\" (0.15 m/s, for "
     "touching and placing), \"normal\" (0.4 m/s), \"fast\" (1.5 m/s). until (optional): \"touch\" stops the move as "
-    "soon as the part touches the object. "
+    "soon as the part touches the object. release_at (optional, 0..1, parts that grip): open the gripper at that "
+    "fraction of the way, while still moving (how a throw lets go). "
+    "throw(part, x, y, from_x, from_y): throws what the gripping part holds so it lands at (x, y): Morph does the "
+    "backswing, the fast swing and lets go on the way, and tunes when to let go and the aim from where practice throws "
+    "land; from_x, from_y (optional): about where to let go (e.g. 30 cm short of the target, on the robot's side). "
+    "Use it for any throw or toss; pick the object up first. "
     "push(part, direction, distance, speed): slide the part horizontally by distance (m) towards direction (degrees: "
     "0 = east, 90 = north), keeping its height and pointing; use it to push or sweep the object (put the part against "
     "the far side of the object first, low on its face). "
     "grip(\"close\") / grip(\"open\"): only for parts listed with can_grip; close waits until the fingers stop. "
+    "pick(part): Morph's own grasp, the reliable way to pick the object up with a gripping part: Morph tries many "
+    "ways to grip this object with this gripper in simulation (which sides, where, from above or the side, how high) "
+    "and uses the one that held best, then lifts it 5 cm. Use it instead of writing the grasp yourself; then carry it "
+    "with move. push_object(part, direction, distance): Morph picks where and how high to push (tried in simulation: "
+    "the contact that slides it straightest) and pushes it about distance m towards direction (degrees; up to 24 cm, in "
+    "6 cm pushes). tip_over(part, direction): Morph picks the contact that tips it over towards direction. "
     "joints({joint: radians}, seconds): set some joints directly. home(seconds): back to the starting pose. "
     "wait(seconds). repeat_if(condition, back_to, times): measure now and, if condition holds, go back to step back_to "
     "(at most times, 1..3): e.g. {\"do\": \"repeat_if\", \"condition\": \"held == 0\", \"back_to\": 2} after lifting grasps "
@@ -331,8 +343,10 @@ def _skew(v):
 
 
 # ------------------------------------------------------------------ checking a program
-def check_body_program(steps: list, parts: dict, joints: list[str], known: set = frozenset(), fixtures=None) -> list[dict]:
-    """The program in Morph's form; ProgramError says what's wrong in words Nemotron can act on."""
+def check_body_program(steps: list, parts: dict, joints: list[str], known: set = frozenset(), fixtures=None,
+                       planner=None) -> list[dict]:
+    """The program in Morph's form; ProgramError says what's wrong in words Nemotron can act on. planner(kind, part,
+    direction) -> steps: the contact Morph planned by testing (contact_plan) for pick / push_object / tip_over."""
     if not isinstance(steps, list) or not steps:
         raise ProgramError("the program has no steps")
     if len(steps) > MAX_STEPS:
@@ -340,7 +354,9 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
     names = set(known) | {f"{p}_{k}" for p in parts for k in "xyz"}
     from .programs import normalize_step
     out = []
+    first_of: dict[int, int] = {}  # step number as written -> its first step once blocks are expanded (for repeat_if)
     for i, st in enumerate(steps, 1):
+        first_of[i] = len(out) + 1
         st = normalize_step(st)
         if not isinstance(st, dict):
             raise ProgramError(f"step {i} isn't an object")
@@ -348,6 +364,51 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
         if op not in BODY_OPS:
             raise ProgramError(f"step {i}: unknown building block {op!r} (known: {', '.join(sorted(BODY_OPS))})")
         s = {"do": op}
+        if op == "pick":  # Morph's own grasp, as plain steps (so it runs, reports and records like any other)
+            part = st.get("part") or next((n for n, p_ in parts.items() if p_.can_grip), None)
+            if part not in parts or not parts[part].can_grip:
+                raise ProgramError(f"step {i}: pick needs a part that grips ({', '.join(n for n, p_ in parts.items() if p_.can_grip) or 'this robot has none'})")
+            macro = planner("pick", part, None) if planner else None  # the grasp that held best when tried
+            macro = macro or [{"do": "grip", "how": "open"},
+                              {"do": "move", "part": part, "x": "obj_x", "y": "obj_y", "z": "obj_top + 0.06",
+                               "point": "down", "turn": "object", "speed": "normal"},
+                              # fingertips 3 mm above what it rests on for a flat thing (a pen), the middle of a tall one
+                              {"do": "move", "part": part, "x": "obj_x", "y": "obj_y",
+                               "z": "max(obj_bottom + 0.003, obj_z - 0.01)", "point": "down", "speed": "slow"},
+                              {"do": "grip", "how": "close"},
+                              {"do": "move", "part": part, "z": "obj_top + 0.03", "speed": "slow"}]
+            out += [dict(x, pick=i) for x in check_body_program(macro, parts, joints, known, fixtures)]
+            continue
+        if op in ("push_object", "tip_over"):  # pushes Morph plans by testing contacts (contact_plan.plan_push)
+            part = st.get("part") or next(iter(parts), None)
+            if part not in parts:
+                raise ProgramError(f"step {i}: part must be one of {', '.join(parts)} (got {part!r})")
+            try:
+                direction = float(st.get("direction"))
+            except (TypeError, ValueError):
+                raise ProgramError(f"step {i}: {op} needs direction as a number of degrees (0 = east, 90 = north)") from None
+            plan = planner(op, part, direction) if planner else None
+            if not plan:
+                why = planner.why_not(op, part, direction) if hasattr(planner, "why_not") else ""
+                raise ProgramError(f"step {i}: Morph couldn't plan a contact for {op} with the {part}{why}")
+            per = planner.moved(op, part, direction) if hasattr(planner, "moved") else 0.06  # what one push achieved
+            repeats = 1 if op == "tip_over" else max(1, min(6, math.ceil(float(st.get("distance", 0.06)) / per - 1e-9)))
+            for _ in range(repeats):  # each push moves it about 6 cm; it comes back behind the object each time
+                out += [dict(x, planned=i) for x in check_body_program(plan, parts, joints, known, fixtures)]
+            continue
+        if op == "throw":  # the backswing and a fast swing that lets go on the way (programs._throw_moves, any part)
+            part = st.get("part") or next((n for n, p_ in parts.items() if p_.can_grip), None)
+            if part not in parts or not parts[part].can_grip:
+                raise ProgramError(f"step {i}: throw needs a part that grips and holds the object")
+            for k in ("x", "y"):
+                if k not in st:
+                    raise ProgramError(f"step {i}: throw needs {k}: where it must land")
+            from .programs import _throw_moves
+            for mv in _throw_moves(st, i, set(names) | {"hand_x", "hand_y"}):
+                out.append({"do": "move", "part": part, "x": str(mv["x"]).replace("hand_", f"{part}_"),
+                            "y": str(mv["y"]).replace("hand_", f"{part}_"), "z": str(mv["z"]), "point": "keep", "turn": "keep",
+                            "speed": mv["speed"], "throw": i} | ({"release_at": mv["release_at"]} if "release_at" in mv else {}))
+            continue
         if op in ("move", "push"):
             part = st.get("part", "hand" if "hand" in parts else None)
             if part not in parts:
@@ -364,8 +425,9 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
                 s[k] = _formula(st[k], f"step {i} {k}", names) if k in st else f"{s['part']}_{k}"
             pt = st.get("point", "keep")
             if isinstance(pt, list):
-                if len(pt) != 3 or not all(isinstance(v, (int, float)) for v in pt) or not any(pt):
+                if len(pt) != 3:
                     raise ProgramError(f"step {i}: point as a direction needs three numbers [dx, dy, dz]")
+                pt = [_formula(v, f"step {i} point", names) for v in pt]  # numbers, or formulas read at the step's start
             elif pt not in set(POINTS) | {"keep", "object"}:
                 raise ProgramError(f"step {i}: point must be down, up, north, south, east, west, object, keep or [dx, dy, dz]")
             s["point"] = pt
@@ -379,6 +441,13 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
                 raise ProgramError(f"step {i}: until can only be \"touch\"")
             if st.get("until"):
                 s["until"] = "touch"
+            if st.get("release_at") is not None:
+                try:
+                    s["release_at"] = float(st["release_at"])
+                except (TypeError, ValueError):
+                    raise ProgramError(f"step {i}: release_at must be a number from 0 to 1") from None
+                if not 0.0 <= s["release_at"] <= 1.0 or not parts[s["part"]].can_grip:
+                    raise ProgramError(f"step {i}: release_at is 0..1, on a part that grips")
         elif op == "push":
             s["direction"] = _formula(st.get("direction", 0.0), f"step {i} direction", names)
             s["distance"] = _formula(st.get("distance", 0.1), f"step {i} distance", names)
@@ -394,7 +463,8 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
                 raise ProgramError(f"step {i}: this robot has no gripper")
             s["how"] = how
         elif op == "joints":
-            vals = st.get("joints") or st.get("values") or {k: v for k, v in st.items() if k not in ("do", "op", "seconds")}
+            vals = (st.get("joints") or st.get("values") or st.get("value") or st.get("targets") or st.get("positions")
+                    or st.get("angles") or {k: v for k, v in st.items() if k not in ("do", "op", "seconds", "speed")})
             if not isinstance(vals, dict) or not vals:
                 raise ProgramError(f"step {i}: joints needs {{joint: radians}}")
             bad = [k for k in vals if k not in joints]
@@ -407,6 +477,9 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
         elif op == "repeat_if":
             s.update(check_repeat(st, i, fixtures))
         out.append(s)
+    for s in out:  # repeat_if names a step as written: point it at that step once blocks are expanded
+        if s["do"] == "repeat_if" and "orig_back_to" not in s:
+            s["orig_back_to"], s["back_to"] = s["back_to"], first_of[s["back_to"]]
     return out
 
 
@@ -427,6 +500,10 @@ def check_repeat(st: dict, i: int, fixtures) -> dict:
 
 
 def describe(s: dict) -> str:
+    if s.get("pick") and s["do"] == "grip" and s["how"] == "open":
+        return "pick: open the gripper"
+    if s["do"] == "move" and s.get("throw"):
+        return "throw: wind up" if "release_at" not in s else f"throw: swing and let go {s['release_at']:.0%} of the way"
     if s["do"] == "move":
         bits = [f"move the {s['part']} to ({s['x']}, {s['y']}, {s['z']})"]
         if s["point"] != "keep":
@@ -436,6 +513,8 @@ def describe(s: dict) -> str:
         bits.append(s["speed"])
         if s.get("until"):
             bits.append("until it touches")
+        if "release_at" in s:
+            bits.append(f"let go {s['release_at']:.0%} of the way")
         return ", ".join(bits)
     if s["do"] == "push":
         return f"push with the {s['part']} {s['distance']} m towards {s['direction']}°, {s['speed']}"
@@ -470,7 +549,7 @@ def _direction(spec, rn: BodyRunner, part: Part, val) -> np.ndarray | None:
         p = rn.env.block_pose()
         v = np.array([p.x, p.y, p.z]) - rn.tip(part)
     elif isinstance(spec, list):
-        v = np.array(spec, float)
+        v = np.array([val(x) for x in spec], float)
     else:
         v = np.array(POINTS[spec], float)
     return v / (np.linalg.norm(v) + 1e-9)
@@ -512,7 +591,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
         state["t"] += CTRL_DT
         for p in rn.parts.values():
             state["touched"] |= _touching(rn, p.bodies)
-        v = measure(np, d.xpos, d.xmat, d.qvel, ix, rn.task, held=contact_held(m, d, ix), ctrl=d.ctrl)
+        v = measure(np, d.xpos, d.xmat, d.qvel, ix, rn.task, held=contact_held(m, d, ix), ctrl=d.ctrl, qpos=d.qpos)
         hist.update(v)
 
     def fell() -> bool:
@@ -529,7 +608,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
         nxt += 1
         if st["do"] == "repeat_if":  # reactive: measure now, and go back if the condition holds
             from .goal_terms import parse, violation
-            v = measure(np, rn.d.xpos, rn.d.xmat, rn.d.qvel, ix, rn.task, held=contact_held(m, rn.d, ix), ctrl=rn.d.ctrl)
+            v = measure(np, rn.d.xpos, rn.d.xmat, rn.d.qvel, ix, rn.task, held=contact_held(m, rn.d, ix), ctrl=rn.d.ctrl, qpos=rn.d.qpos)
             holds = float(violation(np, parse(st["condition"], rn.task.get("fixtures", {})), v)) <= 1e-6
             if holds and jumps.get(i, 0) < st["times"]:
                 jumps[i] = jumps.get(i, 0) + 1
@@ -559,10 +638,20 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                     yaw = before.yaw
                     f = rn.finger_axis(part)
                     cands = [np.array([math.cos(yaw + k * math.pi / 2), math.sin(yaw + k * math.pi / 2), 0.0]) for k in range(2)]
-                    across = max(cands, key=lambda c: abs(c @ f)) if f is not None else cands[0]
+                    hx, hy = scene.block.half_x, scene.block.half_y
+                    if max(hx, hy) > 1.3 * min(hx, hy):  # long and thin (a pen): close across its narrow side
+                        across = cands[0] if hx < hy else cands[1]
+                    else:  # about square: whichever side needs the least turning
+                        across = max(cands, key=lambda c: abs(c @ f)) if f is not None else cands[0]
                 elif st["turn"] != "keep":
                     a = math.radians(val(st["turn"]))
                     across = np.array([math.cos(a), math.sin(a), 0.0])
+                elif part.fingers is not None and (point is None or float(rn.pointing(part) @ point) > 0.995):
+                    # pointing the same way: keep the fingers turned as they are too (no drift on the way down)
+                    f = rn.finger_axis(part).copy()
+                    f[2] = 0.0
+                    if np.linalg.norm(f) > 0.5:
+                        across = f / np.linalg.norm(f)
             else:
                 a = math.radians(val(st["direction"]))
                 target = p0 + val(st["distance"]) * np.array([math.cos(a), math.sin(a), 0.0])
@@ -586,8 +675,9 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
             dist = float(np.linalg.norm(target - p0))
             turn_ang = math.acos(float(np.clip(a0 @ point, -1, 1))) if point is not None else 0.0
             n = max(1, math.ceil(max(dist / SPEEDS[st["speed"]], turn_ang / 0.05)))
-            worst, touched_at = 0.0, None
-            hold = point is None and st["do"] == "push"
+            worst, touched_at, let_go = 0.0, None, ""
+            hold = point is None  # "keep": the part goes on pointing the way it points (a hand tilting on the way drops
+            # what it carries: a pen slid out of the fingers when the hand tipped 60° on a throw's backswing)
             hold_dir = a0 if hold else None
             for k in range(n):
                 f = (k + 1) / n
@@ -602,6 +692,9 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                 worst = max(worst, pe)
                 q_part[st["part"]] = q
                 rn.command(part, q)
+                if "release_at" in st and not let_go and f >= st["release_at"]:
+                    rn.ctrl[ix.grip_act] = ix.grip_open
+                    let_go = f" (let go at {f:.0%}, the {st['part']} moving at {SPEEDS[st['speed']] / CTRL_DT:.1f} m/s)"
                 tick()
                 if st.get("until") == "touch" and rn.touches_object():
                     touched_at = f
@@ -621,7 +714,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                         f"the pointing asked for isn't possible there); ended {err * 100:.1f} cm from the point")
             else:
                 note = f"reached it (within {err * 100:.1f} cm)" if err < 0.015 else f"ended {err * 100:.1f} cm from it (blocked)"
-            note = pre + note
+            note = pre + note + let_go
             if point is not None:
                 miss = math.degrees(math.acos(float(np.clip(rn.pointing(part) @ point, -1, 1))))
                 if miss > 10:
@@ -635,17 +728,24 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                 if k > 5 and abs(now - last) < 1e-4:
                     break
                 last = now
-            held = contact_held(m, rn.d, ix) > 0.5 or "object" in _touching(rn, grippers[0].bodies)
+            hand_geoms = {g for g in range(m.ngeom) if int(m.geom_bodyid[g]) in grippers[0].bodies}
+            pinched = contact_held(m, rn.d, ix) > 0.5 or opposite_sides(rn.d, set(ix.block_geoms.tolist()), hand_geoms,
+                                                                         rn.d.xpos[ix.block])
             if st["how"] == "close":
-                note = ("the fingers are on the object" if held else
-                        f"the fingers closed on nothing: the {scene.object_name} is "
-                        f"{np.linalg.norm(rn.tip(grippers[0]) - np.array([before.x, before.y, before.z])) * 100:.0f} cm "
-                        "from the point between them")
+                if pinched:
+                    note = "the fingers closed on the object from opposite sides"
+                elif "object" in _touching(rn, grippers[0].bodies):
+                    note = (f"the fingers touch the {scene.object_name} but not from opposite sides (pressing on its top "
+                            "or one side): it is not held; the fingertips must get down beside it, around its sides")
+                else:
+                    note = (f"the fingers closed on nothing: the {scene.object_name} is "
+                            f"{np.linalg.norm(rn.tip(grippers[0]) - np.array([before.x, before.y, before.z])) * 100:.0f} cm "
+                            "from the point between them")
             else:
                 note = "the gripper is open"
         elif st["do"] in ("joints", "home"):
             if st["do"] == "home":
-                goal_q = {j: rn.home_q[m.jnt_qposadr[j]] for p in rn.parts.values() for j in p.joints}
+                goal_q = {j: rn.home_q[m.jnt_qposadr[j]] for j in _servo_joints(m)}
             else:
                 goal_q = {m.joint("robot_" + k).id: v for k, v in st["joints"].items()}
             servo = _servo_joints(m)
@@ -685,6 +785,10 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
             break
     for _ in range(int(settle_s / CTRL_DT)):
         tick()
+    for _ in range(100):  # a round or light object (a pen, a ball) may still roll: up to 2 s more for it to come to rest
+        if rn.env.block_speed() < 0.015:
+            break
+        tick()
     pose = rn.env.block_pose()
     held = contact_held(m, rn.d, ix) > 0.5
     res = check(goal, scene, m, rn.d, pose, rn.env.block_speed(), not held, history=hist)
@@ -703,7 +807,71 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
             report.append(f"in the end the {scene.object_name} is at ({pose.x:.2f}, {pose.y:.2f}): {miss * 100:.0f} cm from "
                           f"where it had to end ({', '.join(x for x in (ns, ew) if x)} of it)")
     return {"success": res["success"], "results": res["results"], "reasons": res["reasons"], "report": report,
-            "sim_s": round(state["t"], 1), "miss_m": miss}
+            "sim_s": round(state["t"], 1), "miss_m": miss,
+            "miss_vec": [pose.x - pl["x"], pose.y - pl["y"]] if pl.get("has_place") else None}
+
+
+def tune_throw(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, names: dict, log=print):
+    """A throw that misses (programs.tune, for any body): the moment it lets go moved earlier or later, the swing ending
+    higher (a higher arc, over a container's walls), and the aim corrected from where the last throw landed. Returns
+    (steps, run) for what works, or else the closest miss; None if the program doesn't let go mid-move."""
+    from .project import _params, _start_poses
+    idx = [i for i, s in enumerate(steps) if "release_at" in s]
+    if not idx:
+        return None
+    import time
+    from .task_model import contact_held
+    k, best, t0 = idx[-1], None, time.time()
+    starts = _start_poses(scene, 3)
+    w = k - 1 if k > 0 and steps[k - 1].get("throw") and "release_at" not in steps[k - 1] else None
+    if w is not None:  # the backswing: one the arm can reach still holding the object (not into its own base)
+        part, sw = steps[w]["part"], steps[k]
+        away = (f"({part}_x - ({sw['x']}))", f"({part}_y - ({sw['y']}))")
+        n = f"max(0.05, hypot({away[0]}, {away[1]}))"
+        options = [steps[w]] + [dict(steps[w], x=f"{part}_x + {b} * {away[0]} / {n}", y=f"{part}_y + {b} * {away[1]} / {n}",
+                                     z=f"max({part}_z, {z})") for b, z in ((0.12, 0.3), (0.0, 0.35), (0.0, 0.25))]
+        for o in options:
+            trial = steps[:w] + [o]
+            rn.reset(0, scene.start, _params(0))
+            r0 = run_body_program(rn, trial, goal, scene, names=names, settle_s=0.0)
+            if contact_held(rn.m, rn.d, rn.ix) > 0.5 and "can't get there" not in r0["report"][-1]:
+                if o is not steps[w]:
+                    log(f"  Morph changed the backswing: the first one {'dropped it' if 'can' not in r0['report'][-1] else 'was out of reach'}")
+                steps = steps[:w] + [o] + steps[w + 1:]
+                break
+    for speed, r, lift in [(sp, r, lift) for sp in ("fast", "whip") for r in (0.5, 0.6, 0.4, 0.7, 0.3, 0.8)
+                           for lift in (0.0, 0.1, 0.2)]:  # a faster swing when "fast" lets go too slowly
+        shift = np.zeros(2)
+        for _ in range(4):
+            if time.time() - t0 > 150:  # a couple of minutes at most: the closest miss goes back to Nemotron
+                return None if best is None else (best[1], best[2])
+            trial = [dict(s) for s in steps]
+            trial[k]["release_at"], trial[k]["speed"] = r, speed
+            trial[k]["x"] = f"({trial[k]['x']}) + {shift[0]:.4f}"
+            trial[k]["y"] = f"({trial[k]['y']}) + {shift[1]:.4f}"
+            if lift:
+                trial[k]["z"] = f"({trial[k]['z']}) + {lift}"
+            rn.reset(0, scene.start, _params(0))
+            run = run_body_program(rn, trial, goal, scene, names=names)
+            if run["success"]:  # from the scene's start: and when the object starts a little off?
+                n_ok = 0
+                for j, st0 in enumerate(starts[1:], 1):
+                    rn.reset(j, st0, _params(j))
+                    n_ok += run_body_program(rn, trial, goal, scene, names=names)["success"]
+                if n_ok == 0:
+                    run = dict(run, success=False, robust=1)
+            key = (run["success"], run.get("robust", 0), -(run["miss_m"] if run["miss_m"] is not None else 9.0))
+            if best is None or key > best[0]:
+                best = (key, trial, run)
+            if run["success"]:
+                log(f"  Morph tuned the throw: let go {r:.0%} of the way" + (", a faster swing" if speed == "whip" else "")
+                    + (f", swing ending {lift * 100:.0f} cm higher" if lift else "")
+                    + (f", aim moved {np.linalg.norm(shift) * 100:.0f} cm" if np.linalg.norm(shift) > 0.005 else ""))
+                return trial, run
+            if run.get("miss_vec") is None or run.get("robust") or not any("let go" in x for x in run["report"]):
+                break  # it lands from the scene's start (only the variations miss), or it never let go of anything
+            shift = shift - np.array(run["miss_vec"])
+    return None if best is None else (best[1], best[2])
 
 
 # ------------------------------------------------------------------ the grip: firm enough to lift the object
@@ -764,6 +932,73 @@ def calibrate_grip(rn: BodyRunner, scene, scales=(1, 2, 4, 8, 16), log=print) ->
     return float(found)
 
 
+def needs_hold(goal: GoalSpec, scene) -> bool:
+    """Does the goal need the object picked up (lifted, carried over a wall, held, thrown)?"""
+    from .goals import placement
+    p = placement(goal, scene)
+    return bool(p.get("needs_lift")) or any(c.kind == "height" or c.when == "release"
+                                            or (c.expr and ("held" in c.expr or "lifted" in c.expr))
+                                            for c in goal.conditions)
+
+
+class ContactPlanner:
+    """Plans contacts the first time a program asks for one (pick, push_object, tip_over) and remembers them."""
+
+    def __init__(self, rn: "BodyRunner", scene, log=lambda s: None):
+        self.rn, self.scene, self.log, self.memo, self.failed = rn, scene, log, {}, {}
+
+    def grasp(self, part: str | None = None) -> dict | None:
+        part = part or next((n for n, p_ in self.rn.parts.items() if p_.can_grip), None)  # one plan per gripping part
+        key = ("pick", part)
+        if key not in self.memo:
+            from .contact_plan import plan_grasp
+            self.memo[key] = plan_grasp(self.rn, self.scene, part, log=self.log)
+        return self.memo[key]
+
+    def __call__(self, kind: str, part: str, direction):
+        if kind == "pick":
+            g = self.grasp(part)
+            return g["steps"] if g and g["score"] > 0 else None
+        key = (kind, part, round(float(direction), 1))
+        if key not in self.memo:
+            from .contact_plan import plan_push
+            self.memo[key] = plan_push(self.rn, self.scene, part, float(direction),
+                                       "tip" if kind == "tip_over" else "slide", log=self.log)
+        plan = self.memo[key]
+        if plan and plan["score"] <= 0:  # nothing it tried did it (a slide that didn't move it, a tip that didn't tip)
+            self.failed[key] = plan
+            return None
+        return plan["steps"] if plan else None
+
+    def why_not(self, kind: str, part: str, direction) -> str:
+        plan = self.failed.get((kind, part, round(float(direction), 1)))
+        if not plan:
+            return ""
+        return (f": Morph tried {plan['tried']} contacts in simulation (heights, sides, slow pushes and quick strikes) and none "
+                f"{'tipped it over' if kind == 'tip_over' else 'slid it that way'} with the {part}; try another part, another "
+                "direction, or another way to do it")
+
+    def moved(self, kind: str, part: str, direction) -> float:
+        """How far one planned push moved the object when it was tried (m)."""
+        plan = self.memo.get((kind, part, round(float(direction), 1)))
+        return float(plan.get("moved_per_push", 0.06)) if plan else 0.06
+
+
+def pick_test(rn: BodyRunner, scene) -> tuple[bool, str]:
+    """Morph's own best grasp (pick) once, from where the object starts: can this gripper pick this object up at all?
+    (A gripper whose fingers can't get around it, an object too wide or too flat for it.)"""
+    hand = next((n for n, p_ in rn.parts.items() if p_.can_grip), None)
+    if hand is None:
+        return False, "it has no gripper"
+    from .contact_plan import plan_grasp
+    g = plan_grasp(rn, scene, hand)
+    if g and g["score"] > 0:
+        return True, f"Morph's grasp planning found a grip that holds the {scene.object_name}: {g['desc']}"
+    return False, (f"Morph tried {g['tried'] if g else 0} ways to grip the {scene.object_name} with this gripper (from above "
+                   "and from the side, different sides, places and heights) and none held it: its fingers don't fit "
+                   "around it, or it's too wide, too flat or too heavy for them")
+
+
 # ------------------------------------------------------------------ write, run, fix
 def part_radius(rn: BodyRunner, part: Part) -> float:
     """How far the part's shapes reach sideways from the line through its tip along its pointing: what has to clear the
@@ -802,17 +1037,29 @@ def body_facts(rn: BodyRunner, scene, goal: GoalSpec) -> dict:
                     "reach_from": [round(float(v), 3) for v in base], "reach_m_about": round(float(reach), 2)}
     return {"robot_stands_at": [round(float(v), 3) for v in rn.task["mount"][:2]],
             "robot_floating_base": rn.ix.base >= 0, "parts": parts,
-            "joints": {m.joint(j).name.removeprefix("robot_"): [round(float(v), 2) for v in m.jnt_range[j]]
-                       for p in rn.parts.values() for j in p.joints},
+            "joints_radians_range": {m.joint(j).name.removeprefix("robot_"): [round(float(v), 2) for v in m.jnt_range[j]]
+                                     for j in _servo_joints(m)},
+            # joints that move with another one (a fingertip with its middle joint): set the leader, never these
+            "coupled_joints_not_settable": {
+                m.joint(int(m.eq_obj1id[e])).name.removeprefix("robot_"):
+                    f"follows {m.joint(int(m.eq_obj2id[e])).name.removeprefix('robot_')} x {m.eq_data[e][1]:.2f}"
+                for e in range(m.neq) if int(m.eq_type[e]) == int(mujoco.mjtEq.mjEQ_JOINT) and m.eq_obj2id[e] >= 0},
             "object_half_size_m": [b.half_x, b.half_y, b.half_z], "object_start": [round(float(v), 3) for v in scene.start],
             "where_it_must_end": {k: round(float(p[k]), 3) for k in ("x", "y", "support_z")} if p.get("has_place") else None,
             "where_to_let_go": [round(v, 3) for v in spot] if spot else None,
-            "tips": ["a part is radius_m wide around its tip: to stand it beside the object without landing on it, keep its "
+            "tips": ["for goals about the robot's own body (joint_frac(...), part_z(...)): set the joints directly with "
+                     "joints({name: radians}), within joints_radians_range; a fist or a closed hand means flexion joints "
+                     "near the bent end of their range",
+                     "a part is radius_m wide around its tip: to stand it beside the object without landing on it, keep its "
                      "tip at least (object half size + radius_m + 0.02) from the object's centre, come down there, then "
                      "move in sideways until it touches",
                      "to push it, put the part against the side of the object facing away from where it must go, low on "
                      "its face (z about obj_bottom + 0.02), then push", "to tip it over, push high on its face (near obj_top)",
-                     "to grip: open, move the hand above it pointing down with turn 'object', come down slowly to obj_z, close"]}
+                     "to grip: open, move the hand above it pointing down with turn 'object', come down slowly, close. A "
+                     "gripping part's tip is the very bottom of its fingertips, and the finger pads are above it: for "
+                     "something taller than about 3 cm come down to about obj_z; for a low object (a pen, a coin, a flat "
+                     "box) come down until the fingertips are 2-3 mm above what it rests on (z = obj_bottom + 0.003), so "
+                     "the pads close around its widest part"]}
 
 
 def _cache_key(task: dict, goal: GoalSpec, scene) -> Path:
@@ -836,8 +1083,9 @@ def solve_body(pj, goal: GoalSpec, task_path: Path, llm, log=print, emit=lambda 
     name = task["robot"]
     emit(type="stage", robot=name, stage="setup", text="finding the robot's parts for Nemotron's program")
     rn = BodyRunner(task)
-    if not rn.parts:
-        return {"success": 0, "n": 0, "setup_error": "no part of this robot can be moved to a point (no position servos)"}
+    servo = _servo_joints(rn.m)
+    if not rn.parts and not servo:
+        return {"success": 0, "n": 0, "setup_error": "nothing on this robot can be moved (no position servos)"}
     if any(p.can_grip for p in rn.parts.values()) and not task.get("gripper", {}).get("calibrated"):
         k = calibrate_grip(rn, scene, log=log)  # the learner trains with the same gripper
         task["gripper"]["gain_scale"] = float(task["gripper"].get("gain_scale", 1.0)) * k
@@ -845,20 +1093,30 @@ def solve_body(pj, goal: GoalSpec, task_path: Path, llm, log=print, emit=lambda 
         task_path.write_text(json.dumps(task, indent=1))
         rn = BodyRunner(task)
     prof = profile_robot(task["robot_xml"])
-    joints = [m_j for p in rn.parts.values() for m_j in (rn.m.joint(j).name.removeprefix("robot_") for j in p.joints)]
+    joints = [rn.m.joint(j).name.removeprefix("robot_") for j in servo]  # every joint a motor drives
     top = max([f.top_z for f in scene.fixtures.values()] + [2 * scene.block.half_z])
     from .goals import placement as _placement
     pl = _placement(goal, scene)
-    names = scene_names(scene, top + 0.12, 0.01, (pl["x"], pl["y"]) if pl.get("has_place") else None)
+    names = scene_names(scene, top + 0.12, 0.01, (pl["x"], pl["y"]) if pl.get("has_place") else None,
+                        pl["support_z"] + scene.block.half_z)
     facts = body_facts(rn, scene, goal)
     facts["names_for_formulas"] = {k: round(v, 3) for k, v in names.items()}
+    planner = ContactPlanner(rn, scene, log)
+    if needs_hold(goal, scene) and any(p_.can_grip for p_ in rn.parts.values()):
+        g = planner.grasp()
+        if g:
+            facts["morph_grasp_plan"] = (f"Morph tried {g['tried']} ways to grip the {scene.object_name} with this gripper in "
+                                         f"simulation; best: {g['desc']} (held {g['score']:.0f}/{g['max']:.0f} after lifting "
+                                         "and shaking). pick(part) uses it." if g["score"] > 0 else
+                                         f"Morph tried {g['tried']} ways to grip the {scene.object_name} with this gripper "
+                                         "and none held it: this gripper can't pick it up. Push or tip it instead.")
     checklist = [f"{c.describe()}: {explain(c, scene)}" for c in goal.conditions]
     tries, steps, ok_run = [], None, None
     cache = _cache_key(task, goal, scene)
     if cache.exists():
         try:
             cached = check_body_program(json.loads(cache.read_text())["program"], rn.parts, joints, set(names),
-                                        task.get("fixtures"))
+                                        task.get("fixtures"), planner)
             rn.reset(0, scene.start, _params(0))
             run = run_body_program(rn, cached, goal, scene, names=names)
             if run["success"]:
@@ -879,7 +1137,7 @@ def solve_body(pj, goal: GoalSpec, task_path: Path, llm, log=print, emit=lambda 
                 break
             continue
         try:
-            steps = check_body_program(prop.steps, rn.parts, joints, set(names), task.get("fixtures"))
+            steps = check_body_program(prop.steps, rn.parts, joints, set(names), task.get("fixtures"), planner)
         except ProgramError as e:
             tries.append({"program": prop.steps, "problem": f"Morph couldn't run it: {e}"})
             log(f"  program {a + 1}: can't run it: {e}")
@@ -897,6 +1155,18 @@ def solve_body(pj, goal: GoalSpec, task_path: Path, llm, log=print, emit=lambda 
         emit(type="program_result", robot=name, attempt=a + 1, success=run["success"], report=run["report"],
              reasons=run["reasons"])
         log(f"  program {a + 1}: {'reached the goal' if run['success'] else 'failed: ' + '; '.join(run['reasons'][:2])}")
+        if not run["success"] and any("release_at" in st for st in steps):
+            emit(type="caption", robot=name, text="Morph is fine-tuning the aim: when to let go, how fast to swing")
+            tuned = tune_throw(rn, steps, goal, scene, names, log)
+            if tuned is not None:
+                if tuned[1]["success"]:
+                    steps, run = tuned
+                    tries[-1]["tuned_by_morph"] = [describe(st) for st in steps if "release_at" in st]
+                    emit(type="program_result", robot=name, attempt=a + 1, success=True, report=run["report"],
+                         reasons=[], tuned=True)
+                else:
+                    tries[-1]["closest_tuning"] = {"program": [describe(st) for st in tuned[0]],
+                                                   "result": feedback(tuned[1])}
         if run["success"]:
             ok, r2 = 0, None
             for j, st0 in enumerate(_start_poses(scene, 3)[1:], 1):

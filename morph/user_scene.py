@@ -161,6 +161,25 @@ def _classify_kind(name: str, boxes: list[tuple[np.ndarray, np.ndarray]]) -> Fix
     return Fixture(name, "obstacle", lo, hi, float(hi[2]), 0.0)
 
 
+def _mesh_object(path: Path, m: mujoco.MjModel, g: int, obj_name: str) -> tuple[dict, np.ndarray]:
+    """A mesh object: its file, scale and placement in the object's frame as the scene writes them (for rebuilding it
+    in every robot's scene), and its half extents in that frame."""
+    spec = mujoco.MjSpec.from_file(str(path))
+    sg = next(x for x in spec.geoms if x.parent.name == obj_name and x.type == mujoco.mjtGeom.mjGEOM_MESH)
+    sm = next(x for x in spec.meshes if x.name == sg.meshname)
+    f = Path(sm.file)
+    if not f.is_absolute():
+        f = Path(path).parent / (spec.meshdir or "") / f
+    mid = int(m.geom_dataid[g])
+    v = m.mesh_vert[m.mesh_vertadr[mid]:m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+    R = np.zeros(9)
+    mujoco.mju_quat2Mat(R, m.geom_quat[g])
+    vb = m.geom_pos[g] + v @ R.reshape(3, 3).T  # in the object's frame
+    half = np.maximum(np.abs(vb.max(0)), np.abs(vb.min(0)))
+    return {"mesh_file": str(f.resolve()), "mesh_scale": tuple(float(x) for x in sm.scale),
+            "mesh_pos": tuple(float(x) for x in sg.pos), "mesh_quat": tuple(float(x) for x in sg.quat)}, half
+
+
 def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
     path = Path(path)
     m = mujoco.MjModel.from_xml_path(str(path))
@@ -200,6 +219,9 @@ def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
             shape, half = "cylinder", np.array([sz[0], sz[0], sz[1]])
         elif t == int(mujoco.mjtGeom.mjGEOM_CAPSULE) and upright:
             shape, half = "capsule", np.array([sz[0], sz[0], sz[1] + sz[0]])
+        elif t == int(mujoco.mjtGeom.mjGEOM_MESH):  # its own 3D model (e.g. from morph.object_import)
+            mesh_kw, half = _mesh_object(path, m, og[0], obj_name)
+            shape = "mesh"
     if shape == "box" and not (len(og) == 1 and m.geom_type[og[0]] == int(mujoco.mjtGeom.mjGEOM_BOX)):
         notes.append(f"object {obj_name} is modelled as its {2 * half[0] * 100:.1f} x {2 * half[1] * 100:.1f} x "
                      f"{2 * half[2] * 100:.1f} cm bounding box")
@@ -238,10 +260,16 @@ def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
             rgba = " ".join(f"{v:.3f}" for v in m.geom_rgba[g])
             fr = " ".join(f"{v:g}" for v in m.geom_friction[g])
             if t in GEOM_NAMES:
-                size = " ".join(f"{v:.5f}" for v in m.geom_size[g][:3])
+                sz, ps = m.geom_size[g][:3].copy(), d.geom_xpos[g].copy()
+                if (t == int(mujoco.mjtGeom.mjGEOM_BOX) and d.geom_xmat[g][8] > 0.999 and sz[2] < 0.01
+                        and abs(ps[2] - sz[2]) < 0.002):
+                    # a thin slab on the ground (a bin's 1 cm floor): reach 2 cm below the ground, same top. A pen
+                    # thrown in fast got past the middle of a 1 cm slab and was pushed out underneath it
+                    sz[2], ps[2] = sz[2] + 0.01, ps[2] - 0.01
+                size = " ".join(f"{v:.5f}" for v in sz)
                 quat = np.zeros(4)
                 mujoco.mju_mat2Quat(quat, d.geom_xmat[g])
-                pos = " ".join(f"{v:.5f}" for v in d.geom_xpos[g])
+                pos = " ".join(f"{v:.5f}" for v in ps)
                 q = " ".join(f"{v:.6f}" for v in quat)
                 body.append(f'      <geom type="{GEOM_NAMES[t]}" size="{size}" pos="{pos}" quat="{q}" rgba="{rgba}" friction="{fr}"/>')
             else:
@@ -255,5 +283,6 @@ def load_scene(path: str | Path, object_name: str | None = None) -> UserScene:
         fixtures[name] = f
 
     block = BlockSpec(half_x=float(half[0]), half_y=float(half[1]), half_z=float(half[2]), mass=block_mass,
-                      friction=friction, fixtures_xml="".join(xml), shape=shape)
+                      friction=friction, fixtures_xml="".join(xml), shape=shape,
+                      **(mesh_kw if shape == "mesh" else {}))
     return UserScene(str(path), obj_name, block, start, fixtures, notes)

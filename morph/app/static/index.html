@@ -34,6 +34,9 @@ header { height: 60px; display: flex; align-items: center; gap: 14px; padding: 0
 .chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 99px;
   background: var(--panel); border: 1px solid var(--line); color: var(--dim); font-size: 12.5px; cursor: default; white-space: nowrap; }
 .chip b { color: var(--text); font-weight: 600; }
+.chip.job { color: var(--text); border-color: rgba(106, 168, 255, .55); background: rgba(106, 168, 255, .12); animation: glow 1.6s ease-in-out infinite; }
+.chip.job .spin { border-color: var(--accent); border-top-color: transparent; }
+.chip.job button { height: 22px; padding: 0 9px; font-size: 12px; }
 .chip.click { cursor: pointer; } .chip.click:hover { border-color: var(--line2); color: var(--text); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .15); }
@@ -250,6 +253,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <b>Morph</b><span class="tag">describe a task once, any robot does it</span>
   </div>
   <span class="spacer"></span>
+  <span class="chip job hidden" id="jobchip" data-tip="Morph does one thing at a time: Run and Learn come back when this finishes or you stop it"><span class="spin"></span><span id="jobtxt">Working</span><button class="danger" onclick="stop()">Stop</button></span>
   <span class="chip" data-tip="NVIDIA Nemotron (via Nebius) reads free-form goals and plans for each robot. Billed per token it reads and writes."><span class="dot" id="llmdot"></span><span id="llmtxt">Nemotron</span></span>
   <span class="chip" data-tip="Where the live picture is drawn. On a GPU it can be sharp and smooth; on the CPU pick Fast quality under the viewer."><span class="dot" id="renderdot"></span><span id="rendertxt">Renderer</span></span>
   <span class="chip click" onclick="showTab('compute')" data-tip="Where heavy learning (teaching a robot to walk) runs: this computer or a Nebius cloud GPU. Click to change."><span id="computetxt">Compute: this PC</span></span>
@@ -262,8 +266,8 @@ header [data-tip]:hover::after { left: auto; right: 0; }
   <div class="step" id="st1">
     <div class="stephead"><span class="num">1</span><h3>Where it happens</h3></div>
     <p class="help">A scene: the object to move and what's around it. Use the example or upload your own MuJoCo scene.</p>
-    <div class="row"><select id="scene" class="grow"></select><button onclick="pick('scenefile')" data-tip="A MuJoCo .xml with one free-moving object, plus any bins, shelves or walls.">Upload</button></div>
-    <input type="file" id="scenefile" accept=".xml" class="hidden" onchange="upload(this, 'scene')">
+    <div class="row"><select id="scene" class="grow"></select><button onclick="pick('scenefile')" data-tip="A MuJoCo .xml with one free-moving object, plus any bins, shelves or walls; or just an object's 3D model (.stl / .obj, e.g. exported from SolidWorks): Morph puts it in the work cell, works out its units and weight, and lays it down the way it rests.">Upload</button></div>
+    <input type="file" id="scenefile" accept=".xml,.stl,.obj" class="hidden" onchange="upload(this, 'scene')">
     <div class="things" id="things"></div>
   </div>
 
@@ -410,11 +414,14 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "
 const PLAN = {grasp_place_topdown: "Pick up and place", legged_foot_push: "Walk over and push", mobile_push: "Drive over and push",
               learn_policy: "Needs to learn first", unsupported: "Can't do this goal", learned_skill: "Its learned skill",
               program: "Nemotron's program"};
+function planLabel(p) {  // no ready-made skill fits: Nemotron writes a program first (learning only if that fails)
+  return p.plan === "learn_policy" && p.recipes ? "Nemotron writes a program" : PLAN[p.plan];
+}
 const PLAN_LONG = {program: "Nemotron writes a program from building blocks (move the hand, open, close); Morph runs it, tells it what happened, and it fixes the program until the checklist is met",
                    learned_skill: "Use the skill it learned for this goal", grasp_place_topdown: "Pick it up from above, carry it, set it down (gripper)",
                    legged_foot_push: "Walk with a learned gait, then push with one foot while standing on three",
                    mobile_push: "Drive its base against the object and push it",
-                   learn_policy: "Learn a new skill in simulation first (reinforcement learning on a GPU)"};
+                   learn_policy: "Nemotron writes a program for it (the building blocks for this body); if that doesn't work, it learns a skill in simulation"};
 const KIND = {object: ["◆", "the object to move"], container: ["▢", "a container: things go inside it"],
               surface: ["▭", "a surface: things rest on top of it"], obstacle: ["▮", "an obstacle: things can be pushed against it"]};
 const SRC = {description: "your words", demo: "the demo", default: "added by Morph"};
@@ -461,7 +468,7 @@ async function boot() {
   seg("quality", [["sharp", "Sharp"], ["balanced", "Balanced"], ["fast", "Fast"]], s.control.quality, v => control({quality: v}));
   sendView(); window.addEventListener("resize", () => { clearTimeout(window._rv); window._rv = setTimeout(sendView, 250); });
   if (s.projects.length) await loadScene($("scene").value);
-  events(); steps();
+  events(); steps(); pollJob();
 }
 function previewSize() { const r = $("viewer").getBoundingClientRect(), k = Math.min(1, 1600 / (r.width * devicePixelRatio));
   return [Math.round(r.width * devicePixelRatio * k), Math.round(r.height * devicePixelRatio * k)]; }
@@ -648,7 +655,7 @@ function status(r) {
   if (p.plan === "unsupported") return ["bad", p.why_not || "can't do this goal"];
   if (p.learned) return ["ok", "ready: its learned skill"];
   if (p.plan === "learn_policy") return ["warn", p.legs === 4 ? "needs to learn to walk first (ⓘ)" : "no ready-made skill: it can learn this (ⓘ)"];
-  return ["ok", "ready: " + PLAN[p.plan].toLowerCase()];
+  return ["ok", "ready: " + planLabel(p).toLowerCase()];
 }
 function renderRobots() {
   const list = S.robots.map((r, i) => [r, i]).filter(([r]) => S.filter === "All" || r.group === S.filter);
@@ -710,7 +717,7 @@ async function profile(i) {
         body: "move any of its parts to a point, pointing any way, push, grip, react",
         legged: "walk to, turn, push with a foot, bump with the body (on its learned gait)"}[p.recipes] || "none yet for this body (it can still learn from scratch)"}</div>
     <div class="sec" style="margin-top:14px"><h4>${S.goal ? "Plan for this goal" : "What it could do"}</h4><div class="card">
-      <span class="plan ${p.plan}">${esc(PLAN[p.plan])}</span>
+      <span class="plan ${p.plan}">${esc(planLabel(p))}</span>
       ${p.why_not ? `<div class="why">${esc(p.why_not)}</div>` : ""}
       <div style="margin-top:10px">${p.templates.map(t => `<div class="tmpl"><span class="st ${t.ok ? "ok" : "dim"}">${t.ok ? "✓" : "✕"}</span>
         <div><div>${esc(PLAN_LONG[t.id] || t.id)}</div>${t.ok ? "" : `<div class="why2">${esc(t.missing.join("; "))}</div>`}</div></div>`).join("")}</div></div></div>
@@ -726,7 +733,7 @@ async function profile(i) {
       <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
         : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your own Nebius account.`}
         <a href="#" onclick="showTab('compute');return false">Change</a></div>
-      <button class="primary" onclick="train(${i})">${c.mode === "local" ? "Train on this computer" : "Prepare cloud job"}</button></div></div>` : ""}`;
+      <button class="primary jobbtn" onclick="train(${i})" ${S.running ? "disabled" : ""}>${c.mode === "local" ? "Train on this computer" : "Prepare cloud job"}</button></div></div>` : ""}`;
 }
 function readyFailed(r) {  // the ready-made skill ran here but couldn't be set up, or mostly failed
   const R = S.results[r.path.split("/").pop().replace(/(\.urdf)?\.(xml|urdf|xacro)$/, "")]; if (!R) return false;
@@ -742,7 +749,9 @@ function learnCard(r, i, failed) {
   const e = S.test, c = S.compute; if (!e) return "";
   const g = e.cloud[c.gpu], ok = recipeWorks(r);
   const p = S.profiles[r.path] || {}, at = p.attempt;
-  const prev = !at ? "" : at.state === "learning"
+  const prev = !at ? "" : at.state === "other_file"
+    ? `<div class="why" style="margin-bottom:8px">This goal was learned for another file of ${esc(r.name)} (for example one without its meshes). This one is a different body, so learn it again here.</div>`
+    : at.state === "learning"
     ? `<div class="why" style="margin-bottom:8px">An earlier learning attempt for this goal didn't finish (it was stopped part-way), so runs don't use it.</div>`
     : `<div class="why" style="margin-bottom:8px">An earlier learning attempt only succeeded in ${at.success} of ${at.n} tries, so runs don't use it. Learning again continues from the program, not from that attempt.</div>`;
   return `<div class="sec"><h4>${ok ? "Make it robust" : "Learn this task"}</h4><div class="card small">${prev}
@@ -762,7 +771,7 @@ function learnCard(r, i, failed) {
     <div id="stepsbox" style="margin-bottom:10px">${S.planned && S.planned.path === r.path ? stepsHtml(S.planned, 0, false)
       : `<button class="xs" onclick="planSteps(${i})" data-tip="${$("usellm").checked ? "Nemotron" : "Morph"} writes the steps a person would take without thinking, for this robot's body (which parts it uses, from which side, what to keep steady). The learner is rewarded for reaching each step in order. Costs about $0.002 with Nemotron.">Plan the steps first</button>
          <span class="tiny faint">or Morph plans them when you start</span>`}</div>
-    <button class="primary" onclick="learn(${i})">${c.mode === "local" ? (ok ? "Train a robust skill on this computer" : "Learn on this computer") : "Prepare cloud job"}</button>
+    <button class="primary jobbtn" onclick="learn(${i})" ${S.running ? "disabled" : ""}>${c.mode === "local" ? (ok ? "Train a robust skill on this computer" : "Learn on this computer") : "Prepare cloud job"}</button>
     <div class="tiny faint" style="margin-top:8px">When it's done you can export the learned policy to use outside Morph.</div></div></div>`;
 }
 async function rate(good) {
@@ -789,8 +798,10 @@ async function robustTest(btn, task) {
 }
 async function learn(i) {
   const rs = document.getElementById("randomize");
+  setRunning(true); S.starting = true;  // at once: getting ready to learn takes minutes before the first training event
   try { await api("/api/learn", {path: S.robots[i].path, randomize: rs ? rs.value : "light", llm: $("usellm").checked}); }
   catch (e) { toast(e.message, true); }
+  S.starting = false; pollJob();
 }
 async function planSteps(i) {
   $("stepsbox").innerHTML = `<span class="spin"></span> <span class="muted small">${$("usellm").checked ? "Nemotron is" : "Morph is"} working out how ${esc(S.robots[i].name)} should go about it…</span>`;
@@ -819,7 +830,8 @@ async function upload(input, kind) {
   const r = await fetch(`/api/upload?kind=${kind}&name=${encodeURIComponent(f.name)}`, {method: "POST", body: f});
   const j = await r.json(); input.value = "";
   if (j.error) { toast(j.error, true); return; }
-  if (kind === "scene") { $("scene").innerHTML = j.projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.uploaded ? " (yours)" : ""}</option>`).join(""); $("scene").value = j.path; loadScene(j.path); }
+  if (kind === "scene") { $("scene").innerHTML = j.projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.uploaded ? " (yours)" : ""}</option>`).join(""); $("scene").value = j.path; loadScene(j.path);
+    if (j.note) toast(j.note); }
   if (kind === "robot") { S.robots = j.robots; S.sel.add(j.path); renderFilters(); renderRobots(); steps(); }
   if (kind === "demo") { S.demo = j.path; $("demodrop").innerHTML = `Demonstration: <b>${esc(f.name)}</b> <span class="faint">(click to change)</span>`; $("demodrop").classList.add("has"); }
 }
@@ -833,7 +845,7 @@ async function interpret() {
   $("goalerr").textContent = ""; $("interp").disabled = true; showTab("results");
   $("checklist").innerHTML = `<span class="spin"></span> <span class="muted small">${$("usellm").checked ? "Nemotron is reading the goal…" : "Reading the goal…"}</span>`;
   try {
-    S.goal = await api("/api/goal", {description: $("desc").value, demo: S.demo, llm: $("usellm").checked});
+    S.goal = await api("/api/goal", {description: $("desc").value, demo: S.demo, llm: $("usellm").checked, robots: [...S.sel]});
     S.planned = null;
     renderGoal(); S.profiles = {}; renderRobots();
     for (const p of S.sel) fetchProfile(p);
@@ -872,18 +884,35 @@ async function run() {
   S.results = {}; S.order = []; $("log").textContent = "";
   robots.forEach(p => { const k = p.split("/").pop().replace(".xml", ""); S.results[k] = {trials: Array(S.n).fill(null), plan: null}; S.order.push(k); });
   renderResults(); showTab("results");
+  S.starting = true;
   try { await api("/api/run", {robots, n: S.n, llm: $("usellm").checked}); setRunning(true); showLive(); }
   catch (e) { $("runerr").textContent = e.message; }
+  S.starting = false; pollJob();
 }
 async function train(i) {
+  setRunning(true); S.starting = true;
   try { await api("/api/train", {path: S.robots[i].path}); } catch (e) { toast(e.message, true); }
+  S.starting = false; pollJob();
 }
 async function stop() { await api("/api/stop", {}); }
 async function control(c) { const r = await api("/api/control", c); $("pausebtn").textContent = r.paused ? "▶" : "❚❚"; return r; }
 function togglePause() { control({paused: $("pausebtn").textContent === "❚❚"}); }
 function fullscreen() { $("viewer").requestFullscreen && $("viewer").requestFullscreen(); }
 document.addEventListener("fullscreenchange", () => setTimeout(sendView, 300));
-function setRunning(on) { S.running = on; $("stopbtn").disabled = !on; $("pausebtn").disabled = !on; steps(); renderGoal(S.lastConds); }
+function setRunning(on) { S.running = on; $("stopbtn").disabled = !on; $("pausebtn").disabled = !on;
+  document.querySelectorAll(".jobbtn").forEach(b => b.disabled = on); steps(); renderGoal(S.lastConds); }
+// what the server is doing (asked every 2 s, and after each click): one job at a time, shown in the header; also catches a
+// page reloaded mid-run, or an end the event stream missed
+const JOB = {run: "Running", learn: "Learning", train: "Learning to walk"};
+async function pollJob() {
+  if (S.starting) return;  // a click is still on its way to the server
+  let j; try { j = await api("/api/job"); } catch (e) { return; }
+  const m = Math.floor(j.seconds / 60), t = m ? `${m} min` : `${j.seconds} s`;
+  $("jobchip").classList.toggle("hidden", !j.busy);
+  if (j.busy) $("jobtxt").innerHTML = j.stopping ? "Stopping…" : `${JOB[j.kind] || "Working"}${j.robot ? `: <b>${esc(j.robot)}</b>` : ""} · ${t}`;
+  if (j.busy !== S.running) setRunning(j.busy);
+}
+setInterval(pollJob, 2000);
 function showLive() {
   S.replay = null; S.viewMode = "live"; S.pvTok = (S.pvTok || 0) + 1;  // cancel any preview still loading
   $("empty").classList.add("hidden"); $("live").classList.remove("hidden");
@@ -965,7 +994,7 @@ function events() {
       case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
       case "training_round_start": S.curve = []; S.trainSteps = e.steps; trainLabel(); break;
       case "suggestion": caption(e.now ? "Ending this round early to use your suggestion" : "Got it: Nemotron will use your suggestion at the end of this round"); break;
-      case "training_start": $("trainbox").classList.remove("hidden"); $("tab-learning").classList.remove("hidden"); showTab("learning"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = ""; trainLabel();
+      case "training_start": S.trainRobot = e.robot; progress("setup", `${e.robot} is ${e.kind === "task" ? "learning" : "learning to walk"}`); $("trainbox").classList.remove("hidden"); $("tab-learning").classList.remove("hidden"); showTab("learning"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = ""; trainLabel();
         $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
           : "Score per practice run: higher means it walks and follows directions better.";
         if (e.kind !== "task") $("trainsteps").innerHTML = "";
@@ -999,7 +1028,9 @@ function events() {
         else if (e.stage === "candidates") { prev.ideas = e.ideas; S.rounds[e.round] = prev; }
         else S.rounds[e.round] = {...prev, ...e};
         if (e.stage === "candidates") caption(`Nemotron proposed ${e.ideas.length - 1} new plans: trying each briefly, keeping the best`);
-        if (e.stage === "practice") caption(`Round ${e.round} of ${e.rounds}: practising (${(e.steps / 1e6).toFixed(0)}M steps)`);
+        if (e.stage === "practice") { caption(`Round ${e.round} of ${e.rounds}: practising (${(e.steps / 1e6).toFixed(0)}M steps)`);
+          progress("setup", `${S.trainRobot || ""} · round ${e.round} of ${e.rounds}: practising`); }
+        if (e.stage === "tried") progress("trials", `${S.trainRobot || ""} · round ${e.round}: ${e.success}/${e.n}`);
         if (e.stage === "revised") caption(`Nemotron revised the steps from what it saw in round ${e.round}`);
         if (e.stage === "remounted") caption(`It couldn't reach the parcel: moving it closer and starting again`);
         if (e.stage === "advice") { caption(`Nemotron changed the plan from what you said and rated`); $("suggested").innerHTML = ""; S.rateCount = 0; }
@@ -1022,7 +1053,7 @@ function events() {
       case "training_done": $("trainpct").textContent = !e.ok ? `Training failed: ${e.why || "see Log"}` : e.kind === "task" ? "Learned. Now trying it…" : "Done: plans now use this gait";
         if (e.kind !== "task" || !e.ok) setRunning(false); S.profiles = {}; renderRobots(); break;
       case "robot_start_learn": break;
-      case "learn_done":
+      case "learn_done": progress("done", `${e.robot}: learned ${e.success}/${e.n}`);
         S.profiles = {}; renderRobots();
         if (e.n && 2 * e.success >= e.n) toast(`${e.robot} learned it: ${e.success}/${e.n} tries succeeded. Runs now use it; export it from the Robot tab.`);
         else toast(`${e.robot} didn't learn it well enough: ${e.success}/${e.n} tries succeeded, so runs won't use it. Try learning again, give it suggestions while it learns, or move the robot.`, true);

@@ -55,3 +55,17 @@ def test_plan_context_is_serialisable():
     prof, checks, _ = _plan("agilex_piper/piper.xml")
     ctx = plan_context(prof, SPEC, checks)
     assert json.loads(json.dumps(ctx, default=str))["task"]["goal_yaw_deg"] == pytest.approx(103.1, abs=0.1)
+
+
+def test_the_ready_made_grasp_steps_aside_for_a_flat_object():
+    """A pen lying down: the ready-made top-down skill's fingers can't get around it (0/5 every time); a program with
+    Morph's planned grip can, so the plan goes straight there."""
+    from morph.introspect import profile_robot
+    from morph.planner import check_templates
+    from morph.scene import BlockSpec
+    p = profile_robot(str(Path(__file__).resolve().parents[1] / "third_party/mujoco_menagerie/franka_emika_panda/panda.xml"))
+    pen = BlockSpec(half_x=0.0525, half_y=0.0065, half_z=0.006)
+    t = next(t for t in check_templates(p, SPEC, pen) if t.id == "grasp_place_topdown")
+    assert not t.applicable and any("cm tall" in m for m in t.missing)
+    t = next(t for t in check_templates(p, SPEC, BlockSpec()) if t.id == "grasp_place_topdown")
+    assert t.applicable  # the 6 cm parcel: as before

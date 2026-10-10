@@ -51,7 +51,7 @@ def test_a_sensible_program_reaches_the_goal(setup):
     ad.reset(0, pj.scene.start, _params(0))
     run = run_program(ad, prog, goal, pj.scene, names=names)
     assert run["success"], run["reasons"]
-    assert "holding the object" in run["report"][3]
+    assert "closed on it from opposite sides" in run["report"][3]
 
 
 def test_failures_are_reported_in_words_that_say_why(setup):

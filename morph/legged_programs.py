@@ -27,7 +27,7 @@ from .goal_terms import History
 from .goals import GoalSpec, check
 from .programs import ProgramError, _formula, scene_names
 
-LEG_OPS = {"walk_to", "turn_to", "foot_push", "bump", "push_object_to", "wait"}
+LEG_OPS = {"walk_to", "turn_to", "foot_push", "bump", "push_object_to", "wait", "tip_over"}
 MAX_STEPS = 16
 CACHE = Path(__file__).resolve().parents[1] / "runs" / "programs"
 LOW, HIGH = 0.025, 0.07  # foot push heights (m): low on the face slides it, high tips it
@@ -40,7 +40,9 @@ BLOCKS_DOC = (
     "several for more); height \"low\" slides it, \"high\" pushes higher on its face (a tall, narrow object may tip). bump(direction, distance): the robot walks its body into the "
     "object, moving it about distance (m) towards direction: rougher than a foot push (it may knock the object over). "
     "push_object_to(x, y, facing): Morph plans and runs a series of foot pushes that bring the object to (x, y) "
-    "(facing: the object's final heading in degrees, or leave it out). wait(seconds). Every number can instead be a "
+    "(facing: the object's final heading in degrees, or leave it out). tip_over(direction): Morph tries the ways this "
+    "robot can knock it over towards direction (high and low foot pushes, body bumps) in simulation and uses the one "
+    "that tipped it furthest. wait(seconds). Every number can instead be a "
     "formula (a string) over obj_x, obj_y, obj_z, obj_top, obj_yaw_deg, robot_x, robot_y, robot_facing_deg, and the "
     "scene's names (each fixture's <name>_x, <name>_y, <name>_top, <name>_floor), with + - * / abs min max hypot sqrt."
 )
@@ -59,7 +61,53 @@ def make_robot(prof, scene):
     return LearnedWalker(pol, block=scene.block)
 
 
-def check_leg_program(steps: list, known: set = frozenset()) -> list[dict]:
+class LegPlanner:
+    """tip_over for a legged robot: the ways it can knock the object over (a high or low foot push, one or two, a body
+    bump), each tried in simulation on its own gait from where it stands; the one that tips it furthest is used."""
+
+    def __init__(self, rb, scene, base0, names: dict, log=lambda s: None):
+        self.rb, self.scene, self.base0, self.names, self.log, self.memo = rb, scene, base0, names, log, {}
+
+    def candidates(self, d: float) -> list[tuple[str, list[dict]]]:
+        fp = lambda h, n=1: [{"do": "foot_push", "direction": d, "distance": 0.07, "height": h}] * n  # noqa: E731
+        legs = max(abs(v[1]) for v in self.rb.legs_adapter().legs.nominal.values()) if hasattr(self.rb, "legs_adapter") \
+            else 0.13  # how far its feet stand out to the side: walk in that far off-centre and a leg strikes it
+        bump = lambda off, dist: [{"do": "bump", "direction": d, "distance": dist, "offset": off}]  # noqa: E731
+        out = [("a high foot push", fp("high")), ("two high foot pushes", fp("high", 2)),
+               ("a low foot push, then a high one", fp("low") + fp("high")), ("walking into it centred", bump(0.0, 0.3))]
+        for k in (0.7, 1.0, 1.3):  # off-centre by about a leg's sideways stance, either side
+            out += [(f"walking into it {k * legs * 100:.0f} cm off-centre (left legs)", bump(k * legs, 0.3)),
+                    (f"walking into it {k * legs * 100:.0f} cm off-centre (right legs)", bump(-k * legs, 0.3))]
+        return out
+
+    def __call__(self, d: float):
+        key = round(float(d), 1)
+        if key not in self.memo:
+            from .goals import GoalSpec
+            from .project import _params
+            empty = GoalSpec(object=self.scene.object_name, conditions=[])
+            from .project import _start_poses
+            best = None
+            for desc, prog in self.candidates(float(d)):
+                steps = check_leg_program(prog, set(self.names))
+                tipped, tilts = 0, []
+                for i, st in enumerate(_start_poses(self.scene, 3)):  # how often, not once: a lucky try isn't a way
+                    self.rb.reset(i, st, _params(i), base_xy_yaw=self.base0)
+                    run_leg_program(self.rb, steps, empty, self.scene, self.names)
+                    t = math.degrees(self.rb.env.block_pose().tilt) if not self.rb.fallen() else -1.0
+                    tilts.append(t)
+                    tipped += t > 45
+                key_ = (tipped, sum(tilts))
+                if best is None or key_ > best[0]:
+                    best = (key_, desc, prog, tipped)
+            (_, total), desc, prog, tipped = best
+            self.log(f"  contact planning: tried {len(self.candidates(d))} ways to knock it over (3 tries each); best: "
+                     f"{desc} (tipped it in {tipped}/3)")
+            self.memo[key] = (prog, desc, 90.0 * tipped / 3)
+        return self.memo[key]
+
+
+def check_leg_program(steps: list, known: set = frozenset(), planner: "LegPlanner | None" = None) -> list[dict]:
     if not isinstance(steps, list) or not steps:
         raise ProgramError("the program has no steps")
     if len(steps) > MAX_STEPS:
@@ -74,6 +122,20 @@ def check_leg_program(steps: list, known: set = frozenset()) -> list[dict]:
         op = st.get("do") or st.get("op")
         if op not in LEG_OPS:
             raise ProgramError(f"step {i}: unknown building block {op!r} (known: {', '.join(sorted(LEG_OPS))})")
+        if op == "tip_over":  # the way that tipped it furthest when tried (LegPlanner)
+            try:
+                d = float(st.get("direction"))
+            except (TypeError, ValueError):
+                raise ProgramError(f"step {i}: tip_over needs direction as a number of degrees") from None
+            if planner is None:
+                raise ProgramError(f"step {i}: tip_over needs Morph's contact planning (not available here)")
+            prog, desc, tilt = planner(d)
+            if tilt < 30:  # tipped it in under 1 of 3 tries
+                raise ProgramError(f"step {i}: Morph tried {len(planner.candidates(d))} ways for this robot to knock it "
+                                   f"over towards {d:.0f}° (high and low foot pushes, walking into it centred and "
+                                   "off-centre), 3 tries each, and none tipped it reliably; try another direction or approach")
+            out += check_leg_program(prog, known)
+            continue
         s = {"do": op}
         if op in ("walk_to", "push_object_to"):
             for k in ("x", "y"):
@@ -88,6 +150,8 @@ def check_leg_program(steps: list, known: set = frozenset()) -> list[dict]:
         if op in ("foot_push", "bump"):
             s["direction"] = _formula(st.get("direction", 0.0), f"step {i} direction", names)
             s["distance"] = _formula(st.get("distance", 0.08), f"step {i} distance", names)
+        if op == "bump":  # walk in this far to the left (+) or right (-) of the object: a leg strikes it, not the belly
+            s["offset"] = _formula(st.get("offset", 0.0), f"step {i} offset", names)
         if op == "foot_push":
             s["height"] = st.get("height", "low")
             if s["height"] not in ("low", "high"):
@@ -200,7 +264,8 @@ def run_leg_program(rb, steps: list[dict], goal: GoalSpec, scene, names: dict | 
             dist = float(np.clip(val(st["distance"]), 0.02, 0.6))
             u = np.array([math.cos(d), math.sin(d)])
             back = body_half + _face_extent(scene, before.yaw, d) + 0.08
-            sx, sy = np.array([before.x, before.y]) - u * back
+            side = float(val(st.get("offset", 0.0)))
+            sx, sy = np.array([before.x, before.y]) - u * back + side * np.array([-u[1], u[0]])
             walk(sx, sy, d)
             v = 0.25
             rb.walk((v, 0.0, 0.0), (dist + 0.08) / v)
@@ -283,9 +348,10 @@ def solve_legged(pj, goal: GoalSpec, prof, llm, log=print, emit=lambda **e: None
                       list(scene.start), [round(float(v), 3) for v in base0]], sort_keys=True, default=str)
     cache = CACHE / f"legged_{prof.name}__{hashlib.sha1(key.encode()).hexdigest()[:12]}.json"
     tries, steps, ok_run, a, fixes = [], None, None, 0, 0
+    planner = LegPlanner(rb, scene, base0, names, log)
     if cache.exists():
         try:
-            cached = check_leg_program(json.loads(cache.read_text())["program"], set(names))
+            cached = check_leg_program(json.loads(cache.read_text())["program"], set(names), planner)
             rb.reset(0, scene.start, _params(0), base_xy_yaw=base0)
             run = run_leg_program(rb, cached, goal, scene, names)
             if run["success"]:
@@ -306,7 +372,7 @@ def solve_legged(pj, goal: GoalSpec, prof, llm, log=print, emit=lambda **e: None
                 break
             continue
         try:
-            steps = check_leg_program(prop.steps, set(names))
+            steps = check_leg_program(prop.steps, set(names), planner)
         except ProgramError as e:
             tries.append({"program": prop.steps, "problem": f"Morph couldn't run it: {e}"})
             log(f"  program {a + 1}: can't run it: {e}")

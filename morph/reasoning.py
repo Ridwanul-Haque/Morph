@@ -338,7 +338,8 @@ class ReasoningService:
         return self._chat("review_goal", system, user, GoalReview)
 
     def goal_from_request(self, description: str, scene: dict, demo: dict | None,
-                          feedback: dict | None = None) -> tuple[GoalProposal, InferenceRecord]:
+                          feedback: dict | None = None, robots: list[dict] | None = None
+                          ) -> tuple[GoalProposal, InferenceRecord]:
         system = (
             "You are the goal module of Morph. Turn the operator's request (and/or what a demonstration measurably did "
             "to the object) into checkable conditions on the object's final resting state. You get the scene's "
@@ -413,15 +414,33 @@ class ReasoningService:
             "rests use bottom. Write only what the request asks for. Reply with ONLY one "
             "JSON object with keys: conditions, rationale, ambiguities, feasible, refusal, why_not, suggestion, warnings."
         )
+        system += (
+            " GOALS ABOUT THE ROBOT'S OWN BODY: a request can be about the robot itself rather than the object (\"close "
+            "the hand into a fist\", \"open the hand\", \"raise the arm\", \"point the index finger\", \"lift the "
+            "front left foot\", \"stand up straight\"). Never refuse those for lack of an object: write them as "
+            "expression conditions with these functions of a name pattern (words matched against the robot's joint or "
+            "end-part names, | for alternatives, * as a wildcard, or a regular expression such as (index|middle)_(pip|dip)): joint_frac('pattern') = how far the matching joints are through their "
+            "range on average (0 at the lower limit, 1 at the upper), joint_frac_min / joint_frac_max = the least / most "
+            "of them, and part_x / part_y / part_z('pattern') = where the matching end parts are (metres). robots_selected "
+            "lists each selected robot's joints with their ranges (degrees) and its end parts: choose patterns that "
+            "exist on the robot(s) meant, and decide from the names and ranges which end of a range means what (for "
+            "finger flexion joints such as mcp/pip/dip/pitch/flex, bent = the end farther from 0, usually the upper "
+            "limit; a range like [0, 90] bends towards 90). E.g. a fist on a hand whose flexion joints run 0..90: "
+            "{\"kind\": \"expression\", \"expr\": \"joint_frac_min('pip|dip|mcp_pitch') > 0.8\", \"text\": \"every "
+            "finger bent at least 80% of the way closed\"}. The object can be left out entirely; add object conditions "
+            "only if the request mentions the object."
+        )
         payload = {"request": description or "(none: reproduce what the demonstration achieved)",
                    "scene": scene, "demonstration": demo}
+        if robots:
+            payload["robots_selected"] = robots
         if feedback:
             payload["fix_this"] = feedback  # your previous answer and what was wrong with it
         user = json.dumps(payload, indent=1, default=str)
         return self._chat("goal_from_request", system, user, GoalProposal)
 
     def skill_steps(self, robot: dict, goal: list[str], scene: dict, scales: dict,
-                    fix: dict | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
+                    fix: dict | None = None, body: dict | None = None) -> tuple[SkillStepsProposal, InferenceRecord]:
         system = (
             "You are the motor-planning module of Morph. A robot must learn, in simulation, to reach a goal from "
             "scratch. Write the steps a person would take without thinking about it, the way someone standing up "
@@ -454,6 +473,14 @@ class ReasoningService:
             "\"done_when\": formula, \"keep\": formula or \"\"}], \"rationale\": one or two sentences}."
         )
         payload = {"robot": robot, "goal_checklist": goal, "scene": scene, "realistic_scales": scales}
+        if body:  # the goal is only about the robot's own body: no object in the steps
+            payload["robot_body"] = body
+            system += (" THIS GOAL IS ONLY ABOUT THE ROBOT'S OWN BODY (its joints and parts), not the object: leave the "
+                       "object out of every step. Write the steps as joint_frac('pattern') / joint_frac_min / "
+                       "joint_frac_max (0 = a joint at its lower limit, 1 = upper) and part_x / part_y / part_z('pattern') "
+                       "over the names in robot_body, e.g. for a fist: first the knuckles bend part-way "
+                       "(joint_frac_min('mcp_pitch') > 0.4), then the middle joints follow, then all close fully. One or "
+                       "two steps are enough for a simple pose.")
         if fix:
             payload["fix_these"] = fix  # the previous answer and what Morph couldn't read in it
         user = json.dumps(payload, indent=1, default=str)

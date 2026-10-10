@@ -35,8 +35,38 @@ def _folder(src: Path) -> str:
     return f"{re.sub(r'[^A-Za-z0-9_-]+', '_', src.name)}_{hashlib.sha1(str(src).encode()).hexdigest()[:6]}"
 
 
+_INDEX: dict = {}  # folder -> its file index, for one conversion (cleared at the start of each)
+
+
+def _file_index(root: Path, depth: int = 4, limit: int = 20000) -> dict[str, Path]:
+    """File name -> path for the files under root (a few levels down, a bounded number): found once per folder, so
+    finding 44 meshes doesn't mean 44 searches (on WSL a search of the Windows drive takes minutes)."""
+    key = (str(root), depth)
+    if key in _INDEX:
+        return _INDEX[key]
+    out: dict[str, Path] = {}
+    n = 0
+    stack = [(root, 0)]
+    while stack and n < limit:
+        d, k = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            n += 1
+            if e.is_dir(follow_symlinks=False):
+                if k < depth and not e.name.startswith("."):
+                    stack.append((Path(e.path), k + 1))
+            else:
+                out.setdefault(e.name.lower(), Path(e.path))
+    _INDEX[key] = out
+    return out
+
+
 def _find_mesh(ref: str, urdf: Path, pkgs: dict | None = None) -> Path | None:
-    """package://pkg/meshes/x.stl or meshes/x.stl -> a file on disk."""
+    """package://pkg/meshes/x.stl or meshes/x.stl -> a file on disk: the package's folder, the path as written
+    next to the robot file or a few folders up, else the same file name anywhere under the robot file's folder."""
     m = re.match(r"^package://([^/]+)/(.*)$", ref)
     if m and pkgs and m.group(1) in pkgs and (pkgs[m.group(1)] / m.group(2)).exists():
         return pkgs[m.group(1)] / m.group(2)
@@ -44,13 +74,14 @@ def _find_mesh(ref: str, urdf: Path, pkgs: dict | None = None) -> Path | None:
     rel = re.sub(r"^file://", "", rel)
     if Path(rel).is_absolute() and Path(rel).exists():
         return Path(rel)
-    for base in [urdf.parent, *urdf.parents][:5]:
+    for base in [urdf.parent, *urdf.parents][:4]:  # exact paths only above the robot's own folder
         for cand in (base / rel, base / Path(rel).name):
             if cand.exists():
                 return cand
-        hits = list(base.rglob(Path(rel).name))
-        if hits:
-            return hits[0]
+    for root in [urdf.parent, *(pkgs or {}).values()]:
+        hit = _file_index(Path(root)).get(Path(rel).name.lower())
+        if hit is not None:
+            return hit
     return None
 
 
@@ -59,6 +90,7 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
     """origin: where the robot really came from (the .xacro), for finding its meshes and packages."""
     urdf = Path(urdf_path).resolve()
     home = Path(origin).resolve() if origin else urdf
+    _INDEX.clear()  # look at the folders afresh (meshes may have been added since the last import)
     pkgs = _packages_near(home)
     name = urdf.stem
     out = CONVERTED / _folder(home)
@@ -87,7 +119,12 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
         notes.append(f"{len(unsupported)} visual mesh(es) in a format MuJoCo can't read (e.g. {unsupported[0]}): "
                      "those are left out; collision shapes are kept")
     if missing:
-        notes.append(f"{len(missing)} mesh file(s) not found, those parts are left out: {', '.join(missing[:3])}")
+        total = sum(1 for _ in robot.iter("mesh"))
+        notes.append((f"none of its {total} mesh files were found, so it has no shapes: nothing to see or touch. "
+                      if len(missing) == total else f"{len(missing)} of its {total} mesh files weren't found; those parts "
+                      "are left out. ")
+                     + f"It looks for e.g. {missing[0]} next to the robot file: put that folder there (or upload a .zip of "
+                       "the whole description folder)")
     if missing or unsupported:
         for link in robot.iter("link"):  # drop visuals/collisions whose mesh is missing
             for tag in ("visual", "collision"):
@@ -104,6 +141,9 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
     comp.set("meshdir", str(meshes))
     comp.set("balanceinertia", "true")
     comp.set("discardvisual", "false")
+    # keep the root link (and links on fixed joints) as bodies: MuJoCo otherwise folds the root into the world, and a
+    # root with several things on it (a hand's five fingers, an arm and a camera mount) fell apart into separate pieces
+    comp.set("fusestatic", "false")
     fixed = out / f"{name}_fixed.urdf"
     tree.write(fixed)
     m0 = mujoco.MjSpec.from_file(str(fixed)).compile()
@@ -122,6 +162,7 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
         ET.SubElement(j, "parent", link="morph_world")
         ET.SubElement(j, "child", link=root)
         ET.SubElement(j, "origin", xyz=f"0 0 {max(0.0, -lowest) + 0.005:.4f}", rpy="0 0 0")
+        comp.set("fusestatic", "true")  # morph_world must fold into the world (the root then moves freely)
         tree.write(fixed)
         notes.append("stands on several feet: given a floating base")
     spec = mujoco.MjSpec.from_file(str(fixed))
@@ -132,26 +173,51 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
         if j.get("type") in ("revolute", "prismatic", "continuous") and lim is not None and lim.get("effort"):
             effort[j.get("name")] = float(lim.get("effort"))
 
+    # a joint that follows another (<mimic>: a finger's tip bending with its middle joint, a gripper's second finger)
+    # moves through the coupling MuJoCo makes from it, not a motor of its own (two would fight each other)
+    follows = {j.get("name") for j in robot.iter("joint") if j.find("mimic") is not None}
+    capped: list[str] = []
     for jn in [m0.joint(i).name for i in range(m0.njnt)]:
         j = spec.joint(jn)
-        if j.type not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
+        if j.type not in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE) or jn in follows:
             continue
         tau = effort.get(jn, 30.0)
         kp = max(5.0, 4.0 * tau) if j.type == mujoco.mjtJoint.mjJNT_HINGE else max(50.0, 40.0 * tau)
+        kv = 0.1 * kp ** 0.5
+        # a light part (a finger link) can't take an arm-sized servo: the simulation blows up within a step. Real
+        # servos have rotor inertia (armature); give very light joints some, and keep each servo's stiffness below
+        # what the part it moves can follow at 20 Hz, critically damped
+        dof = m0.jnt_dofadr[m0.joint(jn).id]
+        inertia = 1.0 / max(float(m0.dof_invweight0[dof]), 1e-12)
+        if j.armature < 2e-4 and inertia < 0.01:
+            j.armature = 2e-4
+        eff = inertia + j.armature
+        cap = eff * (2 * np.pi * 20.0) ** 2
+        if kp > cap:
+            kp, kv = cap, 2.0 * (cap * eff) ** 0.5
+            capped.append(jn)
         act = spec.add_actuator(name=jn, target=jn, trntype=mujoco.mjtTrn.mjTRN_JOINT)
         act.gaintype, act.biastype = mujoco.mjtGain.mjGAIN_FIXED, mujoco.mjtBias.mjBIAS_AFFINE
         act.gainprm[0] = kp
-        act.biasprm[0], act.biasprm[1], act.biasprm[2] = 0.0, -kp, -0.1 * kp ** 0.5
+        act.biasprm[0], act.biasprm[1], act.biasprm[2] = 0.0, -kp, -kv
         if j.range[1] > j.range[0]:
             act.ctrllimited, act.ctrlrange = True, list(j.range)
         act.forcelimited, act.forcerange = True, [-tau, tau]
     if not effort:
         notes.append("the URDF gives no joint effort limits: motors assume 30 Nm")
+    if capped:
+        notes.append(f"{len(capped)} joint(s) move very light parts (e.g. {capped[0]}): their motors were softened to what "
+                     "those parts can follow, so the simulation stays stable")
+    big = [n for n, t in effort.items() if t >= 50 and n in capped]
+    if big:
+        notes.append(f"the URDF says {big[0]} can push with {effort[big[0]]:g} Nm, far more than a part that light needs "
+                     "(often a placeholder value in the file)")
     spec.meshdir = str(meshes)
     xml_path = out / f"{name}.xml"
     xml_path.write_text(spec.to_xml())
     mujoco.MjModel.from_xml_path(str(xml_path))  # it must load on its own
-    notes.append(f"converted from URDF: {sum(1 for _ in spec.actuators)} position motors added")
+    notes.append(f"converted from URDF: {sum(1 for _ in spec.actuators)} position motors added"
+                 + (f"; {len(follows)} joint(s) follow another one (mimic) and move with it" if follows else ""))
     return xml_path, notes
 
 

@@ -37,8 +37,8 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.goal_terms import (HOLD_TICKS, condition_violation, is_generic, is_temporal, parse, term_value,  # noqa: E402
-                              violation)
+from morph.goal_terms import (BODY_FUNCS, HOLD_TICKS, condition_violation, is_generic, is_temporal, normalize,  # noqa: E402
+                              parse, term_value, uses, violation)
 from morph.task_model import (CTRL_DT, SIM_DT, Residual, build_task_model, indices, load_task, measure, next_ctrl,  # noqa: E402
                               obs_size, observe, soft)  # noqa: E402
 
@@ -111,7 +111,27 @@ class TaskLearn(mjx_env.MjxEnv):
         self.generic = [c for c in task["conditions"] if is_generic(c) and not is_temporal(c)]
         # conditions about a moment during the task: when it lets go (throwing), the whole time, at some point
         self.temporal = [c for c in task["conditions"] if is_temporal(c)]
+        # every condition about the robot's own body (joint_frac, part_z: a fist, a raised arm), none about the object
+        self.body_goal = bool(task["conditions"]) and all(
+            c.get("kind") == "expression" and c.get("expr") and uses(normalize(c["expr"])) & BODY_FUNCS
+            for c in task["conditions"])
         self.fx = task.get("fixtures", {})
+        # the grip Morph's grasp planning found holds best (contact_plan.plan_grasp), measured on the robot: reaching
+        # means getting the point between the fingers there, fingers closing across the planned sides, hand coming in
+        # the planned way. Without it, the nearest fingertip is pulled to the object's centre, and on a flat object the
+        # learner pokes a fingertip down beside or under it instead of closing both fingers across it from above.
+        g = task.get("grasp") if not self.push and not self.body_goal else None
+        self.grasp = None
+        if g and g.get("fingers") and g.get("close") is not None:
+            try:
+                body = lambda n: self._mj_model.body(n).id  # noqa: E731
+                self.grasp = {"body": body(g["body"]), "offset": jp.array(g["offset"]), "axis": jp.array(g["axis"]),
+                              "fa": body(g["fingers"][0][0]), "oa": jp.array(g["fingers"][0][1]),
+                              "fb": body(g["fingers"][1][0]), "ob": jp.array(g["fingers"][1][1]),
+                              "point": jp.array(g["point"]), "close": jp.array(g["close"]),
+                              "approach": jp.array(g["approach"])}
+            except KeyError:  # a different robot model than the plan was made on
+                self.grasp = None
         # the steps to go about it (skill_steps): reward for reaching each in order
         self.steps = [(parse(st["done_when"], self.fx), parse(st["keep"], self.fx) if st.get("keep") else None)
                       for st in task.get("steps", [])]
@@ -175,7 +195,7 @@ class TaskLearn(mjx_env.MjxEnv):
         if not self.generic and not self.temporal:
             return d, {}
         # graded "held" (grip) here: this is the learner's sense of how far it is, not the judgement of success
-        v = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl))
+        v = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
         unmet = sum((condition_violation(jp, c, v, self.fx, self.half) for c in self.generic), jp.zeros(()))
         track = {}
         if self.temporal:
@@ -204,13 +224,31 @@ class TaskLearn(mjx_env.MjxEnv):
             track = {"tv": tv, "released": released, "was_held": held}
         return d + 0.3 * unmet, track
 
+    def _grasp_aim(self, data, bp, R):
+        """(distance from the planned grip point, 0..1 how well the hand matches the planned grip there). The fingers
+        must close along the planned axis (either way round) and the hand point the way it came in; a hand that has
+        gone past the grip point (under the object, for a grip from above) gets no credit for being close."""
+        g = self.grasp
+        Rw = data.xmat[g["body"]].reshape(3, 3)
+        hand = data.xpos[g["body"]] + Rw @ g["offset"]
+        pointing = Rw @ g["axis"]
+        fa = data.xpos[g["fa"]] + data.xmat[g["fa"]].reshape(3, 3) @ g["oa"]
+        fb = data.xpos[g["fb"]] + data.xmat[g["fb"]].reshape(3, 3) @ g["ob"]
+        fingers = (fb - fa) / (jp.linalg.norm(fb - fa) + 1e-6)
+        target, close_w, come_in = bp + R @ g["point"], R @ g["close"], R @ g["approach"]
+        e = hand - target
+        dist = jp.linalg.norm(e)
+        past = jp.maximum(e @ come_in, 0.0)  # how far beyond the grip point, along the way the hand comes in
+        orient = 0.5 * jp.abs(fingers @ close_w) + 0.5 * jp.maximum(pointing @ come_in, 0.0)
+        return dist, (0.3 + 0.7 * orient) * jp.exp(-past / 0.01)
+
     def _steps(self, data, step, streak):
         """(next step index, potential, keep-rule violation, streaks). The potential grows by 1 per step reached
         and by up to 1 as the current step gets closer to done, so the reward pulls towards the next step."""
         n = len(self.steps)
         if not n:
             return step, jp.zeros(()), jp.zeros(()), streak
-        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl)
+        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
         vs = soft(v)
         done = jp.stack([violation(jp, d, v) for d, _ in self.steps])  # strict: has it really happened
         near = jp.stack([violation(jp, d, vs) for d, _ in self.steps])  # graded: how close it is getting
@@ -264,7 +302,7 @@ class TaskLearn(mjx_env.MjxEnv):
         info = {"rng": rng, "last_act": jp.zeros(self.nu), "prev_d": d0, "ctrl": ctrl0, "delay": delay,
                 "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), **track}
         info["phi"] = self._steps(data, info["step"], info["streak"])[1]
-        metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "success", "dist", "steps_done")}
+        metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done")}
         metrics |= {f"term_{k}": jp.zeros(()) for k in range(len(self.terms))}
         obs = self._obs(data, info)
         return mjx_env.State(data, obs, jp.zeros(()), jp.zeros(()), metrics, info)
@@ -281,7 +319,7 @@ class TaskLearn(mjx_env.MjxEnv):
         return {"state": o + self.rand["obs_noise"] * jax.random.normal(k, o.shape), "privileged_state": priv}
 
     def _critic_extras(self, data, info):
-        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl)
+        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
         n = max(len(self.steps), 1)
         m = self._mjx_model  # this copy's own physics (domain randomisation swaps it in)
         return jp.stack([v["grip"], jp.minimum(v["touch_dist"], 0.5) * 4.0, jp.minimum(v["lifted"], 0.5) * 4.0,
@@ -320,7 +358,15 @@ class TaskLearn(mjx_env.MjxEnv):
             aim = jp.concatenate([bp[:2] - u * (self.r_obj + 0.03), bp[2:3]])
         else:
             aim = bp
-        reach = jp.min(jp.linalg.norm(data.xpos[ix.tips] - aim, axis=1))
+        reach = jp.min(jp.linalg.norm(data.xpos[ix.tips] - aim, axis=1)) if len(ix.tips) else jp.asarray(9.0)
+        aim_ok = jp.asarray(1.0)  # how well the hand matches the planned grip (1 without a plan)
+        if self.grasp is not None:
+            reach, aim_ok = self._grasp_aim(data, bp, R)
+            if "released" in info:  # thrown or let go on purpose: no pull back towards the object
+                reach = jp.where(info["released"] > 0.5, 0.0, reach)
+                aim_ok = jp.where(info["released"] > 0.5, 1.0, aim_ok)
+        if self.body_goal:  # a goal about the robot's own body: reaching for the object is beside the point
+            reach = jp.asarray(9.0)
         progress = (info["prev_d"] - d) / self.dt
         close = jp.exp(-d / 0.03)
         place_ok = d < (self.tol if self.has_place else 1e-3)  # d already includes the unmet conditions
@@ -329,7 +375,7 @@ class TaskLearn(mjx_env.MjxEnv):
         ok = place_ok & ((yaw_err < self.yaw_tol) | (not self.heading)) & ((tilt < 0.17) | (not self.upright))
         # smooth pulls that work from far away (the tool starts ~0.5 m from the object), sharper ones up close
         r = (2.0 * jp.clip(progress, -1.0, 1.0) + 1.0 * (1 - jp.tanh(d / 0.2)) + 2.0 * close
-             + 0.5 * (1 - jp.tanh(reach / 0.25)) * (1 - close) + 0.5 * jp.exp(-reach / 0.05) * (1 - close)
+             + 0.5 * (1 - jp.tanh(reach / 0.25)) * (1 - close) + 0.5 * jp.exp(-reach / 0.05) * aim_ok * (1 - close)
              + (0.5 * jp.exp(-yaw_err ** 2 / 0.3) * close if self.heading else 0.0)
              - (1.0 * tilt ** 2 if self.upright else 0.0) + 3.0 * ok
              - 0.02 * jp.sum(jp.square(action - info["last_act"]))
@@ -350,13 +396,14 @@ class TaskLearn(mjx_env.MjxEnv):
             info["step"], info["phi"] = step, phi
         tvals = []
         if self.terms:  # Nemotron's terms, on the graded quantities (each clipped: one term can't swamp the rest)
-            vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl))
+            vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
             tvals = [jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms]
             r = r + sum(w * tv for (_, w), tv in zip(self.terms, tvals))
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
-        state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), success=ok.astype(jp.float32), dist=z(d),
+        state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), grasp_aim=z(aim_ok),
+                             success=ok.astype(jp.float32), dist=z(d),
                              steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)})
         obs = self._obs(data, info)
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own

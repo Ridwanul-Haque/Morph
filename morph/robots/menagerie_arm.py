@@ -95,7 +95,7 @@ def build_menagerie_arm_model(cfg: MenagerieArmConfig, block: BlockSpec) -> mujo
     scene = mujoco.MjSpec.from_string(f"""<mujoco model="morph_{cfg.name}">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{TIMESTEP}" integrator="implicit" cone="elliptic" impratio="10" noslip_iterations="{NOSLIP}"/>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>

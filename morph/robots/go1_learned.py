@@ -65,7 +65,7 @@ def build_learned_go1_model(block: BlockSpec) -> mujoco.MjModel:
     scene = mujoco.MjSpec.from_string(f"""<mujoco model="morph_go1_learned">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{SIM_DT}" integrator="implicit" cone="elliptic" impratio="10"/>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>

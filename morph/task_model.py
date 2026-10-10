@@ -60,7 +60,7 @@ def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
     scene = mujoco.MjSpec.from_string(f"""<mujoco model="morph_task">
   <compiler angle="radian" autolimits="true"/>
   <option timestep="{SIM_DT}" integrator="implicitfast" cone="elliptic" impratio="10"/>
-  {_common_assets()}
+  {_common_assets(blk)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>
@@ -143,6 +143,9 @@ class Indices:
     grip_close: float = 1.0
     act_scale: np.ndarray | None = None  # per actuator: how far one unit of action moves its command
     act_step: np.ndarray | None = None  # and how far the command may move per control step
+    jnt_lo: np.ndarray | None = None  # the robot's joints' ranges (home_adr order), for goals about its own body
+    jnt_hi: np.ndarray | None = None
+    tip_names: list | None = None  # the end parts' names (tips order, without robot_)
 
 
 def is_position(m: mujoco.MjModel, a: int) -> bool:
@@ -183,6 +186,8 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
         base, base_q, base_v = int(m.jnt_bodyid[fj]), int(m.jnt_qposadr[fj]), int(m.jnt_dofadr[fj])
     tip_off = _tip_points(m, task, np.array(tips), home_adr, np.array(vals, dtype=float))
     act_scale, act_step = action_units(m, task.get("action_scale", 0.8))
+    for a, (sc, st) in (task.get("action_units") or {}).items():  # widened to cover what the recipe does (demo_to_task)
+        act_scale[int(a)], act_step[int(a)] = max(act_scale[int(a)], sc), max(act_step[int(a)], st)
     g_ticks = task.get("gripper_ticks")  # how many control ticks the gripper takes to cross its range
     if g_ticks and task.get("gripper"):
         try:
@@ -196,12 +201,16 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
     except KeyError:
         grip = (-1, 0.0, 1.0)
     bj = m.joint("block_free")
+    rng = [(m.jnt_range[j][0], m.jnt_range[j][1]) if m.jnt_limited[j] and m.jnt_range[j][1] > m.jnt_range[j][0]
+           else (-math.pi, math.pi) for j in js]
+    ix_extra = dict(jnt_lo=np.array([r[0] for r in rng]), jnt_hi=np.array([r[1] for r in rng]),
+                    tip_names=[m.body(int(b)).name.removeprefix("robot_") for b in tips])
     return Indices(home_adr, np.array(vals, dtype=float), joint_vadr, names, np.array(task["q0"]), pos_mask,
-                   np.array(tips), base, base_q, base_v,
+                   np.array(tips, dtype=int), base, base_q, base_v,
                    int(m.body("block").id), int(bj.qposadr[0]), int(bj.dofadr[0]), np.array(lo), np.array(hi), tip_off,
-                   np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] in set(robot_bodies)]),
-                   np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] == m.body("block").id]), *grip,
-                   act_scale, act_step)
+                   np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] in set(robot_bodies)], dtype=int),
+                   np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] == m.body("block").id], dtype=int), *grip,
+                   act_scale, act_step, **ix_extra)
 
 
 def action_units(m: mujoco.MjModel, scale: float) -> tuple[np.ndarray, np.ndarray]:
@@ -300,7 +309,9 @@ def write_task(path: Path, *, robot_xml: str, block: BlockSpec, start, target: d
                q0, conditions: list[dict], scene_path: str, robot_name: str, home: dict | None = None,
                fixtures: dict | None = None) -> dict:
     task = {"robot_xml": robot_xml, "robot": robot_name, "scene": scene_path,
-            "block": {k: getattr(block, k) for k in ("half_x", "half_y", "half_z", "mass", "friction", "fixtures_xml", "shape")},
+            "block": {k: (list(v) if isinstance(v, tuple) else v) for k, v in
+                      ((k, getattr(block, k)) for k in ("half_x", "half_y", "half_z", "mass", "friction", "fixtures_xml",
+                                                        "shape", "mesh_file", "mesh_scale", "mesh_pos", "mesh_quat"))},
             "start": list(start), "target": target, "mount": list(mount), "floating": floating, "q0": list(map(float, q0)),
             "home": home or {}, "fixtures": fixtures or {}, "conditions": conditions, "action_scale": 0.5 if floating else 0.8, "episode_s": 8.0,
             "ctrl_dt": CTRL_DT, "sim_dt": SIM_DT}
@@ -319,6 +330,23 @@ def write_task(path: Path, *, robot_xml: str, block: BlockSpec, start, target: d
 def set_home(m: mujoco.MjModel, qpos, ix: Indices):
     qpos[ix.home_adr] = ix.home_val
     return qpos
+
+
+def opposite_sides(d: mujoco.MjData, block_geoms, robot_geoms, centre) -> bool:
+    """Do the robot's geoms touch the object from two opposite sides (a pinch), whatever else touches it? Two fingers
+    resting on its top, or one pressing on one side, is not."""
+    pts = []
+    for i in range(d.ncon):
+        con = d.contact[i]
+        g1, g2 = int(con.geom1), int(con.geom2)
+        if con.dist <= 0.002 and ((g1 in block_geoms and g2 in robot_geoms) or (g2 in block_geoms and g1 in robot_geoms)):
+            pts.append(con.pos - centre)
+    for a in range(len(pts)):
+        for b in range(a + 1, len(pts)):
+            na, nb = np.linalg.norm(pts[a]), np.linalg.norm(pts[b])
+            if na > 1e-6 and nb > 1e-6 and float(pts[a] @ pts[b]) / (na * nb) < -0.3:
+                return True
+    return False
 
 
 def contact_held(m: mujoco.MjModel, d: mujoco.MjData, ix: Indices) -> float:
@@ -396,7 +424,7 @@ def grip_terms(xp, pts, bp, R, half, task: dict, closure=None):
     return grip, touch, lifted
 
 
-def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None) -> dict:
+def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None, qpos=None) -> dict:
     """Every quantity a goal condition or a skill step can read (goal_terms), from the simulation state.
     Same code for training (JAX) and trying / practice runs (NumPy). held: from contact_held when the
     contacts are at hand (NumPy); otherwise the learner's geometric stand-in. ctrl: the commands (for how far the
@@ -408,8 +436,10 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None)
     bp = xpos[ix.block]
     R = xmat[ix.block].reshape(3, 3)
     pts = xpos[ix.tips]
-    if ix.tip_off is not None:  # the actual fingertips / toes, not the parts' origins
+    if ix.tip_off is not None and len(ix.tips):  # the actual fingertips / toes, not the parts' origins
         pts = pts + xp.einsum("kij,kj->ki", xmat[ix.tips].reshape(-1, 3, 3), xp.asarray(ix.tip_off))
+    if not len(ix.tips):  # a robot with no shapes at all (meshes missing): a stand-in part, nowhere near the object
+        pts = xp.reshape(bp + 9.0, (1, 3))
     d_tips = xp.linalg.norm(pts - bp, axis=1)
     hand = xp.min(d_tips)
     hand_pos = pts[xp.argmin(d_tips)]
@@ -429,6 +459,10 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None)
     v["grip"], v["touch_dist"], v["lifted"] = grip_terms(xp, pts, bp, R, half, task, closure)
     v["closure"] = closure if closure is not None else xp.asarray(0.0)
     v["grip"] = xp.maximum(v["grip"], xp.asarray(held, dtype=float) if xp is np else held)  # a real hold is a full grip
+    v["parts"] = {n: pts[k] for k, n in enumerate(ix.tip_names or [])}  # the robot's own body (goal_terms BODY_FUNCS)
+    if qpos is not None and ix.jnt_lo is not None:
+        frac = (qpos[ix.home_adr] - ix.jnt_lo) / (ix.jnt_hi - ix.jnt_lo)
+        v["joints"] = {n: frac[k] for k, n in enumerate(ix.joints)}
     return v
 
 

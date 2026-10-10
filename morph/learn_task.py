@@ -158,11 +158,20 @@ def learning_status(folder: Path) -> dict:
     return {"state": "done" if finished else "learning", "good": finished and reached}
 
 
-def learned_for(robot_name: str, goal: GoalSpec) -> Path | None:
+def learned_for(robot_name: str, goal: GoalSpec, robot_xml: str | Path | None = None) -> Path | None:
     """task.json of a learned skill for this robot and goal that runs should use: learning finished and it worked
-    (learning_status good), else None."""
+    (learning_status good), and (given robot_xml) it was learned on this very robot file, not another one with the same
+    name (a hand re-imported with its meshes is a different body from the one without). Else None."""
     d = task_dir(robot_name, goal)
-    return d / "task.json" if learning_status(d)["good"] else None
+    if not learning_status(d)["good"]:
+        return None
+    if robot_xml is not None:
+        try:
+            if Path(json.loads((d / "task.json").read_text())["robot_xml"]).resolve() != Path(robot_xml).resolve():
+                return None
+        except (OSError, KeyError, ValueError):
+            return None
+    return d / "task.json"
 
 
 class NumpyPolicy:
@@ -222,7 +231,7 @@ def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), set
             for w in watch:
                 w.t = t
             if watch:
-                v = measure(np, d.xpos, d.xmat, d.qvel, ix, task, held=contact_held(m, d, ix), ctrl=d.ctrl)
+                v = measure(np, d.xpos, d.xmat, d.qvel, ix, task, held=contact_held(m, d, ix), ctrl=d.ctrl, qpos=d.qpos)
                 for w in watch:
                     w.update(v)
                     if hasattr(w, "see"):
@@ -624,7 +633,7 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
     """Nemotron reads what the learner actually did and rewrites the steps (smaller first steps, reachable
     thresholds, graded quantities); Morph checks the new steps and writes them into the task."""
     from .introspect import profile_robot
-    from .skill_steps import Step, check_steps, check_terms, robot_brief, scales
+    from .skill_steps import Step, body_only, check_steps, check_terms, object_steps, robot_brief, scales
     task = load_task(task_path)
     prof = profile_robot(task["robot_xml"])
     p = placement(goal, scene)
@@ -636,6 +645,8 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
         new, errors = check_steps(raw, list(scene.fixtures), scene.object_name)
         terms, t_err = check_terms(prop.reward_terms, list(scene.fixtures), scene.object_name)
         errors += t_err
+        if body_only(goal):
+            errors += object_steps(new)
         if new and not errors:
             task["steps"] = [s.model_dump() for s in new]
             task["reward_terms"] = terms
@@ -917,6 +928,26 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
     task["residual"] = {"scale": residual} if residual else None
     task_path.write_text(json.dumps(task, indent=1))
     ix = indices(m, task)
+    # a joint's command can only go so far from its start (0.8 rad by default) and so fast (2.5 rad/s): if the recipe
+    # goes further or faster (a fist bends fingers 90°, a throw swings hard), widen that joint's range so the learner
+    # can do what the recipe did (else even a perfect copy stops half-way)
+    need_far, need_fast = np.zeros(m.nu), np.zeros(m.nu)
+    for demo in demos:
+        prev = None
+        for _, _, ctrl in demo:
+            c = np.clip(ix.q0, ix.act_lo, ix.act_hi).copy()
+            for sa, ta in amap:
+                c[ta] = ctrl[sa]
+            need_far = np.maximum(need_far, np.abs(c - ix.q0))
+            if prev is not None:
+                need_fast = np.maximum(need_fast, np.abs(c - prev))
+            prev = c
+    wide = {str(a): [round(float(need_far[a] * 1.15), 4), round(float(need_fast[a] * 1.2), 4)] for a in range(m.nu)
+            if need_far[a] > 0.95 * ix.act_scale[a] or need_fast[a] > ix.act_step[a]}
+    if wide:
+        task["action_units"] = wide
+        task_path.write_text(json.dumps(task, indent=1))
+        ix = indices(m, task)
     t = task["target"]
     tgt = (t["x"], t["y"], t["z"], t["yaw"])
 
@@ -964,6 +995,33 @@ def demo_to_task(task_path: Path, ad, demos: list, start_every: int = 4, share: 
     return {"samples": len(obs), "starts": len(sq), "residual": bool(residual)}
 
 
+def attach_grasp(task_path: Path, pj: Project, goal: GoalSpec, log=print, program=None) -> dict | None:
+    """Morph's planned grip (contact_plan.plan_grasp: the one that held best when tried) on the task, for the learner
+    to aim at: where the fingers go, which sides they close on, which way the hand comes in. Only when the goal needs
+    the object held and the robot has a gripper, and only when it agrees with the program it copies (a program that
+    gripped its own way is copied as it is)."""
+    from .body_programs import BodyRunner, needs_hold
+    if not needs_hold(goal, pj.scene) or (program is not None and not any(s.get("pick") for s in program)):
+        return None
+    task = load_task(task_path)
+    try:
+        rn = BodyRunner(task)
+    except Exception:  # noqa: BLE001
+        return None
+    hand = next((n for n, p_ in rn.parts.items() if p_.can_grip), None)
+    if hand is None:
+        return None
+    from .contact_plan import plan_grasp
+    g = plan_grasp(rn, pj.scene, hand, log=log)
+    if not g or not g.get("geom"):
+        return g
+    task["grasp"] = dict(g["geom"], desc=g["desc"])
+    task.pop("_dir", None)
+    task_path.write_text(json.dumps(task, indent=1))
+    log(f"  the learner aims for Morph's planned grip: {g['desc']}")
+    return g
+
+
 def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print, emit=None, stand_at=None,
                      steps_from: Path | None = None) -> tuple[Path, dict]:
     """The task to learn, from a working program when there can be one. For an arm with a gripper, Nemotron writes a
@@ -978,7 +1036,9 @@ def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log
     prof = profile_robot(xml)
     info: dict = {"demo": False}
     planned = load_task(steps_from) if steps_from and Path(steps_from).exists() else None
-    if llm is not None and getattr(llm, "available", False) and prof.base == "fixed" and prof.has_gripper:
+    from .programs import too_flat_for_hand_down
+    if llm is not None and getattr(llm, "available", False) and prof.base == "fixed" and prof.has_gripper \
+            and not too_flat_for_hand_down(pj.scene):  # a flat object: straight to the general blocks (below)
         emit(type="caption", text="Nemotron is writing a program to learn from")
         r = solve(pj, goal, robot_path, prof.name, llm, log=log, emit=emit, n=8, stand_at=stand_at)
         if r.get("demos"):
@@ -1016,7 +1076,20 @@ def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log
             d = demo_to_task(task, None, r["demos"])
             log(f"  learning from Nemotron's program: {len(r['demos'])} successful runs, {d['samples']} moments to copy, "
                 f"{d['starts']} to practise from")
+            attach_grasp(task, pj, goal, log=log, program=r.get("program"))
             return task, {"demo": True, "program": r["program"], "program_trials": f"{r['success']}/{r['n']}"}
+    if info.get("demo") is False and prof.base == "fixed" and prof.has_gripper:
+        # no program worked: before an hour of learning from scratch, can this gripper pick the object up at all?
+        from .body_programs import BodyRunner, needs_hold, pick_test
+        if needs_hold(goal, pj.scene):
+            rn = BodyRunner(load_task(task))
+            if rn.parts and any(p_.can_grip for p_ in rn.parts.values()):
+                ok_pick, said = pick_test(rn, pj.scene)
+                if not ok_pick:
+                    raise ValueError(f"{prof.name} can't learn this: {said}. Learning wouldn't change that (it would "
+                                     "practise for an hour and fail), so Morph stops here. Try a robot whose gripper fits "
+                                     "this object (the Franka Panda picks up a pen), or a goal that doesn't need lifting it.")
+                attach_grasp(task, pj, goal, log=log)  # learning from scratch: aim for the grip that held
     if info.get("demo") is False and prof.base == "fixed" and llm is not None and getattr(llm, "available", False):
         log("  (no working program to learn from: learning from scratch)")
     return task, info

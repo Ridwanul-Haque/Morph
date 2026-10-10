@@ -35,7 +35,12 @@ VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx
              "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps"}
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
                    "touch_dist"}
-FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"}
+# the robot's own body (goals about the robot, not the object: "make a fist", "raise the arm", "lift a foot"): each takes
+# a name pattern ("pip", "index|middle", "foot") matched against the robot's joint / end-part names. joint_frac: how far
+# the matching joints are through their range, 0 at the lower limit, 1 at the upper (mean; _min / _max: the least / most).
+# part_x / part_y / part_z: where the matching end parts (fingertips, hand, feet) are (their mean), in metres.
+BODY_FUNCS = {"joint_frac", "joint_frac_min", "joint_frac_max", "part_x", "part_y", "part_z"}
+FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | BODY_FUNCS
 GENERIC = ("orientation", "height", "away_from", "moved", "expression")
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce
 ANGLE_UNIT, LENGTH_UNIT = 90.0, 0.3  # a violation of 90 degrees or 30 cm counts as "1" in the reward
@@ -90,6 +95,10 @@ def _parse(expr: str, fixtures, object_name: str = "") -> ast.Expression:
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name) or n.func.id not in FUNCS:
                 raise ExprError("only abs, min, max, sqrt, hypot and dist_to can be called")
+            if n.func.id in BODY_FUNCS:
+                a = n.args[0] if len(n.args) == 1 else None
+                if not (isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.strip()):
+                    raise ExprError(f"{n.func.id} needs one name pattern in quotes, e.g. {n.func.id}('index')")
             if n.func.id == "dist_to":
                 a = n.args[0] if n.args else None
                 name = a.value if isinstance(a, ast.Constant) else a.id if isinstance(a, ast.Name) else None
@@ -125,6 +134,8 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
                     ast.Div: lambda: a / (b + 1e-9)}[type(n.op)]()
         if isinstance(n, ast.Call):
             f = n.func.id
+            if f in BODY_FUNCS:
+                return body_value(xp, f, n.args[0].value, v)
             if f == "dist_to":
                 a = n.args[0]
                 return v["dist"][a.value if isinstance(a, ast.Constant) else a.id]
@@ -180,6 +191,44 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
             return -viol(tree, False)  # a condition: its graded distance from true, as a penalty (0 when it holds)
         return val(body)
     return viol(tree, False)
+
+
+def body_names(pattern: str, names) -> list[str]:
+    """The names a pattern picks out: any of its |-separated words appearing in the name (case-insensitive)."""
+    import fnmatch
+    import re
+    pat = pattern.strip().lower()
+    if any(ch in pat for ch in "()[]^$+"):  # written as a regular expression: "(index|middle)_(pip|dip)|thumb_ip"
+        try:
+            rx = re.compile(pat)
+        except re.error:
+            rx = None
+        if rx is not None:
+            full = [n for n in names if rx.fullmatch(n.lower())]
+            return full or [n for n in names if rx.search(n.lower())]
+    alts = [a.strip() for a in pat.split("|") if a.strip()]
+
+    def hit(name: str, a: str) -> bool:  # "pip" anywhere in the name, or a wildcard pattern ("*_pip", "index_*")
+        return fnmatch.fnmatch(name, a if a.startswith("*") or a.endswith("*") else f"*{a}*") if "*" in a or "?" in a \
+            else a in name
+    return [n for n in names if any(hit(n.lower(), a) for a in alts)]
+
+
+def body_value(xp, f: str, pattern: str, v: dict):
+    """joint_frac / part_x ... for this robot (see BODY_FUNCS). NaN if it has no joint or part of that name (NumPy;
+    the checklist then says so), 0 under JAX (Morph doesn't train for a body that can't be measured)."""
+    if f.startswith("joint_frac"):
+        src = v.get("joints") or {}
+        vals = [src[k] for k in body_names(pattern, src)]
+        if not vals:
+            return xp.asarray(float("nan") if xp is not None and xp.__name__ == "numpy" else 0.0)
+        arr = xp.stack([xp.asarray(x) for x in vals])
+        return {"joint_frac": xp.mean, "joint_frac_min": xp.min, "joint_frac_max": xp.max}[f](arr)
+    src = v.get("parts") or {}
+    vals = [src[k] for k in body_names(pattern, src)]
+    if not vals:
+        return xp.asarray(float("nan") if xp.__name__ == "numpy" else 0.0)
+    return xp.mean(xp.stack([xp.asarray(x) for x in vals]), axis=0)["xyz".index(f[-1])]
 
 
 def term_value(xp, tree: ast.Expression, v: dict):
@@ -279,7 +328,17 @@ def is_temporal(c: dict) -> bool:
 
 
 def snapshot(v: dict) -> dict:
-    out = {k: float(x) for k, x in v.items() if k not in ("dist", "R")}
+    """The measurements at one moment, as plain numbers (for the checklist's "at that moment: ...")."""
+    out = {}
+    for k, x in v.items():
+        if k in ("dist", "R", "parts"):
+            continue
+        if k == "joints":
+            out[k] = {n: float(j) for n, j in x.items()}
+        elif isinstance(x, dict) or getattr(x, "ndim", 0):
+            continue  # not a single number
+        else:
+            out[k] = float(x)
     out["dist"] = {n: float(x) for n, x in v["dist"].items()}
     return out
 

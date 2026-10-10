@@ -134,6 +134,13 @@ def scales(scene, p: dict) -> dict:
             "note": "thresholds must be reachable: allow a few cm of slack; 'held' needs the object off the ground"}
 
 
+def _body_facts(prof) -> dict:
+    """The robot's joints (with ranges) and end parts, for planning steps of a goal about its own body."""
+    from .project import robot_bodies
+    b = robot_bodies([prof.source])
+    return b[0] if b else {}
+
+
 def final_step(goal, robot_name: str) -> Step:
     items = "; ".join(c.text or c.describe() if c.kind == "expression" else c.describe() for c in goal.conditions)
     return Step(name="Finish: everything on the goal checklist",
@@ -230,20 +237,45 @@ def rule_steps(prof, goal, scene, p: dict) -> list[Step]:
     return out
 
 
+OBJECT_VARS = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "held", "grip",
+               "touch_dist", "lifted", "hand_dist", "spin_dps", "spin_z_dps", "dist_to"}
+
+
+def body_only(goal) -> bool:
+    """Is the whole goal about the robot's own body (a fist, a raised arm), with nothing to do with the object?"""
+    from .goals import about_body
+    return bool(goal.conditions) and all(about_body(c) for c in goal.conditions)
+
+
+def object_steps(steps: list[Step]) -> list[str]:
+    """For a goal about the robot's own body: the steps that bring the object in anyway, in words."""
+    from .goal_terms import uses
+    out = []
+    for st in steps:
+        used = sorted((uses(st.done_when) | (uses(st.keep) if st.keep else set())) & OBJECT_VARS)
+        if used:
+            out.append(f"step '{st.name}' is about the object ({', '.join(used)}), but the goal is only about the "
+                       "robot's own body: steps must use joint_frac / part_x / part_y / part_z only")
+    return out
+
+
 def plan_steps(prof, goal, scene, p: dict, llm=None, log=print) -> tuple[list[Step], dict]:
     """Nemotron's steps if it's available and they check out, else Morph's own. The goal is always last."""
     fixtures = list(scene.fixtures)
     info = {"from": "rules", "notes": []}
     steps = None
     obj = scene.object_name
+    body = body_only(goal)
     if llm is not None and getattr(llm, "available", False):
         try:
             errors, fix = [], None
             for attempt in range(2):  # one chance to fix formulas Morph can't read
                 prop, rec = llm.skill_steps(robot_brief(prof), [c.describe() for c in goal.conditions], scene.geometry(),
-                                            scales(scene, p), fix)
+                                            scales(scene, p), fix, body=_body_facts(prof) if body else None)
                 raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
                 cand, errors = check_steps(raw, fixtures, obj)
+                if body:
+                    errors += object_steps(cand)
                 if cand and not errors:
                     steps, info["from"] = cand, f"nemotron ({rec.latency_s}s)"
                     info["rationale"] = prop.rationale
@@ -255,7 +287,8 @@ def plan_steps(prof, goal, scene, p: dict, llm=None, log=print) -> tuple[list[St
         except Exception as e:  # noqa: BLE001  (no key, network, bad reply: Morph's own steps)
             info["notes"].append(f"Nemotron couldn't plan the steps ({e}); using Morph's own")
     if steps is None:
-        steps, errors = check_steps(rule_steps(prof, goal, scene, p), fixtures, obj)
+        # Morph's own: for a goal about the robot's body, no object steps (the goal itself is the one step)
+        steps, errors = check_steps([] if body else rule_steps(prof, goal, scene, p), fixtures, obj)
         info["notes"] += errors
     for n in info["notes"]:
         log(f"  ({n})")

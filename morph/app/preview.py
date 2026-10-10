@@ -90,7 +90,7 @@ def jpeg(img: np.ndarray, draft: bool = False) -> bytes:
 def _scene_spec(block) -> mujoco.MjSpec:
     return mujoco.MjSpec.from_string(f"""<mujoco model="morph_preview">
   <compiler angle="radian" autolimits="true"/>
-  {_common_assets()}
+  {_common_assets(block)}
   <worldbody>
     <light pos="0.6 -0.5 2.6" dir="-0.15 0.2 -1" cutoff="45" exponent="2" castshadow="true" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="grid" friction="{FLOOR_FRICTION} 0.005 0.0001"/>

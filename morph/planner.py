@@ -72,6 +72,9 @@ def check_templates(p: RobotProfile, spec: TaskSpec, block: BlockSpec | None = N
         opening = p.gripper.get("max_opening_m", 0.0)
         (t.met if opening >= obj + 0.005 else t.missing).append(
             f"gripper opens {opening * 100:.1f} cm for a {obj * 100:.0f} cm object")
+        if size[2] < 0.03:  # programs.too_flat_for_hand_down: its fingers stop above a pen lying down (0/5 every time)
+            t.missing.append(f"the object is only {size[2] * 100:.1f} cm tall: this skill's fingers can't get down around "
+                             "it; a program with Morph's planned grip can")
     else:
         t.missing.append(f"end effector is {p.gripper.get('type', 'none')}; template needs a gripper with two sides (two fingers, or a jaw against a fixed jaw)")
     if arm:
@@ -130,6 +133,22 @@ def check_templates(p: RobotProfile, spec: TaskSpec, block: BlockSpec | None = N
 
 
 PRIORITY = ["grasp_place_topdown", "legged_foot_push", "mobile_push", "learn_policy"]
+
+
+def body_goal(checks: list[TemplateCheck], goal) -> list[TemplateCheck]:
+    """A goal only about the robot's own body (a fist, a raised arm): nothing has to touch the object, so a program
+    or learning can do it whatever the body; the object templates don't apply."""
+    from .goals import about_body
+    if not goal or not goal.conditions or not all(about_body(c) for c in goal.conditions):
+        return checks
+    for c in checks:
+        if c.id == "learn_policy":
+            c.applicable, c.missing = True, []
+            c.met.append("the goal is about the robot's own body: its joints and parts")
+        else:
+            c.applicable = False
+            c.missing = ["the goal is about the robot's own body, not the object"]
+    return checks
 
 
 def learning_only(checks: list[TemplateCheck], reason: str | None, impossible: str | None = None) -> list[TemplateCheck]:

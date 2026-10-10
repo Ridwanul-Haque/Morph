@@ -71,6 +71,7 @@ class Live:
         self.env = None
         self.anchor = None
         self.last_render = 0.0
+        self.env_seen = 0.0  # when the simulation on screen last stepped
         self.tick = 0
         self.recording: list | None = None
         self.view = (1280, 800)  # the page's viewer size in device pixels
@@ -100,19 +101,25 @@ class Live:
         if self.cancel:
             raise Cancelled()
         while self.paused and not self.cancel:
-            if self.dirty:
+            if self.dirty and env is self.env:
                 self.dirty = False
                 self.publish(self.render(env))
             time.sleep(0.05)
+        now = time.time()
         if env is not self.env:
-            if self.env is not None:
+            # Two simulations can run at once (a practice replay while the learner's tries run; quick setup experiments):
+            # stay on the one on screen while it's still going, and let the other run unseen and unslowed. Switching on
+            # every step showed bits and pieces of both, rebuilding the renderer each time.
+            if self.env is not None and now - self.env_seen < 0.6:
+                return
+            old, self.env, self.anchor = self.env, env, None
+            if old is not None and getattr(old, "_render_thread", None) == threading.get_ident():
                 try:
-                    self.env.close()  # free the previous scene's renderer
+                    old.close()  # free its renderer (only from the thread that made it: GL contexts are per thread)
                 except Exception:  # noqa: BLE001
                     pass
-            self.env, self.anchor = env, None
+        self.env_seen = now
         self.tick += 1
-        now = time.time()
         # ~12 frames per wall-clock second while trials play, ~8 during setup; rendering shares the job
         # thread with the physics, so a fixed wall-clock rate keeps fast-forward fast
         due = now - self.last_render > (1 / 12 if self.pace else 0.12)
@@ -142,6 +149,7 @@ class Live:
             g.offwidth, g.offheight = max(g.offwidth, w), max(g.offheight, h)
             env.close()
         img = env.render(cam, w, h, view=self.orbit)
+        env._render_thread = threading.get_ident()
         if self.renderer_name is None:
             try:
                 from OpenGL import GL
@@ -281,7 +289,8 @@ class App:
         while self.training_task is not None and not self.live.cancel:
             path, step = self.latest_ckpt
             robot = json.loads(self.training_task.read_text())["robot"]
-            self.send(type="caption", robot=robot, text=f"Practice run with what it knows after {step / 1e6:.0f}M steps")
+            self.send(type="caption", robot=robot, text=f"Practice try {k + 1}: " + (
+                f"what it knows after {step / 1e6:.1f}M practice steps this round" if step else "before this round's practice"))
             self.live.pace, self.live.anchor = True, None
             try:
                 r = practice_run(self.training_task, path, seed=k,
@@ -342,7 +351,7 @@ class App:
         from ..goals import needs_learning, placement, reach_problem, to_taskspec
         from ..introspect import capabilities_from_profile, profile_robot
         from ..learn_task import learned_for
-        from ..planner import check_templates, learning_only, rule_plan
+        from ..planner import body_goal, check_templates, learning_only, rule_plan
         from ..task import default_spec
         key = (path, id(self.goal))
         if key in self.profiles:
@@ -351,9 +360,10 @@ class App:
         caps = capabilities_from_profile(prof)
         if self.goal is not None and self.project is not None:
             p = placement(self.goal, self.project.scene)
-            checks = learning_only(check_templates(prof, to_taskspec(self.goal, self.project.scene), self.project.scene.block,
-                                                   lift_reason=p["lift_reason"]), needs_learning(self.goal),
-                                   reach_problem(prof, self.goal, self.project.scene))
+            checks = body_goal(learning_only(check_templates(prof, to_taskspec(self.goal, self.project.scene),
+                                                             self.project.scene.block, lift_reason=p["lift_reason"]),
+                                             needs_learning(self.goal), reach_problem(prof, self.goal, self.project.scene)),
+                               self.goal)
         else:
             checks = check_templates(prof, default_spec(0.4, 0.12, 0.0))
         plan = rule_plan(checks)
@@ -368,23 +378,26 @@ class App:
              "plan": plan["plan_id"], "why_not": why or ("" if plan["plan_id"] != "unsupported" else plan.get("rationale", "")),
              "templates": [{"id": c.id, "ok": c.applicable, "met": c.met, "missing": c.missing} for c in checks],
              "import_notes": self._imports.get(path, ("", []))[1] if hasattr(self, "_imports") else [],
-             "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal) if self.goal else None),
+             "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal, self.resolve(path))
+                                                                  if self.goal else None),
              "recipes": P.program_body(prof)}
         if self.goal is not None and not r["learned"]:  # an earlier attempt that didn't work (or didn't finish)
             from ..learn_task import learning_status, task_dir
             st = learning_status(task_dir(prof.name, self.goal))
             if st["state"] != "none":
-                r["attempt"] = {"state": st["state"], "success": st.get("success"), "n": st.get("n")}
+                r["attempt"] = {"state": "other_file" if st["good"] else st["state"], "success": st.get("success"),
+                                "n": st.get("n")}
         if r["learned"]:
             r["plan"], r["why_not"] = "learned_skill", ""
         self.profiles[key] = r
         return r
 
     # goals
-    def interpret(self, description: str, demo: str | None, use_llm: bool) -> dict:
+    def interpret(self, description: str, demo: str | None, use_llm: bool, robots: list[str] | None = None) -> dict:
         logs = []
         self.goal, self.goal_info = P.resolve_goal(self.project, description, demo,
-                                                   self.reasoning() if use_llm else None, log=logs.append)
+                                                   self.reasoning() if use_llm else None, log=logs.append,
+                                                   robots=[self.resolve(r) for r in (robots or [])][:6])
         self.profiles, self.planned = {}, {}
         return self.goal_view() | {"log": logs}
 
@@ -410,9 +423,13 @@ class App:
     def busy(self) -> bool:
         return self.job is not None and self.job.is_alive()
 
-    def start(self, target, *args):
+    def start(self, target, *args, kind: str = "run", robot: str = ""):
         if self.busy():
-            raise RuntimeError("a run is already going; stop it first")
+            j = getattr(self, "job_info", None) or {}
+            what = {"learn": "learning", "train": "learning to walk"}.get(j.get("kind"), "a run")
+            raise RuntimeError(f"{what}{' (' + j['robot'] + ')' if j.get('robot') else ''} is already going: wait for it "
+                               "to finish, or press Stop first")
+        self.job_info = {"kind": kind, "robot": robot, "since": time.time()}
         with self.lock:
             self.history = []
         self.live.cancel, self.live.paused = False, False
@@ -662,6 +679,11 @@ class Handler(BaseHTTPRequestHandler):
                             "renderer": APP.live.renderer_name, "compute": APP.compute, "estimates": estimates(),
                             "task_estimates": task_estimates(),
                             "llm_cost": nemotron_cost(APP.llm.records if APP.llm else [])})
+            elif u.path == "/api/job":  # what's running now (the page shows it, and keeps Run / Learn from starting another)
+                j = getattr(APP, "job_info", None) or {}
+                self._json({"busy": APP.busy(), "kind": j.get("kind"), "robot": j.get("robot", ""),
+                            "seconds": round(time.time() - j["since"]) if APP.busy() and j.get("since") else 0,
+                            "stopping": bool(APP.busy() and APP.live.cancel)})
             elif u.path == "/api/costs":
                 from .compute import nemotron_cost
                 self._json({"llm_cost": nemotron_cost(APP.llm.records if APP.llm else []), "renderer": APP.live.renderer_name})
@@ -754,20 +776,23 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/goal":
                 if APP.project is None:
                     raise ValueError("pick a scene first")
-                self._json(APP.interpret(b.get("description", ""), b.get("demo") or None, b.get("llm", True)))
+                self._json(APP.interpret(b.get("description", ""), b.get("demo") or None, b.get("llm", True),
+                                         b.get("robots") or []))
             elif u.path == "/api/conditions":
                 self._json(APP.set_conditions(b["conditions"]))
             elif u.path == "/api/run":
                 if APP.goal is None:
                     raise ValueError("interpret a goal first")
-                APP.start(APP.run, b["robots"], int(b.get("n", 5)), b.get("llm", True))
+                APP.start(APP.run, b["robots"], int(b.get("n", 5)), b.get("llm", True), kind="run",
+                          robot=", ".join(Path(r).stem for r in b["robots"]))
                 self._json({"ok": True})
             elif u.path == "/api/learn":
                 steps = int(min(max(int(b.get("steps", 60_000_000)), 1_000_000), 500_000_000))
                 rnd = b.get("randomize", "light")
                 if rnd not in ("off", "light", "full"):
                     raise ValueError("randomize must be off, light or full")
-                APP.start(_learn, APP, b["path"], steps, rnd, bool(b.get("llm", True)))
+                APP.start(_learn, APP, b["path"], steps, rnd, bool(b.get("llm", True)), kind="learn",
+                          robot=Path(b["path"]).stem)
                 self._json({"ok": True})
             elif u.path == "/api/placement":
                 self._json(APP.place(b))
@@ -806,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(robustness(APP.project, APP.goal, folder / "task.json", n=int(min(max(int(b.get("n", 10)), 2), 30)),
                                       log=lambda s: None))
             elif u.path == "/api/train":
-                APP.start(APP.train, b["path"])
+                APP.start(APP.train, b["path"], kind="train", robot=Path(b["path"]).stem)
                 self._json({"ok": True})
             elif u.path == "/api/control":
                 if "paused" in b:
@@ -851,6 +876,13 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, kind: str, name: str) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         data = self.rfile.read(n)
+        if kind == "scene" and Path(name).suffix.lower() in (".stl", ".obj"):  # an object's 3D model: a scene around it
+            from ..object_import import object_scene
+            src = UPLOADS / "objects" / Path(name).name
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_bytes(data)
+            info = object_scene(src)
+            return {"path": info["path"], "projects": APP.projects(), "note": info["note"]}
         if kind == "scene":
             d = UPLOADS / "scenes" / Path(name).stem
             d.mkdir(parents=True, exist_ok=True)

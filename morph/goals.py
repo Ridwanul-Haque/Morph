@@ -266,7 +266,8 @@ def needs_learning(goal: GoalSpec) -> str | None:
     if not odd:
         return None
     return ("the ready-made skills carry or push the object to a spot and let go; this goal asks for "
-            + "; ".join(c.describe() for c in odd) + ", so it has to be learned")
+            + "; ".join(c.describe() for c in odd) + ", so Nemotron writes a program for it instead (and if that "
+            "doesn't work out, it can be learned)")
 
 
 def lets_go(goal: GoalSpec) -> bool:
@@ -391,10 +392,37 @@ def _measure(goal, scene, model, data, pose, released) -> tuple[dict, dict]:
     if robot:
         kw = {"robot_xy": data.xpos[robot[0]][:2].copy(),
               "hand_dist": float(min(np.linalg.norm(data.xpos[i] - pos) for i in robot))}
+    body = robot_body(model, data)
     v = quantities(np, pos=pos, R=data.xmat[bid].reshape(3, 3).copy(), vel=data.qvel[j.dofadr[0]:j.dofadr[0] + 3].copy(),
                    ang=data.qvel[j.dofadr[0] + 3:j.dofadr[0] + 6].copy(), start=scene.start[:2], half=(b.half_x, b.half_y, b.half_z), fixtures=fx,
                    held=0.0 if released else 1.0, **kw)
+    v |= body
     return v, fx
+
+
+def robot_body(model: mujoco.MjModel, data: mujoco.MjData) -> dict:
+    """The robot's own body in any of Morph's models (with or without the robot_ prefix): how far each of its joints is
+    through its range (0..1) and where each of its end parts is, for goals about the robot itself."""
+    bid = model.body("block").id
+    joints, parts = {}, {}
+    for j in range(model.njnt):
+        if int(model.jnt_type[j]) not in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
+            continue
+        lo, hi = model.jnt_range[j] if model.jnt_limited[j] and model.jnt_range[j][1] > model.jnt_range[j][0] else (-np.pi, np.pi)
+        joints[model.joint(j).name.removeprefix("robot_")] = float((data.qpos[model.jnt_qposadr[j]] - lo) / (hi - lo))
+    has_child = {int(model.body_parentid[b]) for b in range(1, model.nbody)}
+    moving = set()  # bodies with a joint at or above them (the robot, not the fixtures)
+    for b in range(1, model.nbody):
+        a = b
+        while a > 0:
+            if model.body_jntnum[a] and a != bid:
+                moving.add(b)
+                break
+            a = int(model.body_parentid[a])
+    for b in moving - has_child - {bid}:
+        if any(model.geom_bodyid[g] == b for g in range(model.ngeom)) or model.body_jntnum[b]:
+            parts[model.body(b).name.removeprefix("robot_")] = data.xpos[b].copy()
+    return {"joints": joints, "parts": parts}
 
 
 def _measured_text(c: Condition, v: dict) -> str:
@@ -414,8 +442,28 @@ def _measured_text(c: Condition, v: dict) -> str:
         parts = [f"{n} = {float(v[n]):.3g}" for n in names]
         if dists:
             parts += [f"dist_to('{t}') = {float(d):.3g}" for t, d in v["dist"].items() if t in c.expr]
+        parts += _body_text(c.expr, v)
         return ", ".join(parts)
     return f"centre at ({float(v['x']):.2f}, {float(v['y']):.2f}), {float(v['dist'].get(c.target, 0)) * 100:.0f} cm from it"
+
+
+def _body_text(expr: str, v: dict) -> list[str]:
+    """What the robot-body functions in a formula measured, or that this robot has nothing of that name."""
+    import ast as _ast
+    from .goal_terms import BODY_FUNCS, body_names, body_value, normalize
+    out = []
+    for n in _ast.walk(_ast.parse(normalize(expr), mode="eval")):
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name) and n.func.id in BODY_FUNCS and n.args:
+            pat = getattr(n.args[0], "value", "")
+            kind = "joints" if n.func.id.startswith("joint") else "parts"
+            hits = body_names(str(pat), v.get(kind) or {})
+            if not hits:
+                have = ", ".join(sorted(v.get(kind) or {})[:12]) or "none"
+                out.append(f"this robot has no {kind[:-1]} matching '{pat}' (its {kind}: {have})")
+            else:
+                out.append(f"{n.func.id}('{pat}') = {float(body_value(np, n.func.id, str(pat), v)):.2f} "
+                           f"({', '.join(hits[:6])}{'…' if len(hits) > 6 else ''})")
+    return out
 
 
 def _distance_to_fixture(m: mujoco.MjModel, d: mujoco.MjData, fixture: str) -> float:
@@ -588,14 +636,20 @@ def reach_problem(prof, goal: GoalSpec, scene: UserScene) -> str | None:
             f"both pick it up and get there. A robot that can walk or drive (or a longer arm) could")
 
 
+def about_body(c: "Condition") -> bool:
+    """Is this condition about the robot's own body (joint_frac, part_z, ...) rather than the object?"""
+    from .goal_terms import BODY_FUNCS, uses
+    return c.kind == "expression" and bool(c.expr) and bool(uses(c.expr) & BODY_FUNCS)
+
+
 def unsatisfiable(goal: GoalSpec, scene: UserScene) -> list[str]:
     """Can the end of this checklist ever be met? Tries resting states of the object over the whole scene
     (on the floor, on fixtures' tops and floors; upright, on a side, upside down; turned four ways; and held,
     if the goal lets the robot hold on). Returns the items no state satisfies (alone or together), in words."""
     from .goal_bench import Moment, _end_ok, _v
     from .goal_terms import fixtures_geometry
-    ends = [c for c in goal.conditions if c.when == "end"]
-    if not ends:
+    ends = [c for c in goal.conditions if c.when == "end" and not about_body(c)]  # the robot's own body: can't
+    if not ends:                                                                     # be judged from the scene
         return []
     fx = fixtures_geometry(scene)
     b = scene.block
