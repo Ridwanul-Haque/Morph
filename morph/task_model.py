@@ -100,6 +100,9 @@ def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
         scene.option.iterations, scene.option.ls_iterations = 50, 25
     else:
         scene.option.iterations, scene.option.ls_iterations = 4, 8
+        for k, v in (task.get("physics") or {}).items():  # what physics_check found this robot needs to stay stable
+            if k in ("impratio", "iterations", "ls_iterations"):
+                setattr(scene.option, k, type(getattr(scene.option, k))(v))
     for k in ("integrator", "timestep", "impratio", "cone", "noslip_iterations", "ccd_iterations", "iterations",
               "ls_iterations", "tolerance", "solver"):  # the scene's physics settings win; say so quietly
         setattr(robot.option, k, getattr(scene.option, k))
@@ -424,6 +427,12 @@ def grip_terms(xp, pts, bp, R, half, task: dict, closure=None):
     return grip, touch, lifted
 
 
+def _goal_xyz(task: dict):
+    """Where the goal puts the object (goal_x, goal_y, goal_z in formulas), when it has a place."""
+    t = task.get("target") or {}
+    return (t["x"], t["y"], t.get("z", 0.0)) if t.get("has_place", True) and "x" in t else None
+
+
 def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None, qpos=None) -> dict:
     """Every quantity a goal condition or a skill step can read (goal_terms), from the simulation state.
     Same code for training (JAX) and trying / practice runs (NumPy). held: from contact_held when the
@@ -452,7 +461,7 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None,
     v = quantities(xp, pos=bp, R=R, vel=qvel[ix.block_v:ix.block_v + 3], ang=qvel[ix.block_v + 3:ix.block_v + 6],
                    start=task["start"][:2], half=half,
                    fixtures=task.get("fixtures", {}), held=held, robot_xy=robot, hand_dist=hand, hand_pos=hand_pos,
-                   base_z=base_z, base_up=base_up)
+                   base_z=base_z, base_up=base_up, goal=_goal_xyz(task))
     closure = None
     if ctrl is not None and ix.grip_act >= 0 and ix.grip_close != ix.grip_open:
         closure = xp.clip((ctrl[ix.grip_act] - ix.grip_open) / (ix.grip_close - ix.grip_open), 0.0, 1.0)

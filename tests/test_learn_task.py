@@ -319,3 +319,61 @@ def test_practice_run_says_what_the_try_did(tmp_path, monkeypatch):
     _random_policy(task_path.parent, obs_size(indices(m, load_task(task_path))), m.nu)
     r = lt.practice_run(task_path, task_path.parent / "policy.npz")
     assert {"closest_to_object_cm", "best_grip_0_to_1", "highest_lift_cm", "moved_object_cm"} <= set(r["did"])
+
+
+def test_a_suggestion_about_a_reward_part_changes_its_weight(tmp_path, monkeypatch):
+    """'About the reward part reach: count it less' -> Nemotron sets reward_weights; Morph keeps them within limits, saves
+    them on the task (the trainer reads them) and Nemotron sees each part's totals and any loophole."""
+    import json as _json
+    import morph.learn_task as lt
+    from morph.reasoning import SkillStepsProposal
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("push the parcel against the wall", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "tests" / "data" / "tiny_arm.urdf"))
+    m = build_task_model(load_task(task_path))
+    n_obs, n_act = obs_size(indices(m, load_task(task_path))), m.nu
+    seen = {}
+
+    class FakeLLM:
+        available = True
+
+        def revise_steps(self, robot, goal_, steps, diagnosis, *a, advice=None, ratings=None, **k):
+            seen.update(diagnosis=diagnosis, advice=advice)
+            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"}],
+                                      reward_weights={"reach": 0.4, "near": 0.0}, rationale="You said: less reach."), None
+
+    def fake_train(tp, n, restore):
+        _random_policy(tp.parent, n_obs, n_act)
+        curve = [{"step": k, "reward": r, "success": 0.0, "steps_done": 0.0, "dist": 1.0, "parts": {"reach": r, "near": 0.1}}
+                 for k, r in enumerate([1, 2, 4, 8])]
+        (tp.parent / "train_meta.json").write_text(_json.dumps({"curve": curve}))
+        return True
+
+    said = [["About the reward part reach (\"the hand getting to the object\"): count it less"]]
+    lt.learn_in_rounds(pj, goal, task_path, fake_train, llm=FakeLLM(), log=lambda s: None, total_steps=10_000_000,
+                       rounds=2, tries=1, candidates=0, advice=lambda: said.pop() if said else [])
+    assert "reward part reach" in seen["advice"][0]
+    assert {p["part"] for p in seen["diagnosis"]["reward_parts"]} == {"reach", "near"}
+    assert "getting to the object" in seen["diagnosis"]["possible_loophole"]  # reach rose late, the checklist didn't
+    w = load_task(task_path)["reward_weights"]
+    assert w["reach"] == 0.4 and w["near"] == 0.5  # the goal's own part can't be turned below half
+
+
+def test_a_wheeled_robot_starts_on_the_floor_and_holds_still_in_the_learning_physics(tmp_path, monkeypatch):
+    """The Stretch was dropped from 40 cm (its keyframe height 0 read as "missing"), counted as fallen every moment (so
+    every practice run ended at once), and its light wheels spun themselves up in the fast learning physics: in
+    practice it only went in circles. Arms keep the physics they had."""
+    import json as _json
+    import morph.learn_task as lt
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("put the parcel in the bin", pj.scene)
+    men = ROOT / "third_party" / "mujoco_menagerie"
+    t = _json.loads(make_task(pj, goal, str(men / "hello_robot_stretch" / "stretch.xml"), plan=False,
+                              folder=tmp_path / "stretch").read_text())
+    assert t["base_z"] < 0.05  # on its wheels, not 40 cm up
+    assert t["physics_check"]["moved_m"] < 0.05 and t["physics"]  # needed (and got) steadier physics
+    arm = _json.loads(make_task(pj, goal, str(men / "franka_emika_panda" / "panda.xml"), plan=False,
+                                folder=tmp_path / "panda").read_text())
+    assert "physics" not in arm and arm["physics_check"]["moved_m"] < 0.05

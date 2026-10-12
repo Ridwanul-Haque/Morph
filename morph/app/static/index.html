@@ -6,6 +6,7 @@
 <title>Morph</title>
 <style>
 :root {
+  color-scheme: dark;  /* native controls (dropdown lists, scrollbars) drawn dark, so their text stays readable */
   --bg: #0a0f1a; --bg2: #0e1524; --panel: #121b2d; --raise: #182338; --hover: #1d2a43;
   --line: rgba(148, 163, 184, .12); --line2: rgba(148, 163, 184, .22);
   --text: #e7edf6; --dim: #94a3b8; --faint: #64748b;
@@ -37,6 +38,24 @@ header { height: 60px; display: flex; align-items: center; gap: 14px; padding: 0
 .chip.job { color: var(--text); border-color: rgba(106, 168, 255, .55); background: rgba(106, 168, 255, .12); animation: glow 1.6s ease-in-out infinite; }
 .chip.job .spin { border-color: var(--accent); border-top-color: transparent; }
 .chip.job button { height: 22px; padding: 0 9px; font-size: 12px; }
+.rgroup { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin: 10px 0 2px; }
+.rgroup:first-child { margin-top: 0; }
+.rw { padding: 10px 0 9px; border-top: 1px solid var(--line); }
+.rgroup + .rw { border-top: none; }
+.rw .top { display: flex; align-items: center; gap: 10px; }
+.rw .name { flex: 1; min-width: 0; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rw .wt { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 99px; font-size: 11px; font-weight: 600; color: var(--warn); background: var(--warnbg); vertical-align: 1px; }
+.rw .val { flex: none; font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; white-space: nowrap; }
+.rw .val.neg { color: var(--bad); }
+.rw .up { color: var(--ok); font-size: 11px; } .rw .down { color: var(--bad); font-size: 11px; }
+.rw select { flex: none; width: 84px; height: 26px; padding: 0 6px 0 10px; font-size: 12px; border-radius: 99px; color: var(--dim); background: var(--bg2); cursor: pointer; }
+.rw select:hover { color: var(--text); border-color: var(--accent); }
+.rw .bar { margin-top: 7px; height: 6px; border-radius: 99px; background: rgba(148, 163, 184, .12); overflow: hidden; }
+.rw .bar i { display: block; height: 100%; border-radius: 99px; min-width: 3px; }
+.rw .bar i.pos { background: linear-gradient(90deg, var(--accent), var(--accent2)); } .rw .bar i.neg { background: var(--bad); opacity: .85; }
+.rw .pending { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 9px; border-radius: 99px; font-size: 11.5px; color: var(--accent); background: var(--accbg); }
+.rw .what { margin-top: 5px; font-size: 12px; line-height: 1.4; color: var(--faint); }
+.hole { border: 1px solid rgba(251, 191, 36, .45); background: var(--warnbg); color: var(--warn); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; line-height: 1.45; }
 .chip.click { cursor: pointer; } .chip.click:hover { border-color: var(--line2); color: var(--text); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .15); }
@@ -60,6 +79,8 @@ main { display: grid; grid-template-columns: 370px minmax(0, 1fr) 390px; height:
 .stephead h3 { margin: 0; font-size: 15px; }
 .help { color: var(--dim); font-size: 12.5px; margin: 0 0 12px 34px; }
 
+select option { background: var(--raise); color: var(--text); }
+select option:checked { background: var(--hover); }
 select, input[type=text], input[type=number], textarea { background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px;
   padding: 8px 10px; width: 100%; outline: none; transition: border-color .15s; }
 select:focus, input:focus, textarea:focus { border-color: var(--accent); }
@@ -397,6 +418,9 @@ header [data-tip]:hover::after { left: auto; right: 0; }
         <button class="xs primary" onclick="suggest(false)" data-tip="At the end of this practice round, Nemotron reads what you wrote together with Morph's measurements and changes the steps and reward terms to fix it. Your words are advice: the measurements still decide what is kept, and the best version so far is never lost. About $0.005.">Fix it after this round</button>
         <button class="xs" onclick="suggest(true)" data-tip="Ends this round at its next snapshot (within a minute or two), keeping what it has learned so far, then changes the plan right away.">Fix it now</button></div>
       <div id="suggested" class="tiny muted" style="margin-top:6px"></div></div></div>
+    <div class="sec"><h4>What it's rewarded for</h4><div class="card small">
+      <div class="tiny muted" style="margin-bottom:10px;line-height:1.45">Points it earns while it practises, per practice run (▲▼ since this round began). Only the goal checklist decides if it worked. If a part pays for the wrong thing, adjust it: Nemotron changes it at the end of the round.</div>
+      <div id="rewardhole"></div><div id="rewardbox" class="faint">Shown once practice starts.</div></div></div>
     <div class="sec"><h4>Score while it practises</h4><div class="card">
       <canvas id="curve" width="900" height="240"></canvas>
       <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div></div></div>
@@ -1021,6 +1045,7 @@ function events() {
           if (pg) Object.assign(pg, {success: e.success, report: e.report, reasons: e.reasons}); renderResults(); }
         caption(e.success ? `Program ${e.attempt} reached the goal` : `Program ${e.attempt} failed: ${(e.reasons || [])[0] || ""}. Nemotron is fixing it`); break;
       case "learn_round": {
+        if (e.stage === "advice") { S.rewardPending = {}; renderReward(); }  // Nemotron answered (changed or not: see Rounds)
         S.rounds = S.rounds || {};
         const prev = S.rounds[e.round] || {};
         if (e.stage === "candidate") { prev.cands = [...(prev.cands || []), e]; S.rounds[e.round] = prev; }
@@ -1047,9 +1072,10 @@ function events() {
               return `<br><span class="${won ? "" : "faint"}">${won ? "✓" : "·"} ${esc(idea)}${c ? ` (${c.success}/${c.n}, ${c.in_goal} moments in the goal state)` : " (practising…)"}</span>`; }).join("")}` : ""}
             ${x.chosen && (x.chosen.reward_terms || []).length ? `<br><span class="faint">its reward terms: ${x.chosen.reward_terms.map(t => `${esc(t.name)} (${esc(t.formula)}, ×${t.weight})`).join("; ")}</span>` : ""}</div>`; }).join("");
         break; }
-      case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true); break;
+      case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true);
+        if (e.reward_parts) { S.reward = e; S.rewardPending = {}; renderReward(); } break;
       case "training_retry": toast(`Out of GPU memory: retrying with ${e.envs} practice copies at once`); break;
-      case "training": S.curve.push(e); drawCurve(); break;
+      case "training": S.curve.push(e); drawCurve(); renderReward(); break;
       case "training_done": $("trainpct").textContent = !e.ok ? `Training failed: ${e.why || "see Log"}` : e.kind === "task" ? "Learned. Now trying it…" : "Done: plans now use this gait";
         if (e.kind !== "task" || !e.ok) setRunning(false); S.profiles = {}; renderRobots(); break;
       case "robot_start_learn": break;
@@ -1064,6 +1090,67 @@ function events() {
       case "cloud_job": showCloudJob(e); break;
     }
   };
+}
+// ------------------------------------------------------------ the reward, part by part (morph/reward_parts.py)
+function rewardTotals(rec) {  // one check's per-part totals, Nemotron's own terms under their names
+  const out = {...(rec.parts || {})};
+  ((S.reward && S.reward.reward_terms) || []).forEach((t, k) => { if (rec.term_totals && rec.term_totals[k] !== undefined) out["term:" + t.name] = rec.term_totals[k]; });
+  return out;
+}
+const cap = t => t ? t[0].toUpperCase() + t.slice(1) : t;
+function rewardShort(k) { return k.startsWith("term:") ? cap(k.slice(5)) : ((S.reward && S.reward.reward_short && S.reward.reward_short[k]) || rewardLabel(k)); }
+function rewardLabel(k) { return k.startsWith("term:") ? "written by Nemotron for this task" : ((S.reward && S.reward.reward_parts[k]) || k); }
+function rewardHole(pts) {  // the score going up while the checklist doesn't: which part pays for it (reward_parts.loophole);
+  // only in the second half of a round (early on the score rises as it learns to reach the object: that's progress)
+  if (!pts.length) return null;
+  pts = pts.filter(p => p.step >= pts[pts.length - 1].step / 2);
+  if (pts.length < 2) return null;
+  const a = pts[0], b = pts[pts.length - 1];
+  if (!(b.reward - a.reward > Math.max(1, 0.2 * Math.abs(a.reward)))) return null;
+  if ((b.success || 0) - (a.success || 0) > 0.02 || (b.steps_done || 0) - (a.steps_done || 0) > 0.1) return null;
+  const pa = rewardTotals(a), pb = rewardTotals(b);
+  const k = Object.keys(pb).sort((x, y) => (pb[y] - (pa[y] || 0)) - (pb[x] - (pa[x] || 0)))[0];
+  return k && pb[k] - (pa[k] || 0) > 0 ? {k, from: pa[k] || 0, to: pb[k], ra: a.reward, rb: b.reward} : null;
+}
+function renderReward() {
+  const pts = (S.curve || []).filter(p => p.parts);
+  if (!pts.length) return;
+  const first = rewardTotals(pts[0]), last = rewardTotals(pts[pts.length - 1]);
+  const keys = Object.keys(last).sort((a, b) => Math.abs(last[b]) - Math.abs(last[a]));
+  const big = Math.max(0.001, ...keys.map(k => Math.abs(last[k])));
+  const w = (S.reward && S.reward.reward_weights) || {}, w0 = (S.reward && S.reward.reward_defaults) || {};
+  $("rewardbox").classList.remove("faint");
+  S.rewardKeys = keys;
+  const row = (k, i) => {
+    const v = last[k], d = v - (first[k] || 0), pct = Math.max(2, 100 * Math.abs(v) / big);
+    const trend = pts.length > 1 && Math.abs(d) > 0.05 * big ? `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}</span> ` : "";
+    const changed = !k.startsWith("term:") && w[k] !== undefined && w0[k] !== undefined && Math.abs(w[k] - w0[k]) > 1e-6;
+    return `<div class="rw"><div class="top">
+        <div class="name" title="${esc(rewardShort(k))}">${esc(rewardShort(k))}${changed ? `<span class="wt" data-tip="Changed from Morph's default (×${w0[k]}) by a suggestion">×${w[k]}</span>` : ""}</div>
+        <div class="val ${v < 0 ? "neg" : ""}">${trend}${v > 0 ? "+" : ""}${v.toFixed(1)}</div>
+        <select onchange="rewardChange(${i}, this)" aria-label="Adjust ${esc(rewardShort(k))}">
+          <option value="">Adjust</option><option value="less">Less of this</option><option value="more">More of this</option>
+          <option value="gripping">Only once it's gripping</option><option value="remove">Remove it</option><option value="own">Say it my way…</option></select></div>
+      <div class="bar"><i class="${v >= 0 ? "pos" : "neg"}" style="width:${pct.toFixed(0)}%"></i></div>
+      <div class="what">${esc(cap(rewardLabel(k)))}</div>
+      ${(S.rewardPending || {})[k] ? `<div class="pending"><span class="spin" style="width:10px;height:10px;border-color:var(--accent);border-top-color:transparent"></span>Asked: ${esc(S.rewardPending[k])}. Nemotron changes it when this round ends</div>` : ""}</div>`; };
+  const earn = keys.filter(k => last[k] >= 0), pen = keys.filter(k => last[k] < 0);
+  $("rewardbox").innerHTML = (earn.length ? `<div class="rgroup">Earning points</div>` + earn.map(k => row(k, keys.indexOf(k))).join("") : "")
+    + (pen.length ? `<div class="rgroup">Penalties</div>` + pen.map(k => row(k, keys.indexOf(k))).join("") : "");
+  const h = rewardHole(pts);
+  $("rewardhole").innerHTML = h ? `<div class="hole">⚠ Possible loophole: its score rose from ${h.ra.toFixed(0)} to ${h.rb.toFixed(0)} but it isn't meeting the checklist more often. Most of the rise comes from <b>${esc(rewardShort(h.k))}</b> (${h.from.toFixed(1)} → ${h.to.toFixed(1)}): it may be earning those points without getting closer to the goal. Watch what it does; if that's what's happening, change that part.</div>` : "";
+}
+async function rewardChange(i, sel) {
+  const k = S.rewardKeys[i], how = sel.value; sel.value = ""; if (!how || !k) return;
+  const said = {less: "count it less", more: "count it more", gripping: "only pay it once the hand is actually gripping the object",
+                remove: "remove it"}[how] || prompt(`What should change about "${rewardShort(k)}"?`);
+  if (!said) return;
+  const text = `About the reward part ${k} ("${rewardShort(k)}": ${rewardLabel(k)}): ${said}`;
+  try { await api("/api/suggest", {text, now: false});
+        S.rewardPending = {...(S.rewardPending || {}), [k]: said}; renderReward();
+        $("suggested").innerHTML += `<div>✓ sent, for the end of this round: “${esc(text)}”</div>`;
+        toast("Sent: Nemotron changes it at the end of this round"); }
+  catch (e) { toast(e.message, true); }
 }
 function trainLabel() {  // before any practice step of a round is logged
   $("trainbar").style.width = "0%";

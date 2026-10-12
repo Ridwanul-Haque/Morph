@@ -20,7 +20,12 @@ Quantities an expression can use (metres, degrees):
   part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level), grip (0..1: how close
   the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
   its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut)
-functions: abs, min, max, sqrt, hypot; operators: + - * / < <= > >= == and or not.
+  roll_deg, pitch_deg (the object's tilt about its own long and short axes), goal_x, goal_y, goal_z (where the goal
+  puts it, when it has a place; target_x ... mean the same), <fixture>_x, <fixture>_y, <fixture>_top (a fixture's
+  centre and top, e.g. bin_x)
+functions: abs, min, max, sqrt, hypot, exp, log, tanh, cos, sin, atan2 (radians), cosd, sind, atan2d (degrees),
+  clip(x, lo, hi), pow(x, n); constant pi; operators: + - * / ** (or ^, a power with a number as the exponent)
+  < <= > >= == and or not.
 """
 
 from __future__ import annotations
@@ -32,7 +37,10 @@ SIDES = {"east": (1, 0), "west": (-1, 0), "north": (0, 1), "south": (0, -1)}
 FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1, 1), "-y": (1, -1)}
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
-             "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps"}
+             "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps", "roll_deg", "pitch_deg",
+             "goal_x", "goal_y", "goal_z"}
+GOAL_VARIABLES = {"goal_x", "goal_y", "goal_z"}  # only when the goal has a place (else not a number: the check says so)
+FIXTURE_ATTRS = ("_x", "_y", "_top")  # bin_x, bin_y, bin_top: a fixture's centre and top
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
                    "touch_dist"}
 # the robot's own body (goals about the robot, not the object: "make a fist", "raise the arm", "lift a foot"): each takes
@@ -40,7 +48,11 @@ ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_
 # the matching joints are through their range, 0 at the lower limit, 1 at the upper (mean; _min / _max: the least / most).
 # part_x / part_y / part_z: where the matching end parts (fingertips, hand, feet) are (their mean), in metres.
 BODY_FUNCS = {"joint_frac", "joint_frac_min", "joint_frac_max", "part_x", "part_y", "part_z"}
-FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | BODY_FUNCS
+# the maths a shaping term needs (Eureka-style terms are often exp(-d / scale), tanh, a squared error, an angle)
+MATH_FUNCS = {"exp", "log", "tanh", "cos", "sin", "atan2", "cosd", "sind", "atan2d", "clip", "pow"}
+FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | MATH_FUNCS | BODY_FUNCS
+CONSTANTS = {"pi": math.pi}
+MAX_POWER = 4.0  # x ** n with a number n, |n| <= 4 (a squared or cubed error; not an overflowing x ** 100)
 GENERIC = ("orientation", "height", "away_from", "moved", "expression")
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce
 ANGLE_UNIT, LENGTH_UNIT = 90.0, 0.3  # a violation of 90 degrees or 30 cm counts as "1" in the reward
@@ -52,9 +64,12 @@ class ExprError(ValueError):
 
 # ------------------------------------------------------------------ expressions
 def normalize(expr: str, object_name: str = "") -> str:
-    """Common ways of writing the same thing: && || ! true false, object_x / parcel_x for x, ..."""
+    """Common ways of writing the same thing: && || ! true false, object_x / parcel_x for x, target_x for goal_x,
+    clamp / clipped for clip, ..."""
     import re
-    e = expr.replace("&&", " and ").replace("||", " or ")
+    if isinstance(expr, bool):  # a step written as "done_when": true
+        return "1" if expr else "0"
+    e = str(expr).replace("&&", " and ").replace("||", " or ")
     e = re.sub(r"!(?!=)", " not ", e)
     e = re.sub(r"\btrue\b", "1", e, flags=re.I)
     e = re.sub(r"\bfalse\b", "0", e, flags=re.I)
@@ -62,6 +77,9 @@ def normalize(expr: str, object_name: str = "") -> str:
     for n in names:
         for a in ("x", "y", "z", "tilt_deg", "yaw_deg", "speed", "bottom", "top"):
             e = re.sub(rf"\b{re.escape(n)}_{a}\b", a, e)
+    e = re.sub(r"\b(?:target|goal|place)_(x|y|z)\b", r"goal_\1", e)
+    e = re.sub(r"\b(?:clamp|clipped|clamped)\s*\(", "clip(", e)
+    e = re.sub(r"\b(?:math|np|numpy|jnp)\.", "", e)  # math.exp(...) -> exp(...)
     return e
 
 
@@ -85,16 +103,26 @@ def _parse(expr: str, fixtures, object_name: str = "") -> ast.Expression:
     except SyntaxError as e:
         raise ExprError(f"can't read {expr!r}: {e.msg}") from None
     ok_nodes = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not, ast.USub, ast.UAdd, ast.BinOp,
-                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Compare, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq,
-                ast.Call, ast.Name, ast.Constant, ast.Load)
+                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.BitXor, ast.Compare, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                ast.Eq, ast.NotEq, ast.Call, ast.Name, ast.Constant, ast.Load)
     for n in ast.walk(tree):
         if not isinstance(n, ok_nodes):
             raise ExprError(f"{type(n).__name__} isn't allowed in a goal formula")
-        if isinstance(n, ast.Name) and n.id not in VARIABLES and n.id not in FUNCS and n.id not in fixtures:
-            raise ExprError(f"unknown quantity {n.id!r} (known: {', '.join(sorted(VARIABLES))})")
+        if isinstance(n, ast.Name) and n.id not in VARIABLES and n.id not in FUNCS and n.id not in fixtures \
+                and n.id not in CONSTANTS and not _fixture_attr(n.id, fixtures):
+            fx = [f"{f}{a}" for f in fixtures for a in FIXTURE_ATTRS][:9]
+            raise ExprError(f"unknown quantity {n.id!r} (known: {', '.join(sorted(VARIABLES) + fx)})")
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Pow, ast.BitXor)):  # x ** 2 (x ^ 2 means the same here)
+            _power(n.right)
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name) or n.func.id not in FUNCS:
-                raise ExprError("only abs, min, max, sqrt, hypot and dist_to can be called")
+                raise ExprError(f"only these can be called: {', '.join(sorted(FUNCS - BODY_FUNCS))} (and "
+                                f"{', '.join(sorted(BODY_FUNCS))} for the robot's own body)")
+            arity = {"atan2": 2, "atan2d": 2, "clip": 3, "pow": 2}.get(n.func.id, 1 if n.func.id in MATH_FUNCS else None)
+            if arity is not None and len(n.args) != arity:
+                raise ExprError(f"{n.func.id} takes {arity} value{'s' if arity > 1 else ''}")
+            if n.func.id == "pow":
+                _power(n.args[1])
             if n.func.id in BODY_FUNCS:
                 a = n.args[0] if len(n.args) == 1 else None
                 if not (isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.strip()):
@@ -107,6 +135,30 @@ def _parse(expr: str, fixtures, object_name: str = "") -> ast.Expression:
         if isinstance(n, ast.Constant) and not isinstance(n.value, (int, float, str)):
             raise ExprError(f"{n.value!r} isn't a number")
     return tree
+
+
+def _fixture_attr(name: str, fixtures) -> bool:
+    return any(name == f"{f}{a}" for f in fixtures for a in FIXTURE_ATTRS)
+
+
+def _power(node) -> float:
+    """The exponent of a power: a plain number, at most MAX_POWER either way."""
+    k = node.operand if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)) else node
+    if not (isinstance(k, ast.Constant) and isinstance(k.value, (int, float)) and not isinstance(k.value, bool)):
+        raise ExprError("a power's exponent must be a number (x ** 2), not a quantity")
+    n = -float(k.value) if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) else float(k.value)
+    if abs(n) > MAX_POWER:
+        raise ExprError(f"a power's exponent must be between -{MAX_POWER:g} and {MAX_POWER:g}")
+    return n
+
+
+def _pow(xp, a, n: float):
+    """a ** n without NaN or infinity: a fractional power of |a|, a negative power of a kept off zero."""
+    if n != int(n):
+        a = xp.abs(a)
+    if n < 0:
+        a = xp.where(xp.abs(a) < 1e-6, 1e-6, a)
+    return a ** n
 
 
 def uses(expr: str) -> set[str]:
@@ -125,10 +177,17 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
         if isinstance(n, ast.Constant):
             return float(n.value)
         if isinstance(n, ast.Name):
+            if n.id in CONSTANTS:
+                return CONSTANTS[n.id]
+            if n.id not in v and (n.id in GOAL_VARIABLES or n.id.endswith(FIXTURE_ATTRS)):
+                # a goal with no place (goal_x) or a fixture this model doesn't know: not a number, so not "met"
+                return xp.asarray(float("nan") if xp.__name__ == "numpy" else 0.0)
             return v[n.id]
         if isinstance(n, ast.UnaryOp):
             return -val(n.operand) if isinstance(n.op, ast.USub) else val(n.operand)
         if isinstance(n, ast.BinOp):
+            if isinstance(n.op, (ast.Pow, ast.BitXor)):
+                return _pow(xp, val(n.left), _power(n.right))
             a, b = val(n.left), val(n.right)
             return {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b,
                     ast.Div: lambda: a / (b + 1e-9)}[type(n.op)]()
@@ -139,7 +198,16 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
             if f == "dist_to":
                 a = n.args[0]
                 return v["dist"][a.value if isinstance(a, ast.Constant) else a.id]
+            if f == "pow":
+                return _pow(xp, val(n.args[0]), _power(n.args[1]))
             args = [val(a) for a in n.args]
+            if f in MATH_FUNCS:
+                a = args[0]
+                return {"exp": lambda: xp.exp(xp.clip(a, -50.0, 50.0)), "log": lambda: xp.log(xp.maximum(a, 1e-9)),
+                        "tanh": lambda: xp.tanh(a), "cos": lambda: xp.cos(a), "sin": lambda: xp.sin(a),
+                        "cosd": lambda: xp.cos(xp.radians(a)), "sind": lambda: xp.sin(xp.radians(a)),
+                        "atan2": lambda: xp.arctan2(a, args[-1]), "atan2d": lambda: xp.degrees(xp.arctan2(a, args[-1])),
+                        "clip": lambda: xp.clip(a, args[1], args[2])}[f]()
             if f == "abs":
                 return xp.abs(args[0])
             if f == "sqrt":
@@ -393,7 +461,7 @@ class History:
 
 
 def quantities(xp, *, pos, R, vel, start, half, fixtures: dict, held, robot_xy=None, hand_dist=None,
-               hand_pos=None, base_z=None, base_up=None, ang=None) -> dict:
+               hand_pos=None, base_z=None, base_up=None, ang=None, goal=None) -> dict:
     """ang: the object's angular velocity in its own frame (a free joint's qvel[3:6]), for spin."""
     """Everything a condition or formula can read, from the object's state (NumPy or JAX arrays)."""
     x, y, z = pos[0], pos[1], pos[2]
@@ -406,7 +474,15 @@ def quantities(xp, *, pos, R, vel, start, half, fixtures: dict, held, robot_xy=N
          "yaw_deg": xp.degrees(xp.arctan2(R[1, 0], R[0, 0])), "speed": xp.sqrt(xp.sum(vel * vel)),
          "vx": vel[0], "vy": vel[1], "vz": vel[2],
          "start_x": start[0], "start_y": start[1],
-         "travelled": xp.sqrt((x - start[0]) ** 2 + (y - start[1]) ** 2), "held": held, "dist": dist, "R": R}
+         "travelled": xp.sqrt((x - start[0]) ** 2 + (y - start[1]) ** 2), "held": held, "dist": dist, "R": R,
+         # tilt about its own x axis (roll) and y axis (pitch); tilt_deg is the total
+         "roll_deg": xp.degrees(xp.arctan2(R[2, 1], R[2, 2])),
+         "pitch_deg": xp.degrees(xp.arcsin(xp.clip(-R[2, 0], -1.0, 1.0)))}
+    for n, f in fixtures.items():  # each fixture's centre and top (bin_x, bin_y, bin_top)
+        v[f"{n}_x"], v[f"{n}_y"] = (f["lo"][0] + f["hi"][0]) / 2, (f["lo"][1] + f["hi"][1]) / 2
+        v[f"{n}_top"] = f.get("top_z", f["hi"][2] if len(f["hi"]) > 2 else 0.0)
+    if goal is not None:  # where the goal puts it, when it has a place
+        v["goal_x"], v["goal_y"], v["goal_z"] = goal[0], goal[1], goal[2]
     if ang is not None:  # how fast it spins (deg/s), and about the vertical (+ = anticlockwise seen from above)
         w = R @ ang
         v["spin_dps"] = xp.degrees(xp.sqrt(xp.sum(w * w)))

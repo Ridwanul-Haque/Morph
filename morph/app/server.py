@@ -446,7 +446,10 @@ class App:
             self.send(type="error", text=f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-2000:])
 
     def run(self, robots: list[str], n: int, use_llm: bool):
-        self.replays, result = {}, {"project": self.project.name, "goal": self.goal.model_dump(),
+        # this run's scene and goal, as they were when it started: changing them in the page meanwhile (loading a scene
+        # clears the goal) doesn't change what the robots still to come are asked to do
+        pj, goal, placements = self.project, self.goal, dict(self.placements)
+        self.replays, result = {}, {"project": pj.name, "goal": goal.model_dump(),
                                     "goal_info": self.goal_info, "robots": []}
         self.send(type="run_start", robots=robots, n=n)
         for path in robots:
@@ -462,8 +465,8 @@ class App:
                     elif text.startswith("grip test"):
                         self.send(type="caption", robot=_name, text="Grip test: a practice pick to find how firmly to hold"
                                   + (" (shown on an empty floor)" if "empty floor" in text else ""))
-            r = P.run_on_robot(self.project, self.goal, path, n=n, llm=self.reasoning() if use_llm else None, log=log,
-                               stand_at=self.placements.get(path))
+            r = P.run_on_robot(pj, goal, path, n=n, llm=self.reasoning() if use_llm else None, log=log,
+                               stand_at=placements.get(path))
             result["robots"].append(r)
         self.live.pace = False
         self.result = result
@@ -552,7 +555,9 @@ def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, q
 def steps_view(task: Path) -> dict:
     t = json.loads(task.read_text())
     steps = t.get("steps", []) + ([t["steps_final"]] if t.get("steps_final") else [])
-    return {"robot": t["robot"], "steps": steps, "from": t.get("steps_from", ""), "rationale": t.get("steps_rationale", "")}
+    from ..reward_parts import view
+    return {"robot": t["robot"], "steps": steps, "from": t.get("steps_from", ""), "rationale": t.get("steps_rationale", ""),
+            **view(t)}
 
 
 def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "light", use_llm: bool = True):
@@ -560,9 +565,12 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
     from .compute import cloud_task_job
     if app.goal is None or app.project is None:
         raise ValueError("understand a goal first")
-    planned = app.planned.get((path, id(app.goal)))  # the steps already shown, if they were planned first
+    # what this learning is for, as it was when it started: learning takes an hour or more, and loading another scene
+    # meanwhile clears the page's goal (that once crashed it at the very end, after all the practice)
+    pj, goal = app.project, app.goal
+    planned = app.planned.get((path, id(goal)))  # the steps already shown, if they were planned first
     app.send(type="caption", text="Working out how to go about it")
-    task, prep = prepare_learning(app.project, app.goal, app.resolve(path), llm=app.reasoning() if use_llm else None,
+    task, prep = prepare_learning(pj, goal, app.resolve(path), llm=app.reasoning() if use_llm else None,
                                   log=lambda t: app.send(type="log", text=t.strip()), emit=lambda **e: app.on_event(e),
                                   stand_at=app.placements.get(path), steps_from=planned)
     if prep.get("demo"):
@@ -617,7 +625,7 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
 
     with app.suggest_lock:
         app.suggestions = []
-    res = learn_in_rounds(app.project, app.goal, task, train, llm=app.reasoning() if use_llm else None,
+    res = learn_in_rounds(pj, goal, task, train, llm=app.reasoning() if use_llm else None,
                           log=lambda t: app.send(type="log", robot=robot, text=t.strip()), emit=emit, total_steps=steps,
                           advice=advice)
     app.training_task = None
@@ -627,7 +635,7 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
         return
     app.send(type="training_done", robot=robot, ok=True, kind="task", folder=task.parent.name)
     app.live.pace = False
-    app.result = {"project": app.project.name, "goal": app.goal.model_dump(), "robots": [{"robot": robot, "learned": task.parent.name, **res}]}
+    app.result = {"project": pj.name, "goal": goal.model_dump(), "robots": [{"robot": robot, "learned": task.parent.name, **res}]}
     app.send(type="learn_done", robot=robot, success=res["success"], n=res["n"], folder=task.parent.name,
              rounds=len(res.get("rounds", [])) + 1)
     app.send(type="done", summary=[{"robot": robot, "plan": "learned_skill", "success": res["success"], "n": res["n"]}])

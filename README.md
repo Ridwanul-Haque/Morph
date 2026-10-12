@@ -225,7 +225,7 @@ can train one for another legged robot.
 ## Reproduce
 
 ```bash
-.venv/bin/python -m pytest -q                       # 150 tests, ~1 min (CPU)
+.venv/bin/python -m pytest -q                       # 158 tests, ~1 min (CPU)
 .venv/bin/morph goal-bench                          # request understanding: Nemotron vs rules (~$0.07)
 .venv/bin/morph do examples/parcel "<task>" --robot <model> --run 5 --yes   # each cell of the programs table
 ```

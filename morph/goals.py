@@ -393,9 +393,11 @@ def _measure(goal, scene, model, data, pose, released) -> tuple[dict, dict]:
         kw = {"robot_xy": data.xpos[robot[0]][:2].copy(),
               "hand_dist": float(min(np.linalg.norm(data.xpos[i] - pos) for i in robot))}
     body = robot_body(model, data)
+    p = placement(goal, scene)
     v = quantities(np, pos=pos, R=data.xmat[bid].reshape(3, 3).copy(), vel=data.qvel[j.dofadr[0]:j.dofadr[0] + 3].copy(),
                    ang=data.qvel[j.dofadr[0] + 3:j.dofadr[0] + 6].copy(), start=scene.start[:2], half=(b.half_x, b.half_y, b.half_z), fixtures=fx,
-                   held=0.0 if released else 1.0, **kw)
+                   held=0.0 if released else 1.0,
+                   goal=(p["x"], p["y"], p["support_z"] + b.half_z) if p.get("has_place") else None, **kw)
     v |= body
     return v, fx
 

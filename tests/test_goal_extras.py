@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from morph.goal_terms import History, parse, term_value
+from morph.goal_terms import History, parse, term_value, violation
 from morph.goals import Condition
 from morph.project import load_project
 from morph.skill_steps import check_terms
@@ -159,3 +159,35 @@ def test_moment_snapshots_keep_body_measurements_without_crashing():
          "joints": {"j1": 0.5}, "parts": {"hand": np.array([0.4, 0.0, 0.1])}}
     h.update(v)
     assert h.result()[0] == 0 and h.snap[0]["joints"] == {"j1": 0.5} and "parts" not in h.snap[0]
+
+
+def test_formulas_take_powers_maths_and_scene_names():
+    """What Nemotron writes for shaping (all once rejected, each throwing away a whole plan): squared errors, exp / tanh,
+    clip, angles, the goal's and fixtures' positions, roll and pitch."""
+    import math
+    fx = {"bin": {"lo": [0.34, 0.10, 0.0], "hi": [0.5, 0.26, 0.05], "top_z": 0.05}}
+    from morph.goal_terms import quantities
+    v = quantities(np, pos=np.array([0.30, 0.0, 0.05]), R=np.eye(3), vel=np.array([0.6, 0.8, 0.0]), start=(0.45, -0.18),
+                   half=(0.05, 0.01, 0.01), fixtures=fx, held=0.0, hand_dist=np.asarray(0.1), goal=(0.42, 0.18, 0.02))
+    val = lambda f: float(term_value(np, parse(f, fx), v))  # noqa: E731
+    assert abs(val("(0.42 - x)**2") - 0.0144) < 1e-9 and abs(val("(hand_dist - 0.05)^2") - 0.0025) < 1e-9
+    assert abs(val("exp(-hand_dist / 0.05)") - math.exp(-2)) < 1e-6 and val("clipped(speed, 0, 0.5)") == 0.5
+    assert abs(val("bin_x") - 0.42) < 1e-9 and val("target_y") == 0.18 and abs(val("cosd(60)") - 0.5) < 1e-9
+    assert val("roll_deg") == 0.0 and np.isfinite(val("log(0)")) and np.isfinite(val("hand_dist ** -4"))
+    for bad in ("x ** y", "x ** 9", "eval(1)", "exp(x, y)"):
+        try:
+            parse(bad, fx)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} was accepted")
+    # a goal with no place: goal_x isn't a number, so a condition on it isn't met (rather than crashing)
+    v2 = quantities(np, pos=np.zeros(3), R=np.eye(3), vel=np.zeros(3), start=(0, 0), half=(0.03, 0.03, 0.03), fixtures={},
+                    held=0.0)
+    assert not violation(np, parse("abs(x - goal_x) < 0.05", {}), v2) == 0
+
+
+def test_a_plan_is_kept_without_the_reward_term_morph_cant_measure():
+    """One bad reward term used to throw a whole plan away (three times in one Stretch run)."""
+    terms, errors = check_terms([{"name": "ok", "formula": "-(hand_dist - 0.05) ** 2", "weight": 1},
+                                 {"name": "bad", "formula": "wobble_factor * 2", "weight": 1}], ["bin"])
+    assert [t["name"] for t in terms] == ["ok"] and len(errors) == 1 and "wobble_factor" in errors[0]

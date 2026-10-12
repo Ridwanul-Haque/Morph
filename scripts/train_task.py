@@ -39,6 +39,7 @@ from mujoco_playground.config import locomotion_params  # noqa: E402
 
 from morph.goal_terms import (BODY_FUNCS, HOLD_TICKS, condition_violation, is_generic, is_temporal, normalize,  # noqa: E402
                               parse, term_value, uses, violation)
+from morph.reward_parts import weights as reward_weights  # noqa: E402
 from morph.task_model import (CTRL_DT, SIM_DT, Residual, build_task_model, indices, load_task, measure, next_ctrl,  # noqa: E402
                               obs_size, observe, soft)  # noqa: E402
 
@@ -135,6 +136,11 @@ class TaskLearn(mjx_env.MjxEnv):
         # the steps to go about it (skill_steps): reward for reaching each in order
         self.steps = [(parse(st["done_when"], self.fx), parse(st["keep"], self.fx) if st.get("keep") else None)
                       for st in task.get("steps", [])]
+        # how much each part of the reward counts (reward_parts: 1 = Morph's default; a suggestion can change it)
+        self.w = reward_weights(task)
+        self.parts = ["toward", "near", "success", "reach", "smooth", "fling"] + (["heading"] if self.heading else []) \
+            + (["upright"] if self.upright else []) + (["standing"] if self.ix.base >= 0 else []) \
+            + (["steps"] if task.get("steps") else [])  # + "copy" once the demonstration is loaded (below)
         # extra shaping terms Nemotron wrote (Eureka-style), each logged on its own so it can see what they did
         self.terms = [(parse(t["formula"], self.fx), float(t["weight"])) for t in task.get("reward_terms", [])]
         b = task["block"]
@@ -176,6 +182,7 @@ class TaskLearn(mjx_env.MjxEnv):
             o, act = z["obs"].astype(np.float32), np.clip(z["act"], -1, 1).astype(np.float32)
             mu, sd = o.mean(0), o.std(0) + 1e-3
             self._demo = (jp.array(mu), jp.array(sd), jp.array((o - mu) / sd), jp.array(act))
+            self.parts.append("copy")
         # corrections on top of the recipe: the action is the recipe's at this moment plus a learned correction
         self.residual = Residual.of(task, task.get("_dir", "."))
         # asymmetric actor-critic (Pinto et al. 2018): the critic also sees what the robot can't (how well it really
@@ -304,6 +311,8 @@ class TaskLearn(mjx_env.MjxEnv):
         info["phi"] = self._steps(data, info["step"], info["streak"])[1]
         metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done")}
         metrics |= {f"term_{k}": jp.zeros(()) for k in range(len(self.terms))}
+        metrics |= {f"termw_{k}": jp.zeros(()) for k in range(len(self.terms))}
+        metrics |= {f"part_{k}": jp.zeros(()) for k in self.parts}
         obs = self._obs(data, info)
         return mjx_env.State(data, obs, jp.zeros(()), jp.zeros(()), metrics, info)
 
@@ -373,38 +382,52 @@ class TaskLearn(mjx_env.MjxEnv):
         if any(c["when"] == "release" for c in self.temporal):
             place_ok = place_ok & (info["released"] > 0.5)
         ok = place_ok & ((yaw_err < self.yaw_tol) | (not self.heading)) & ((tilt < 0.17) | (not self.upright))
-        # smooth pulls that work from far away (the tool starts ~0.5 m from the object), sharper ones up close
-        r = (2.0 * jp.clip(progress, -1.0, 1.0) + 1.0 * (1 - jp.tanh(d / 0.2)) + 2.0 * close
-             + 0.5 * (1 - jp.tanh(reach / 0.25)) * (1 - close) + 0.5 * jp.exp(-reach / 0.05) * aim_ok * (1 - close)
-             + (0.5 * jp.exp(-yaw_err ** 2 / 0.3) * close if self.heading else 0.0)
-             - (1.0 * tilt ** 2 if self.upright else 0.0) + 3.0 * ok
-             - 0.02 * jp.sum(jp.square(action - info["last_act"]))
-             - 1.0 * jp.maximum(jp.linalg.norm(data.qvel[ix.block_v:ix.block_v + 3]) - 0.5, 0.0))  # no flinging
+        # the reward, part by part (reward_parts: each logged on its own and shown in the app; weights from suggestions).
+        # Smooth pulls that work from far away (the tool starts ~0.5 m from the object), sharper ones up close
+        w = self.w
+        part = {"toward": 2.0 * jp.clip(progress, -1.0, 1.0),
+                "near": 1.0 * (1 - jp.tanh(d / 0.2)) + 2.0 * close,
+                "success": 3.0 * ok,
+                "reach": 0.5 * (1 - jp.tanh(reach / 0.25)) * (1 - close) + 0.5 * jp.exp(-reach / 0.05) * aim_ok * (1 - close),
+                "smooth": -0.02 * jp.sum(jp.square(action - info["last_act"])),
+                "fling": -1.0 * jp.maximum(jp.linalg.norm(data.qvel[ix.block_v:ix.block_v + 3]) - 0.5, 0.0)}
+        if self.heading:
+            part["heading"] = 0.5 * jp.exp(-yaw_err ** 2 / 0.3) * close
+        if self.upright:
+            part["upright"] = -1.0 * tilt ** 2
         done = jp.zeros(())
         if ix.base >= 0:
             up = data.xmat[ix.base].reshape(3, 3)[2, 2]
-            fell = (up < 0.4) | (data.xpos[ix.base][2] < 0.4 * self.task.get("base_z", 0.4))
-            r = r + 0.2 - 5.0 * fell
+            # tipped over, or (a body that stands up: legs) sunk to under 40% of its standing height. A base that
+            # rests on the floor (wheels) only falls by tipping: its height near 0 once counted as fallen every moment
+            stand = self.task.get("base_z", 0.4)
+            fell = (up < 0.4) | ((data.xpos[ix.base][2] < 0.4 * stand) if stand > 0.1 else False)
+            part["standing"] = 0.2 - 5.0 * fell
             done = fell.astype(jp.float32)
         if self._demo is not None:
-            r = r + 1.5 * self._demo_reward(state.obs["privileged_state"], action)
+            part["copy"] = 1.5 * self._demo_reward(state.obs["privileged_state"], action)
         shaped = jp.zeros(())
         if self.steps:  # the steps a person would take: reward reaching each, in order; mind the keep rules
             step, phi, keep, info["streak"] = self._steps(data, info["step"], info["streak"])
-            shaped = 0.5 * (phi - info["phi"])  # a one-off bonus per step reached (not a rate: not scaled by dt)
-            r = r + 1.0 * step / len(self.steps) - 1.0 * jp.minimum(keep, 2.0)
+            shaped = w["steps"] * 0.5 * (phi - info["phi"])  # a one-off bonus per step reached (not a rate: not scaled by dt)
+            part["steps"] = 1.0 * step / len(self.steps) - 1.0 * jp.minimum(keep, 2.0)
             info["step"], info["phi"] = step, phi
+        part = {k: w[k] * v for k, v in part.items()}
+        r = sum(part.values(), jp.zeros(()))
         tvals = []
         if self.terms:  # Nemotron's terms, on the graded quantities (each clipped: one term can't swamp the rest)
             vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
             tvals = [jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms]
-            r = r + sum(w * tv for (_, w), tv in zip(self.terms, tvals))
+            r = r + sum(wt * tv for (_, wt), tv in zip(self.terms, tvals))
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
         state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), grasp_aim=z(aim_ok),
                              success=ok.astype(jp.float32), dist=z(d),
-                             steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)})
+                             steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)},
+                             # what each part paid this tick (summed over a run: its total), the step bonus included
+                             **{f"part_{k}": z(v * self.dt + (shaped if k == "steps" else 0.0)) for k, v in part.items()},
+                             **{f"termw_{k}": z(wt * tv * self.dt) for k, ((_, wt), tv) in enumerate(zip(self.terms, tvals))})
         obs = self._obs(data, info)
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own
         # environments; otherwise one bad copy turns the whole batch's numbers into NaN
@@ -550,6 +573,9 @@ def main():
         if env.terms:  # each of Nemotron's reward terms: its average value per control step in the evaluation
             rec["terms"] = [round(float(metrics.get(f"eval/episode_term_{k}", 0.0)) / p.episode_length, 4)
                             for k in range(len(env.terms))]
+            rec["term_totals"] = [round(float(metrics.get(f"eval/episode_termw_{k}", 0.0)), 3) for k in range(len(env.terms))]
+        # what each part of the reward paid over a practice run (reward_parts), for the app and Nemotron
+        rec["parts"] = {k: round(float(metrics.get(f"eval/episode_part_{k}", 0.0)), 3) for k in env.parts}
         log.append(rec)
         print(json.dumps(rec), flush=True)
 

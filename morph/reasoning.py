@@ -25,6 +25,8 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from .reward_parts import doc as reward_parts_doc
+
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 PROMPT_VERSION = "morph.prompts/1"
@@ -102,11 +104,18 @@ class GoalProposal(BaseModel):
     suggestion: str = Field(default="", max_length=400)
 
 
+# what a formula may call and name (goal_terms checks the same): one text for every prompt that asks for formulas
+FUNCS_DOC = ("functions abs, min, max, sqrt, hypot, exp, log, tanh, clip(x, lo, hi), pow(x, n), cos, sin, atan2(y, x) "
+             "(radians), cosd, sind, atan2d (degrees); powers x ** n with a number n from -4 to 4; constant pi")
+MORE_NAMES_DOC = ("; also goal_x, goal_y, goal_z (where the goal puts the object, when it has a place), each fixture's "
+                  "<name>_x, <name>_y, <name>_top (its centre and top, e.g. bin_x), roll_deg and pitch_deg (the object's "
+                  "tilt about its own long and short axes)")
 REWARD_TERMS_DOC = (
     "You may also add up to 4 reward_terms: extra shaping on top of the steps, as Eureka does: each {\"name\", "
     "\"formula\", \"weight\", \"why\"}. formula is a NUMBER formula over the same quantities (e.g. \"closure * "
     "(touch_dist < 0.03)\" rewards closing only with the fingers at the object, \"-speed\" penalises flinging it, "
-    "\"min(lifted, 0.1)\" rewards lifting up to 10 cm), or a condition (then its graded distance from true counts, 0 "
+    "\"min(lifted, 0.1)\" rewards lifting up to 10 cm, \"exp(-touch_dist / 0.05)\" pulls a fingertip to it, sharper "
+    "up close, \"-(hypot(x - goal_x, y - goal_y)) ** 2\" a squared miss), or a condition (then its graded distance from true counts, 0 "
     "when it holds). weight -5..5: > 0 rewards the value, < 0 penalises it; the value is clipped to -3..3 and earned "
     "every tick (about 1 per second of weight x value). measured.reward_terms says how each current term behaved in "
     "the last practice (its average value per tick at the start and end): a term that never moves is not helping; one "
@@ -117,6 +126,7 @@ REWARD_TERMS_DOC = (
 class SkillStepsProposal(BaseModel):
     steps: list[dict] = Field(default_factory=list, max_length=8)
     reward_terms: list[dict] = Field(default_factory=list, max_length=6)  # Eureka-style shaping (revisions only)
+    reward_weights: dict = Field(default_factory=dict)  # how much Morph's built-in parts count (reward_parts; revisions)
     rationale: str = Field(default="", max_length=1200)
 
 
@@ -365,8 +375,8 @@ class ReasoningService:
             "is a Python-like boolean over these measured quantities at the end: x, y, z (object centre, m), bottom, top "
             "(m above the floor), tilt_deg, yaw_deg (0 = east), speed, vx, vy, vz (m/s), travelled (m from its start), start_x, "
             "start_y, held (1 if the robot still holds it), dist_to('fixture') (m, edge to edge), robot_x, robot_y "
-            "(robot base), hand_dist (m from the robot's nearest part to the object); functions abs, min, max, sqrt, "
-            "hypot; operators + - * / < <= > >= == and or not. Examples: \"balance it on its corner\" -> "
+            "(robot base), hand_dist (m from the robot's nearest part to the object); " + FUNCS_DOC + "; operators "
+            "+ - * / < <= > >= == and or not. Examples: \"balance it on its corner\" -> "
             "\"tilt_deg > 30 and speed < 0.02 and not held\"; \"put it between the bin and the wall\" -> an expression on x "
             "and y from the fixtures' extents; \"bring it to the robot\" -> \"hand_dist < 0.15\". "
             "Any condition can also say WHEN it must hold with \"when\": \"end\" (default: the final resting state), "
@@ -461,7 +471,7 @@ class ReasoningService:
             "(0 = east), speed, vx, vy, vz (its velocity, m/s), travelled (m from its start), start_x, start_y, held (1 while the robot holds it), "
             "dist_to('fixture') (m, edge to edge), robot_x, robot_y, base_z, base_tilt_deg (the robot body: 0 = level), "
             "hand_dist (m from the robot's nearest end part, e.g. fingertips or a foot, to the object's centre), "
-            "hand_x, hand_y, hand_z (that end part's position); functions abs, min, max, sqrt, hypot; operators "
+            "hand_x, hand_y, hand_z (that end part's position)" + MORE_NAMES_DOC + "; " + FUNCS_DOC + "; operators "
             "+ - * / < <= > >= == != and or not (Python syntax: never && || !, and only the names listed: the "
             "object's position is x, y, z, not object_x). Use the scene's numbers (object size, fixture extents, the "
             "target) and the realistic scales given (e.g. how close hand_dist gets when gripping: fingertips sit "
@@ -505,12 +515,12 @@ class ReasoningService:
             "close on things; legs walk and a foot pushes while the body stays level; an arm with no gripper pushes "
             "or tips. done_when is a boolean formula over these quantities: x, y, z, bottom, top, tilt_deg, yaw_deg, "
             "speed, vx, vy, vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), "
-            "robot_x, robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; functions abs, min, max, "
-            "sqrt, hypot; Python syntax (and, or, not). 2 to 6 steps; the goal checklist is checked after them. "
-            + REWARD_TERMS_DOC +
+            "robot_x, robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z" + MORE_NAMES_DOC + "; "
+            + FUNCS_DOC + "; Python syntax (and, or, not). 2 to 6 steps; the goal checklist is checked after them. "
+            + REWARD_TERMS_DOC + reward_parts_doc() +
             "Reply with ONLY one JSON object: {\"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", "
-            "\"done_when\", \"keep\"}], \"reward_terms\": [...] (optional), \"rationale\": what you changed and why, "
-            "from the measurements}."
+            "\"done_when\", \"keep\"}], \"reward_terms\": [...] (optional), \"reward_weights\": {...} (optional), "
+            "\"rationale\": what you changed and why, from the measurements}."
         )
         payload = {"robot": robot, "goal_checklist": goal, "current_steps": steps, "measured": diagnosis,
                    "realistic_scales": scales, "earlier_rounds": [{k: v for k, v in r.items() if k != "diagnosis"}
@@ -524,7 +534,10 @@ class ReasoningService:
                        "into measurable steps and reward terms (e.g. 'grab it lower' -> a step with hand_z near obj_z and a "
                        "term rewarding it), check it against the measurements, and say in the rationale how you used it, "
                        "starting with 'You said: ...'. If it can't be measured with these quantities, or it contradicts the "
-                       "goal, say so plainly and do what the measurements support instead.")
+                       "goal, say so plainly and do what the measurements support instead. A suggestion about one part "
+                       "of the reward reads 'About the reward part <part>: ...': change that part's reward_weights (less = "
+                       "about 0.5, much less = 0.2, remove = 0, more = 1.5, within its range), or for 'only once it grips "
+                       "it' lower it and add a reward term that pays the same only when grip is high.")
         if ratings:  # practice tries the person marked as looking right / wrong, each with what it measurably did
             payload["person_rated_tries"] = [{"rating": a["rating"], "what_it_did": a.get("did", {})} for a in ratings][-12:]
             system += (" The person also rated practice tries they watched (person_rated_tries: good = looks right, bad = "
@@ -545,8 +558,8 @@ class ReasoningService:
             "different rather than small variations. Rules for every plan are the same as for a single revision: "
             "2 to 6 steps, done_when is a boolean formula over: x, y, z, bottom, top, tilt_deg, yaw_deg, speed, vx, vy, "
             "vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), robot_x, "
-            "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z; abs, min, max, sqrt, hypot; Python "
-            "syntax. grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
+            "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z" + MORE_NAMES_DOC + "; " + FUNCS_DOC
+            + "; Python syntax. grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
             "how far the gripper is commanded shut. " + REWARD_TERMS_DOC + "A candidate can differ in its steps, its "
             "reward_terms, or both. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
             "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}], "

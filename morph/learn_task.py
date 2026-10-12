@@ -19,6 +19,7 @@ import mujoco
 import numpy as np
 
 from .goal_terms import History, fixtures_geometry
+from .reward_parts import view as reward_view
 from .goals import GoalSpec, check, lets_go, placement, release_spot
 from .introspect import home_qpos, profile_robot
 from .project import Project, _free_spot, _params, _start_poses
@@ -97,9 +98,11 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
                       mount=(mx, my, myaw), floating=floating, q0=q0, conditions=[c.model_dump() for c in goal.conditions],
                       scene_path=pj.scene.path, robot_name=prof.name, home=home,
                       fixtures=fixtures_geometry(pj.scene))
-    if floating:  # standing height from the model's keyframe
+    if floating:  # standing height from the model's keyframe; without one, the height at which its lowest point
+        # touches the floor (a wheeled base sits at about 0: "or 0.4" once dropped the Stretch from 40 cm)
         fj = [j for j in range(m.njnt) if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE][0]
-        task["base_z"] = float(q[m.jnt_qposadr[fj] + 2]) or 0.4
+        z = float(q[m.jnt_qposadr[fj] + 2])
+        task["base_z"] = z if z > 0.02 else _resting_height(m, q, fj)
     if gripper:
         task["gripper"] = gripper
         # a gripper snaps shut (0.2 s), as on the arm the programs run on; at the old 1 s the arm lifted before the
@@ -117,7 +120,84 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         if info.get("rationale"):
             task["steps_rationale"] = info["rationale"]
     (out / "task.json").write_text(json.dumps(task, indent=1))
+    physics_check(out / "task.json", log)
     return out / "task.json"
+
+
+def _resting_height(m: mujoco.MjModel, q, fj: int) -> float:
+    """The free base's height at which the robot's lowest collision shape just touches the floor (z = 0)."""
+    d = mujoco.MjData(m)
+    d.qpos[:] = q
+    d.qpos[m.jnt_qposadr[fj] + 2] = 0.0
+    mujoco.mj_forward(m, d)
+    low = min((float(d.geom_xpos[g][2] - _half_height(m, d, g)) for g in range(m.ngeom)
+               if (m.geom_contype[g] or m.geom_conaffinity[g]) and m.geom_type[g] != mujoco.mjtGeom.mjGEOM_PLANE),
+              default=0.0)
+    return round(max(0.0, -low) + 0.002, 4)
+
+
+def _half_height(m, d, g: int) -> float:
+    """How far a geom reaches below its centre (its bounding box, turned as it is)."""
+    h = m.geom_aabb[g][3:]
+    R = d.geom_xmat[g].reshape(3, 3)
+    return float(abs(R[2, 0]) * h[0] + abs(R[2, 1]) * h[1] + abs(R[2, 2]) * h[2] - R[2] @ m.geom_aabb[g][:3])
+
+
+def physics_check(task_path: Path, log=print, seconds: float = 3.0) -> dict:
+    """Does the robot stay still in the learner's fast physics when told to hold still? The fast physics (4 ms steps, 4
+    solver iterations, strong grip friction) suits arms, but on the Stretch's light wheels it didn't settle: they spun
+    themselves up to 300 rad/s and every practice run was the robot sliding in circles. If it drifts, the learner's
+    physics uses ordinary friction for this robot (stable at the same speed); the final tries keep the accurate physics."""
+    task = load_task(task_path)
+    tried = [{}, {"impratio": 1.0}, {"impratio": 1.0, "iterations": 20, "ls_iterations": 10}]
+    result = {}
+    for fix in tried:
+        task["physics"] = fix
+        try:
+            moved, fastest = _idle_drift(task, seconds)
+        except Exception:  # noqa: BLE001  (a model that can't even be built here: leave it to the learner)
+            return {}
+        result = {"settings": fix, "moved_m": round(moved, 3), "fastest_joint": round(fastest, 1)}
+        if moved < 0.05 and fastest < 50:
+            break
+    t = json.loads(Path(task_path).read_text())
+    if result.get("settings"):
+        t["physics"] = result["settings"]
+        log(f"  the learning physics wasn't stable for this robot (it drifted on its own); using "
+            + ", ".join(f"{k} {v:g}" for k, v in result["settings"].items()) + f": still now ({result['moved_m'] * 100:.1f} cm)")
+    else:
+        t.pop("physics", None)
+    t["physics_check"] = result
+    Path(task_path).write_text(json.dumps(t, indent=1))
+    return result
+
+
+def _idle_drift(task: dict, seconds: float) -> tuple[float, float]:
+    """(how far the robot's base, or else the object, moved; the fastest any robot joint turned) holding still."""
+    m = build_task_model(task)
+    ix = indices(m, task)
+    d = mujoco.MjData(m)
+    d.qpos[ix.home_adr] = ix.home_val
+    bx, by, byaw = task["start"]
+    d.qpos[ix.block_q:ix.block_q + 7] = [bx, by, task["block"]["half_z"], math.cos(byaw / 2), 0, 0, math.sin(byaw / 2)]
+    if ix.base >= 0:
+        mx, my, myaw = task["mount"]
+        d.qpos[ix.base_q:ix.base_q + 7] = [mx, my, task.get("base_z", 0.4), math.cos(myaw / 2), 0, 0, math.sin(myaw / 2)]
+    d.ctrl[:] = np.clip(ix.q0, ix.act_lo, ix.act_hi)
+    mujoco.mj_forward(m, d)
+    body = ix.base if ix.base >= 0 else ix.block
+    p0, fastest = d.xpos[body].copy(), 0.0
+    robot_dofs = [m.jnt_dofadr[j] for j in range(m.njnt) if m.joint(j).name.startswith("robot_")
+                  and m.jnt_type[j] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)]
+    for k in range(int(seconds / m.opt.timestep)):
+        mujoco.mj_step(m, d)
+        if k > int(0.5 / m.opt.timestep):  # after it has settled onto the floor
+            v = d.qvel[robot_dofs] if robot_dofs else np.zeros(1)
+            if not np.all(np.isfinite(v)):
+                return 1e9, 1e9
+            fastest = max(fastest, float(np.max(np.abs(v))))
+    moved = float(np.linalg.norm(d.xpos[body][:2] - p0[:2]))
+    return (moved if np.isfinite(moved) else 1e9), fastest
 
 
 def _behind(pj: Project, start, target, centre, dist: float) -> tuple[float, float]:
@@ -612,6 +692,28 @@ def diagnose(task_path: Path, policy_path: Path, n: int = 4) -> dict:
     terms = term_stats(task_path.parent, task)
     if terms:
         out["reward_terms"] = terms
+    out.update(reward_part_stats(task_path.parent, task))
+    if task.get("dropped_terms"):  # so the next revision writes them in a form Morph can measure
+        out["your_reward_terms_morph_couldnt_use"] = task["dropped_terms"]
+    return out
+
+
+def reward_part_stats(folder: Path, task: dict) -> dict:
+    """What each part of the reward (reward_parts) paid over a practice run at the start and the end of the last round,
+    the weights in use, and a possible loophole (the reward rising while the checklist doesn't)."""
+    from .reward_parts import REWARD_PARTS, loophole, part_totals, weights
+    meta = json.loads((folder / "train_meta.json").read_text()) if (folder / "train_meta.json").exists() else {}
+    curve = [c for c in meta.get("curve", []) if c.get("parts")]
+    if not curve:
+        return {}
+    a, b = part_totals(curve[0], task), part_totals(curve[-1], task)
+    w = weights(task)
+    out = {"reward_parts": [{"part": k, "what": REWARD_PARTS[k][0] if k in REWARD_PARTS else "Nemotron's term",
+                             "weight": w.get(k, 1.0), "total_per_run_at_start": a.get(k), "total_per_run_at_end": b[k]}
+                            for k in b]}
+    hole = loophole(curve, task)
+    if hole:
+        out["possible_loophole"] = hole["text"]
     return out
 
 
@@ -638,18 +740,28 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
     prof = profile_robot(task["robot_xml"])
     p = placement(goal, scene)
     errors, fix = [], None
-    for _ in range(2):
+    for attempt in range(2):
         prop, rec = llm.revise_steps(robot_brief(prof), [c.describe() for c in goal.conditions], task.get("steps", []),
                                      diagnosis, scales(scene, p), rounds, fix, advice=advice, ratings=ratings)
         raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
         new, errors = check_steps(raw, list(scene.fixtures), scene.object_name)
         terms, t_err = check_terms(prop.reward_terms, list(scene.fixtures), scene.object_name)
-        errors += t_err
+        if attempt == 0:  # asked once to fix them; after that the plan is kept without the terms Morph can't measure
+            errors += t_err
+        elif t_err:
+            log(f"  (left out a reward term Morph couldn't measure: {t_err[0]})")
+        from .reward_parts import check_weights
+        wts, w_err = check_weights(prop.reward_weights, task)
+        errors += w_err
         if body_only(goal):
             errors += object_steps(new)
         if new and not errors:
             task["steps"] = [s.model_dump() for s in new]
             task["reward_terms"] = terms
+            task["dropped_terms"] = t_err if attempt else []
+            if wts != (task.get("reward_weights") or {}):
+                log("  reward weights now: " + ", ".join(f"{k} ×{v:g}" for k, v in wts.items()))
+            task["reward_weights"] = wts
             task["steps_from"] = f"nemotron, revised after round {len(rounds)}"
             task_path.write_text(json.dumps(task, indent=1))
             return {"steps": task["steps"], "rationale": prop.rationale}
@@ -713,7 +825,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         emit(type="learn_round", round=r, rounds=rounds, stage="advice", said=said, rationale=why)
         if rev:
             t = load_task(task_path)
-            emit(type="skill_steps", robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+            emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
                  rationale=why)
         return bool(rev)
 
@@ -788,7 +900,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             if chosen:
                 history[-1]["revision"] = f"best of {chosen['tried']} plans: {chosen['idea']}"
                 t = load_task(task_path)
-                emit(type="skill_steps", robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
                      rationale=chosen["idea"])
                 best = _keep_best(task_path, chosen["result"], best, f"best plan after round {r}")
                 if chosen["result"]["success"] >= math.ceil(0.6 * tries):  # the search itself got there
@@ -805,7 +917,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
                 history[-1]["revision"] = rev["rationale"]
                 log(f"  Nemotron revised the steps: {rev['rationale'][:300]}")
                 t = load_task(task_path)
-                emit(type="skill_steps", robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
                      rationale=rev["rationale"])
                 emit(type="learn_round", round=r, rounds=rounds, stage="revised", rationale=rev["rationale"])
     if best is not None and _fitness(task_path.parent, res) < best[0]:  # a later round did worse: go back
@@ -1160,9 +1272,11 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
         ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name)
         terms, t_err = check_terms(c.get("reward_terms"), list(pj.scene.fixtures), pj.scene.object_name)
-        errors += t_err
-        if ok and not errors:
-            plans.append({"idea": str(c.get("idea", ""))[:200], "steps": [s.model_dump() for s in ok], "reward_terms": terms})
+        if ok and not errors:  # a reward term Morph can't measure is left out; the plan itself is still tried
+            plans.append({"idea": str(c.get("idea", ""))[:200], "steps": [s.model_dump() for s in ok], "reward_terms": terms,
+                          "dropped_terms": t_err})
+            if t_err:
+                log(f"  (a proposed plan is tried without a reward term Morph couldn't measure: {t_err[0]})")
         else:
             log(f"  (a proposed plan couldn't be measured: {'; '.join(errors[:1])})")
     if len(plans) == 1:
@@ -1177,7 +1291,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         for f in ("demo.npz", "starts.npz"):  # the same demonstration and practice starts
             if (main / f).exists():
                 shutil.copy(main / f, cdir / f)
-        t = dict(task, steps=plan["steps"], reward_terms=plan["reward_terms"])
+        t = dict(task, steps=plan["steps"], reward_terms=plan["reward_terms"], dropped_terms=plan.get("dropped_terms", []))
         (cdir / "task.json").write_text(json.dumps(t, indent=1))
         log(f"  candidate {i + 1}/{len(plans)}: {plan['idea']}")
         if not train(cdir / "task.json", steps_each, main / "params.pkl"):
