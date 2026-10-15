@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import zipfile
@@ -363,7 +364,8 @@ def test_a_suggestion_about_a_reward_part_changes_its_weight(tmp_path, monkeypat
 def test_a_wheeled_robot_starts_on_the_floor_and_holds_still_in_the_learning_physics(tmp_path, monkeypatch):
     """The Stretch was dropped from 40 cm (its keyframe height 0 read as "missing"), counted as fallen every moment (so
     every practice run ended at once), and its light wheels spun themselves up in the fast learning physics: in
-    practice it only went in circles. Arms keep the physics they had."""
+    practice it only went in circles. The learning physics now uses ordinary friction for every new task (with strong
+    grip friction a held parcel also slid out of the Panda's fingers)."""
     import json as _json
     import morph.learn_task as lt
     monkeypatch.setattr(lt, "LEARNED", tmp_path)
@@ -376,4 +378,34 @@ def test_a_wheeled_robot_starts_on_the_floor_and_holds_still_in_the_learning_phy
     assert t["physics_check"]["moved_m"] < 0.05 and t["physics"]  # needed (and got) steadier physics
     arm = _json.loads(make_task(pj, goal, str(men / "franka_emika_panda" / "panda.xml"), plan=False,
                                 folder=tmp_path / "panda").read_text())
-    assert "physics" not in arm and arm["physics_check"]["moved_m"] < 0.05
+    assert arm["physics"] == {"impratio": 1.0} and arm["physics_check"]["moved_m"] < 0.05
+
+
+def test_a_hand_space_policy_exports_and_runs_the_same_outside_morph(tmp_path, monkeypatch):
+    """A policy that moves the hand (not the joints) is run the same way by Morph, run_policy.py and the ROS 2 core."""
+    import morph.learn_task as lt
+    from morph.task_model import apply_action
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    pj = load_project(ROOT / "examples" / "parcel")
+    goal = goal_from_description_rules("lift the parcel 10 cm off the ground and hold it there", pj.scene)
+    task_path = make_task(pj, goal, str(ROOT / "third_party/mujoco_menagerie/franka_emika_panda/panda.xml"), plan=False)
+    assert lt.use_hand_space(task_path, log=lambda s: None)
+    task = load_task(task_path)
+    m = build_task_model(task, accurate=True)
+    ix = indices(m, task)
+    _random_policy(task_path.parent, obs_size(ix), m.nu)
+    export(task_path)
+    out = task_path.parent / "export"
+    assert json.loads((out / "policy.json").read_text())["hand_space"]["slots"]
+    r = subprocess.run([sys.executable, "run_policy.py"], cwd=out, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and "object ended at" in r.stdout, r.stderr[-800:]
+    pkg = next((out / "ros2").iterdir())
+    spec = importlib.util.spec_from_file_location("policy_core", pkg / pkg.name / "policy_core.py")
+    core_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core_mod)
+    core = core_mod.MorphPolicy(pkg / "policy")
+    c_ros = core.step()  # one step from the start, in the core's own mirror of the robot
+    a = core.last
+    prev = np.clip(core.d.actuator_length * core.mask, core.lo, core.hi)
+    want = apply_action(np, prev, a, core.q0, ix, core.d)
+    assert np.allclose(c_ros, want, atol=1e-6)

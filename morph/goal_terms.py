@@ -512,3 +512,123 @@ def fixtures_geometry(scene) -> dict:
                   "inner_hi": [float(a) for a in (f.inner_hi if f.inner_hi is not None else f.hi)],
                   "top_z": float(f.top_z), "rest_z": float(f.rest_z)}
     return out
+
+
+# ------------------------------------------------------------------ formulas in plain words (for the app)
+# quantity -> (words, unit): "m" is shown in cm, "deg" in degrees, "frac" 0..1, "flag" yes / no, "" as is
+WORDS = {
+    "x": ("the object's x", "m"), "y": ("the object's y", "m"), "z": ("the object's centre height", "m"),
+    "bottom": ("the object's bottom", "m"), "top": ("the object's top", "m"),
+    "tilt_deg": ("the object's tilt", "deg"), "yaw_deg": ("the object's heading", "deg"),
+    "roll_deg": ("the object's roll", "deg"), "pitch_deg": ("the object's pitch", "deg"),
+    "speed": ("the object's speed", "m/s"), "vx": ("its speed east", "m/s"), "vy": ("its speed north", "m/s"),
+    "vz": ("its speed up", "m/s"), "travelled": ("how far it has moved", "m"),
+    "held": ("the robot holding it", "flag"), "grip": ("the grip score (0 to 1)", "frac"),
+    "closure": ("the gripper closed", "pct"), "touch_dist": ("the nearest fingertip's gap to it", "m"),
+    "lifted": ("it lifted", "m"), "hand_dist": ("the hand's distance to it", "m"),
+    "hand_x": ("the hand's x", "m"), "hand_y": ("the hand's y", "m"), "hand_z": ("the hand's height", "m"),
+    "robot_x": ("the robot's x", "m"), "robot_y": ("the robot's y", "m"), "base_z": ("the robot body's height", "m"),
+    "base_tilt_deg": ("the robot body's tilt", "deg"), "spin_dps": ("how fast it spins", "deg/s"),
+    "goal_x": ("the goal's x", "m"), "goal_y": ("the goal's y", "m"), "goal_z": ("the goal's height", "m"),
+}
+_OPS = {ast.Lt: "under", ast.LtE: "at most", ast.Gt: "over", ast.GtE: "at least", ast.Eq: "about", ast.NotEq: "not"}
+
+
+def describe_formula(expr: str, object_name: str = "the object") -> str:
+    """A step's done_when / keep in plain words: "hand_dist < 0.3 and base_tilt_deg < 10" -> "the hand's distance to the
+    parcel under 30 cm and the robot body's tilt under 10°". Parts it can't put simply are shown as written."""
+    try:
+        tree = ast.parse(normalize(expr, object_name if object_name != "the object" else ""), mode="eval").body
+    except SyntaxError:
+        return str(expr)
+    obj = object_name if object_name.startswith("the ") else f"the {object_name}"
+
+    def word(n) -> tuple[str, str] | None:
+        if isinstance(n, ast.Name) and n.id in WORDS:
+            w, u = WORDS[n.id]
+            w = w.replace("the object", obj)
+            return (obj + w[2:] if w.startswith("it ") else w.replace(" it", f" {obj}")), u
+        if isinstance(n, ast.Name) and _fixture_attr(n.id, {n.id.rsplit("_", 1)[0]}):
+            f, a = n.id.rsplit("_", 1)
+            return f"the {f}'s {'top' if a == 'top' else a}", "m"
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "hypot" and len(n.args) == 2
+                and all(isinstance(a, ast.BinOp) and isinstance(a.op, ast.Sub) and isinstance(a.left, ast.Name)
+                        and isinstance(a.right, ast.Name) for a in n.args)):  # hypot(x - goal_x, y - goal_y)
+            def thing(name: str) -> str:
+                base = name[:-2] if name.endswith(("_x", "_y")) else ""
+                return {"": obj, "hand": "the hand", "robot": "the robot", "goal": "the goal",
+                        "start": "where it started"}.get(base, f"the {base}")
+            return f"{thing(n.args[0].left.id)}'s distance to {thing(n.args[0].right.id)}", "m"
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "dist_to" and n.args:
+            a = n.args[0]
+            return f"{obj}'s distance to the {a.value if isinstance(a, ast.Constant) else getattr(a, 'id', '?')}", "m"
+        return None
+
+    def number(v: float, unit: str) -> str:
+        if unit == "m":
+            return f"{v * 100:.3g} cm"
+        if unit == "deg":
+            return f"{v:.3g}°"
+        if unit == "frac":
+            return f"{v:.2g}"
+        if unit == "pct":
+            return f"{v * 100:.0f}%"
+        return f"{v:.3g}" + (f" {unit}" if unit not in ("", "flag") else "")
+
+    def value(n, unit: str) -> str | None:
+        """A side of a comparison: a quantity, a number (in the other side's unit), or one plus or minus a number."""
+        w = word(n)
+        if w:
+            return w[0]
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return number(float(n.value), unit)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant):
+            return number(-float(n.operand.value), unit)
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
+            a, b = value(n.left, unit), value(n.right, unit)
+            if a and b:
+                return f"{a} {'+' if isinstance(n.op, ast.Add) else '−'} {b}"
+        return None
+
+    def unit_of(n) -> str:
+        for x in ast.walk(n):
+            w = word(x)
+            if w:
+                return w[1]
+        return ""
+
+    def text(n) -> str:
+        if isinstance(n, ast.BoolOp):
+            return (" and " if isinstance(n.op, ast.And) else " or ").join(text(v) for v in n.values)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            w = word(n.operand)
+            if w and w[1] == "flag":  # "not held"
+                return w[0].replace("the robot holding", "the robot not holding")
+            return f"not ({text(n.operand)})"
+        w = word(n)
+        if w and w[1] == "flag":  # a bare "held"
+            return w[0]
+        if isinstance(n, ast.Compare) and len(n.ops) == 1:
+            left, right, op = n.left, n.comparators[0], type(n.ops[0])
+            const = right.value if isinstance(right, ast.Constant) and isinstance(right.value, (int, float)) else None
+            w = word(left)
+            if w and const is not None:
+                if w[1] == "flag":
+                    on = (op in (ast.Eq, ast.GtE, ast.Gt) and const >= 0.5) or (op in (ast.Lt, ast.LtE, ast.NotEq) and const <= 0.5)
+                    return w[0] if on else w[0].replace("the robot holding", "the robot not holding")
+                return f"{w[0]} {_OPS[op]} {number(float(const), w[1])}"
+            # abs(a - b) < c: a within c of b
+            if (isinstance(left, ast.Call) and isinstance(left.func, ast.Name) and left.func.id == "abs" and left.args
+                    and isinstance(left.args[0], ast.BinOp) and isinstance(left.args[0].op, ast.Sub)
+                    and op in (ast.Lt, ast.LtE) and const is not None):
+                u = unit_of(left)
+                a, b = value(left.args[0].left, u), value(left.args[0].right, u)
+                if a and b:
+                    return f"{a} within {number(float(const), u)} of {b}"
+            u = unit_of(n)
+            a, b = value(left, u), value(right, u)
+            if a and b:
+                return f"{a} {_OPS[op]} {b}"
+        return ast.unparse(n)
+
+    return text(tree)

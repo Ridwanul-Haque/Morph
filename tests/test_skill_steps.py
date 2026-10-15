@@ -105,3 +105,18 @@ def test_a_loosely_written_step_is_still_a_step():
     from morph.skill_steps import Step
     s = Step(name="x" * 120, done_when="touch_dist < 0.02", keep=False, body_parts="gripper", how=None)
     assert s.keep == "" and s.body_parts == ["gripper"] and len(s.name) == 80 and s.how == ""
+
+
+def test_steps_are_shown_in_plain_words_so_a_person_can_spot_a_wrong_one():
+    from morph.goal_terms import describe_formula
+    from morph.skill_steps import steps_with_words
+    d = lambda e: describe_formula(e, "parcel")  # noqa: E731
+    assert d("hand_dist < 0.3 and base_tilt_deg < 10") == "the hand's distance to the parcel under 30 cm and the robot body's tilt under 10°"
+    assert d("held == 1 and lifted > 0.03") == "the robot holding the parcel and the parcel lifted over 3 cm"
+    assert d("not held") == "the robot not holding the parcel"
+    assert d("abs(x - bin_x) < 0.05") == "the parcel's x within 5 cm of the bin's x"
+    assert d("hypot(x - goal_x, y - goal_y) < 0.03") == "the parcel's distance to the goal under 3 cm"
+    assert d("closure > 0.6") == "the gripper closed over 60%"
+    assert d("sqrt(vx * vx) > 1") == "sqrt(vx * vx) > 1"  # what it can't put simply is shown as written
+    s = steps_with_words([{"name": "lift", "done_when": "lifted > 0.05", "keep": "tilt_deg < 20"}], "pen")
+    assert s[0]["done_words"] == "the pen lifted over 5 cm" and s[0]["keep_words"] == "the pen's tilt under 20°"

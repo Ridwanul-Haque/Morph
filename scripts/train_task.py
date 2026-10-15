@@ -40,7 +40,8 @@ from mujoco_playground.config import locomotion_params  # noqa: E402
 from morph.goal_terms import (BODY_FUNCS, HOLD_TICKS, condition_violation, is_generic, is_temporal, normalize,  # noqa: E402
                               parse, term_value, uses, violation)
 from morph.reward_parts import weights as reward_weights  # noqa: E402
-from morph.task_model import (CTRL_DT, SIM_DT, Residual, build_task_model, indices, load_task, measure, next_ctrl,  # noqa: E402
+from morph.task_model import (CTRL_DT, SIM_DT, Residual, apply_action, build_task_model, indices, load_task, measure,  # noqa: E402
+                              next_ctrl,  # noqa: E402
                               obs_size, observe, soft)  # noqa: E402
 
 
@@ -351,7 +352,10 @@ class TaskLearn(mjx_env.MjxEnv):
         applied = action + state.info["delay"] * (state.info["last_act"] - action)
         if self.residual is not None:
             applied = self.residual.action(jp, state.info["t"], applied)
-        ctrl = next_ctrl(jp, state.info["ctrl"], applied, self._ctrl0, self.scale, self._lo, self._hi, self._step)
+        if self.ix.hand is None:
+            ctrl = next_ctrl(jp, state.info["ctrl"], applied, self._ctrl0, self.scale, self._lo, self._hi, self._step)
+        else:  # acting in hand space: the arm's slots move the hand; Morph's Jacobian step turns that into joint targets
+            ctrl = apply_action(jp, state.info["ctrl"], applied, self._ctrl0, self.ix, state.data)
         data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
         ix, info = self.ix, state.info
         d, track = self._dist(data, info)
@@ -556,6 +560,12 @@ def main():
     print(json.dumps({"obs": n_obs, "actions": env.nu, "residual": env.residual is not None, "tips": [env.mj_model.body(int(b)).name for b in env.ix.tips]}),
           flush=True)
     p = locomotion_params.brax_ppo_config("Go1JoystickFlatTerrain")
+    if task.get("ppo") == "manipulation":
+        # an arm or a gripper (make_task): settings after MuJoCo Playground's tuned PandaPickCube ones. The moment that
+        # matters (fingers round it) rarely happens by chance: explore more, and learn more from each batch once it does.
+        # The network keeps Morph's size (Playground's 32-wide policy is too small for several steps in a row)
+        p.learning_rate, p.entropy_cost, p.unroll_length = 1e-3, 2e-2, 10
+        p.batch_size, p.num_minibatches, p.num_updates_per_batch = 512, 32, 8
     p.num_timesteps, p.num_envs, p.num_evals = a.steps, a.envs, a.evals
     p.episode_length = int(task["episode_s"] / CTRL_DT)
     net = dict(p.network_factory)

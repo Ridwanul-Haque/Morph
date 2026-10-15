@@ -328,3 +328,18 @@ class StepTracker:
             return ""
         nxt = f"; stuck at: {self.steps[self.reached][0]}" if self.reached < len(self.steps) else ""
         return f"reached {self.reached} of {len(self.steps)} steps{nxt}"
+
+
+def steps_with_words(steps: list[dict], object_name: str = "the object") -> list[dict]:
+    """The steps as the app shows them: each with its done_when / keep in plain words (so a person can see when a step
+    was understood wrongly, and say so)."""
+    from .goal_terms import describe_formula
+    out = []
+    for s in steps:
+        s = dict(s)
+        if s.get("done_when"):
+            s["done_words"] = describe_formula(s["done_when"], object_name)
+        if s.get("keep"):
+            s["keep_words"] = describe_formula(s["keep"], object_name)
+        out.append(s)
+    return out

@@ -88,7 +88,8 @@ class MorphPolicy:
         self.target = np.array(self.spec["target"][:3])
         self.tyaw = self.spec["target"][3]
         self.floating = ix["base"] >= 0
-        self.max_step = np.asarray(self.spec["max_step"]) * min(max(speed_scale, 0.05), 1.0)
+        self.speed = min(max(speed_scale, 0.05), 1.0)  # start lower on hardware
+        self.max_step = np.asarray(self.spec["max_step"]) * self.speed
         # input frame -> scene frame: a bolted-down robot's base sits at the training mount
         mx, my, myaw = self.spec["mount"]
         self.to_scene = Frame2D(*scene_origin).inverse() if self.floating else Frame2D(mx, my, myaw)
@@ -173,6 +174,18 @@ class MorphPolicy:
         self.t += 1
         want = np.clip(self.q0 + a * np.asarray(self.spec["action_scale"]), self.lo, self.hi)
         self.ctrl = self.ctrl + np.clip(want - self.ctrl, -self.max_step, self.max_step)
+        hs = self.spec.get("hand_space")
+        if hs:  # the arm acts in hand space (policy.json "hand_space"): its slots move the hand
+            d, jids = self.d, np.array(hs["jids"])
+            p = d.xpos[hs["body"]] + d.xmat[hs["body"]].reshape(3, 3) @ np.array(hs["offset"])
+            ax, r, hinge = d.xaxis[jids], p - d.xanchor[jids], np.array(hs["hinge"])[:, None]
+            J = np.concatenate([(hinge * np.cross(ax, r) + (1 - hinge) * ax).T, (hinge * ax).T])
+            s = a[np.array(hs["slots"])]
+            v = np.concatenate([s[:3] * hs["step"], s[3:6] * hs["turn"]]) * self.speed
+            dq = J.T @ np.linalg.solve(J @ J.T + hs["damp"] ** 2 * np.eye(6), v)
+            q = np.clip(d.qpos[np.array(hs["qadr"])] + hs["lead"] * dq, hs["jlo"], hs["jhi"]) * np.array(hs["gear"])
+            acts = np.array(hs["acts"])
+            self.ctrl[acts] = np.clip(q, self.lo[acts], self.hi[acts])
         return self.ctrl.copy()
 
     def distance(self):

@@ -281,7 +281,7 @@ class App:
         task = make_task(self.project, self.goal, self.resolve(path), llm=self.reasoning() if use_llm else None,
                          log=logs.append, stand_at=self.placements.get(path))
         self.planned[(path, id(self.goal))] = task
-        return steps_view(task) | {"log": logs}
+        return steps_view(task, self.project.scene.object_name) | {"log": logs}
 
     def _practice_loop(self):
         from ..learn_task import practice_run
@@ -552,9 +552,10 @@ def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, q
     return code, oom
 
 
-def steps_view(task: Path) -> dict:
+def steps_view(task: Path, object_name: str = "the object") -> dict:
+    from ..skill_steps import steps_with_words
     t = json.loads(task.read_text())
-    steps = t.get("steps", []) + ([t["steps_final"]] if t.get("steps_final") else [])
+    steps = steps_with_words(t.get("steps", []) + ([t["steps_final"]] if t.get("steps_final") else []), object_name)
     from ..reward_parts import view
     return {"robot": t["robot"], "steps": steps, "from": t.get("steps_from", ""), "rationale": t.get("steps_rationale", ""),
             **view(t)}
@@ -577,7 +578,7 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
         app.send(type="log", text=f"Learning starts from Nemotron's program (it worked {prep['program_trials']}); "
                                   "the learner copies it first, then practises")
     robot = json.loads(task.read_text())["robot"]
-    app.send(type="skill_steps", **steps_view(task))
+    app.send(type="skill_steps", **steps_view(task, pj.scene.object_name))
     if app.compute["mode"] == "cloud":
         app.send(type="cloud_job", robot=robot, **cloud_task_job(str(task), robot, app.compute["gpu"], steps, randomize))
         return

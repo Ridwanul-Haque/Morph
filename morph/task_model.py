@@ -45,6 +45,72 @@ def next_ctrl(xp, prev, action, q0, scale, lo, hi, step=MAX_STEP):
     return prev + xp.clip(want - prev, -step, step)
 
 
+# ------------------------------------------------------------------ acting in hand space
+HAND_STEP = 0.01  # m per control step for a full action (about 0.35 m/s once the motors follow)
+HAND_TURN = 0.05  # rad it may turn per step (2.5 rad/s)
+HAND_DAMP = 0.05  # damped least squares: no wild joint jumps near a singular pose
+HAND_LEAD = 2.0  # the joint targets lead the measured pose by this many steps' worth of the move
+
+
+def hand_ctrl(xp, prev, action, xpos, xmat, xanchor, xaxis, qpos, hand: dict):
+    """Hand-space actions (task["action_space"] == "hand"): the arm's action slots say which way the hand moves and turns
+    (x, y, z in metres, then about x, y, z, in the world frame); Morph turns that into joint targets with one damped
+    least-squares step of the arm's Jacobian (built from each joint's axis and anchor: exact for hinge and slide joints,
+    the same in NumPy and JAX).
+    Returns the new commands for the arm's actuators. Same code for training (JAX) and trying / export (NumPy)."""
+    b = hand["body"]
+    p = xpos[b] + xmat[b].reshape(3, 3) @ hand["offset"]
+    ax = xaxis[hand["jids"]]  # (n, 3)
+    r = p - xanchor[hand["jids"]]
+    hinge = hand["hinge"][:, None]
+    jp_ = hinge * xp.cross(ax, r) + (1 - hinge) * ax
+    jr = hinge * ax
+    J = xp.concatenate([jp_.T, jr.T], axis=0)  # (6, n)
+    a = action[hand["slots"]]  # the arm's first six action slots
+    v = xp.concatenate([a[:3] * HAND_STEP, a[3:6] * HAND_TURN])
+    dq = J.T @ xp.linalg.solve(J @ J.T + HAND_DAMP ** 2 * xp.eye(6), v)
+    # from where the arm IS (its Jacobian is for that pose; stepping from the commands, which the motors lag by up to
+    # 0.25 rad, bent a straight move 35° off), leading by HAND_LEAD steps so the lagging motors still keep pace.
+    # Bolted-down arms are gravity compensated, so aiming at the pose they're in doesn't let them sag
+    q_new = xp.clip(qpos[hand["qadr"]] + HAND_LEAD * dq, hand["jlo"], hand["jhi"])
+    return q_new * hand["gear"]
+
+
+def apply_action(xp, prev, action, q0, ix, data=None):
+    """The commands for this step, whichever way the task's policy acts: joint targets (next_ctrl) or, for a task that
+    acts in hand space, the hand's moves for the arm and the joint way for everything else (gripper, base, head)."""
+    c = next_ctrl(xp, prev, action, q0, ix.act_scale, ix.act_lo, ix.act_hi, ix.act_step)
+    h = ix.hand
+    if h is None or data is None:
+        return c
+    arm = xp.clip(hand_ctrl(xp, prev, action, data.xpos, data.xmat, data.xanchor, data.xaxis, data.qpos, h),
+                  ix.act_lo[h["acts"]], ix.act_hi[h["acts"]])
+    if xp is np:
+        c = c.copy()
+        c[h["acts"]] = arm
+        return c
+    return c.at[h["acts"]].set(arm)
+
+
+def hand_space(task: dict) -> dict | None:
+    """What acting in hand space needs, for a bolted-down arm whose gripping hand is moved by at least six position-
+    controlled joints (fewer can't move a hand in all six directions): stored on the task by make_task."""
+    from .body_programs import BodyRunner
+    if task.get("floating"):
+        return None
+    try:
+        rn = BodyRunner(task)
+    except Exception:  # noqa: BLE001
+        return None
+    hand = next((p for p in rn.parts.values() if p.can_grip), None)
+    if hand is None or len(hand.joints) < 6:
+        return None
+    m2 = rn.m
+    return {"body": m2.body(hand.body).name, "offset": [float(v) for v in hand.offset],
+            "joints": [m2.joint(j).name for j in hand.joints], "acts": [m2.actuator(a).name for a in hand.acts],
+            "gears": [float(g) for g in hand.gears]}
+
+
 def load_task(path: str | Path) -> dict:
     task = json.loads(Path(path).read_text())
     task["_dir"] = str(Path(path).resolve().parent)  # where its files are (demo.npz, starts.npz): always its own folder
@@ -149,6 +215,7 @@ class Indices:
     jnt_lo: np.ndarray | None = None  # the robot's joints' ranges (home_adr order), for goals about its own body
     jnt_hi: np.ndarray | None = None
     tip_names: list | None = None  # the end parts' names (tips order, without robot_)
+    hand: dict | None = None  # acting in hand space (hand_ctrl): the arm's joints, actuators and the hand's point
 
 
 def is_position(m: mujoco.MjModel, a: int) -> bool:
@@ -207,13 +274,30 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
     rng = [(m.jnt_range[j][0], m.jnt_range[j][1]) if m.jnt_limited[j] and m.jnt_range[j][1] > m.jnt_range[j][0]
            else (-math.pi, math.pi) for j in js]
     ix_extra = dict(jnt_lo=np.array([r[0] for r in rng]), jnt_hi=np.array([r[1] for r in rng]),
-                    tip_names=[m.body(int(b)).name.removeprefix("robot_") for b in tips])
+                    tip_names=[m.body(int(b)).name.removeprefix("robot_") for b in tips], hand=_hand_indices(m, task))
     return Indices(home_adr, np.array(vals, dtype=float), joint_vadr, names, np.array(task["q0"]), pos_mask,
                    np.array(tips, dtype=int), base, base_q, base_v,
                    int(m.body("block").id), int(bj.qposadr[0]), int(bj.dofadr[0]), np.array(lo), np.array(hi), tip_off,
                    np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] in set(robot_bodies)], dtype=int),
                    np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] == m.body("block").id], dtype=int), *grip,
                    act_scale, act_step, **ix_extra)
+
+
+def _hand_indices(m: mujoco.MjModel, task: dict) -> dict | None:
+    hs = task.get("hand_space")
+    if task.get("action_space") != "hand" or not hs:
+        return None
+    try:
+        jids = np.array([m.joint(n).id for n in hs["joints"]], dtype=int)
+        acts = np.array([m.actuator(n).id for n in hs["acts"]], dtype=int)
+    except KeyError:
+        return None
+    lo = np.array([m.jnt_range[j][0] if m.jnt_limited[j] else -math.pi for j in jids])
+    hi = np.array([m.jnt_range[j][1] if m.jnt_limited[j] else math.pi for j in jids])
+    return {"body": int(m.body(hs["body"]).id), "offset": np.array(hs["offset"]), "jids": jids, "acts": acts,
+            "qadr": np.array([m.jnt_qposadr[j] for j in jids], dtype=int),
+            "hinge": np.array([1.0 if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE else 0.0 for j in jids]),
+            "gear": np.array(hs["gears"]), "jlo": lo, "jhi": hi, "slots": acts[:6]}
 
 
 def action_units(m: mujoco.MjModel, scale: float) -> tuple[np.ndarray, np.ndarray]:

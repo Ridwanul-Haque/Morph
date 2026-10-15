@@ -20,13 +20,14 @@ import numpy as np
 
 from .goal_terms import History, fixtures_geometry
 from .reward_parts import view as reward_view
+from .skill_steps import steps_with_words
 from .goals import GoalSpec, check, lets_go, placement, release_spot
 from .introspect import home_qpos, profile_robot
 from .project import Project, _free_spot, _params, _start_poses
 from .robot_import import import_robot
 from .sim import SimulationEnvironment, SimulationUnstable
 from .skill_steps import StepTracker, plan_steps
-from .task_model import (CTRL_DT, MAX_STEP, Residual, build_task_model, contact_held, indices, load_task, measure,
+from .task_model import (CTRL_DT, MAX_STEP, Residual, apply_action, build_task_model, contact_held, indices, load_task, measure,
                          next_ctrl, observe, write_task)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,8 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         task["gripper_ticks"] = 10
     if not floating:  # like the arm the programs run on (and real arm controllers): gravity compensated
         task["gravcomp"] = True
+        # (task["ppo"] = "manipulation" switches an arm to Playground's manipulation settings; not the default: on the
+        # Panda bin task it levelled off lower than the walking settings, 8.3 against 10.8, and gripped no better)
     task["placed_by_user"] = placed
     task["critic_extras"] = True  # the critic sees grip, progress and this copy's physics (train_task._critic_extras)
     if plan:
@@ -121,7 +124,40 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
             task["steps_rationale"] = info["rationale"]
     (out / "task.json").write_text(json.dumps(task, indent=1))
     physics_check(out / "task.json", log)
+    if not floating:  # how its hand could be moved directly (acting in hand space, if it learns from scratch)
+        from .task_model import hand_space
+        hs = hand_space(load_task(out / "task.json"))
+        if hs:
+            t = json.loads((out / "task.json").read_text())
+            t["hand_space"] = hs
+            (out / "task.json").write_text(json.dumps(t, indent=1))
+    if gripper:
+        _calibrate_grip(out / "task.json", pj, log)
     return out / "task.json"
+
+
+def _calibrate_grip(task_path: Path, pj: Project, log=print) -> None:
+    """Morph's grip test (body_programs.calibrate_grip) on every task with a gripper: how firmly to squeeze to lift this
+    object. Learning from scratch used to keep the model's default squeeze, and on the Panda that couldn't lift the parcel
+    at all (3 cm against 21 cm with the tested grip, in both physics): practice got its hand round the parcel and closed
+    it every time and never once lifted it. A program that works later keeps the grip it ran with."""
+    from .body_programs import BodyRunner, calibrate_grip
+    t = json.loads(Path(task_path).read_text())
+    if t.get("gripper", {}).get("calibrated"):
+        return
+    try:
+        rn = BodyRunner(load_task(task_path))
+        if not any(p_.can_grip for p_ in rn.parts.values()):
+            return
+        k = calibrate_grip(rn, pj.scene, log=lambda s: None)
+    except Exception as e:  # noqa: BLE001  (a gripper Morph can't test: the model's own squeeze, as before)
+        log(f"  (couldn't test the grip: {type(e).__name__})")
+        return
+    t["gripper"]["gain_scale"] = float(t["gripper"].get("gain_scale", 1.0)) * k
+    t["gripper"]["calibrated"] = True
+    Path(task_path).write_text(json.dumps(t, indent=1))
+    if k != 1:
+        log(f"  grip test: squeezing {k:g}x the model's default to lift the {pj.scene.object_name}")
 
 
 def _resting_height(m: mujoco.MjModel, q, fj: int) -> float:
@@ -144,12 +180,16 @@ def _half_height(m, d, g: int) -> float:
 
 
 def physics_check(task_path: Path, log=print, seconds: float = 3.0) -> dict:
-    """Does the robot stay still in the learner's fast physics when told to hold still? The fast physics (4 ms steps, 4
-    solver iterations, strong grip friction) suits arms, but on the Stretch's light wheels it didn't settle: they spun
-    themselves up to 300 rad/s and every practice run was the robot sliding in circles. If it drifts, the learner's
-    physics uses ordinary friction for this robot (stable at the same speed); the final tries keep the accurate physics."""
+    """The learner's fast physics for this robot (4 ms steps, 4 solver iterations): ordinary friction (the strong grip
+    friction let grips slide out, and spun the Stretch's light wheels up to 300 rad/s: every practice run was the robot
+    sliding in circles), checked by holding the robot still for a few seconds; more solver iterations if it still
+    drifts. The final tries keep the accurate physics."""
     task = load_task(task_path)
-    tried = [{}, {"impratio": 1.0}, {"impratio": 1.0, "iterations": 20, "ls_iterations": 10}]
+    # ordinary friction first: the strong grip friction (impratio 10) needs far more solver iterations than the fast
+    # physics has, and with 4 a held parcel slid out of the Panda's fingers in every one of 41 held states within a
+    # second, holding still (41 of 41 stayed held with impratio 1): learning could never find a grip. The final tries
+    # keep the accurate physics (strong friction, 50 iterations), where all 41 hold too.
+    tried = [{"impratio": 1.0}, {"impratio": 1.0, "iterations": 20, "ls_iterations": 10}]
     result = {}
     for fix in tried:
         task["physics"] = fix
@@ -161,12 +201,10 @@ def physics_check(task_path: Path, log=print, seconds: float = 3.0) -> dict:
         if moved < 0.05 and fastest < 50:
             break
     t = json.loads(Path(task_path).read_text())
-    if result.get("settings"):
-        t["physics"] = result["settings"]
+    t["physics"] = result.get("settings") or tried[0]
+    if len(t["physics"]) > 1:
         log(f"  the learning physics wasn't stable for this robot (it drifted on its own); using "
-            + ", ".join(f"{k} {v:g}" for k, v in result["settings"].items()) + f": still now ({result['moved_m'] * 100:.1f} cm)")
-    else:
-        t.pop("physics", None)
+            + ", ".join(f"{k} {v:g}" for k, v in t["physics"].items()) + f": still now ({result['moved_m'] * 100:.1f} cm)")
     t["physics_check"] = result
     Path(task_path).write_text(json.dumps(t, indent=1))
     return result
@@ -304,7 +342,7 @@ def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), set
             last = a
             if residual is not None:
                 a = residual.action(np, t, a)
-            ctrl = next_ctrl(np, ctrl, a, ctrl0, ix.act_scale, ix.act_lo, ix.act_hi, ix.act_step)
+            ctrl = apply_action(np, ctrl, a, ctrl0, ix, d)  # joint targets, or the hand's moves (hand space)
             if disturb is not None and t == disturb[0]:  # a bump: the object suddenly gets this velocity (m/s)
                 d.qvel[ix.block_v:ix.block_v + 3] += disturb[1]
             env.advance(ctrl)
@@ -449,6 +487,17 @@ tx, ty, tz, tyaw = spec["target"]
 
 res = spec.get("residual")  # corrections on top of a recipe (recipe.npy): action = recipe[t] + scale * output
 recipe = np.load(res["file"]) if res else None
+hs = spec.get("hand_space")  # the arm acts in hand space: its slots move the hand (see policy.json "hand_space")
+
+def hand_ctrl(a):
+    b, jids = hs["body"], np.array(hs["jids"])
+    p = d.xpos[b] + d.xmat[b].reshape(3, 3) @ np.array(hs["offset"])
+    ax, r, hinge = d.xaxis[jids], p - d.xanchor[jids], np.array(hs["hinge"])[:, None]
+    J = np.concatenate([(hinge * np.cross(ax, r) + (1 - hinge) * ax).T, (hinge * ax).T])
+    s = a[np.array(hs["slots"])]
+    v = np.concatenate([s[:3] * hs["step"], s[3:6] * hs["turn"]])
+    dq = J.T @ np.linalg.solve(J @ J.T + hs["damp"] ** 2 * np.eye(6), v)
+    return np.clip(d.qpos[np.array(hs["qadr"])] + hs["lead"] * dq, hs["jlo"], hs["jhi"]) * np.array(hs["gear"])
 
 def observe(last, t):
     bp = d.xpos[ix["block"]]; R = d.xmat[ix["block"]].reshape(3, 3); yaw = math.atan2(R[1, 0], R[0, 0])
@@ -472,6 +521,8 @@ for t in range(int(spec["episode_s"] / spec["control_dt"])):
     a = last if recipe is None else np.clip(recipe[min(t, len(recipe) - 1)] + res["scale"] * last, -1, 1)
     want = np.clip(q0 + a * np.asarray(spec["action_scale"]), lo, hi)
     ctrl = ctrl + np.clip(want - ctrl, -np.asarray(spec["max_step"]), np.asarray(spec["max_step"]))
+    if hs:
+        ctrl[hs["acts"]] = np.clip(hand_ctrl(a), lo[hs["acts"]], hi[hs["acts"]])
     d.ctrl[:] = ctrl
     for _ in range(steps):
         mujoco.mj_step(m, d)
@@ -479,6 +530,19 @@ for t in range(int(spec["episode_s"] / spec["control_dt"])):
 bp = d.xpos[ix["block"]]
 print(f"object ended at ({bp[0]:.3f}, {bp[1]:.3f}, {bp[2]:.3f}); target ({tx:.3f}, {ty:.3f}, {tz:.3f})")
 '''
+
+
+def _hand_spec(ix) -> dict:
+    from .task_model import HAND_DAMP, HAND_LEAD, HAND_STEP, HAND_TURN
+    h = ix.hand
+    return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in h.items()} | {
+        "step": HAND_STEP, "turn": HAND_TURN, "damp": HAND_DAMP, "lead": HAND_LEAD,
+        "meaning": "the arm acts in hand space: the outputs at slots (6) say how the hand moves (x, y, z: times step metres) "
+                   "and turns (about x, y, z: times turn radians) this control step, in the world frame. The arm's commands "
+                   "(acts) are then: its joints now (qadr) + lead x a damped least-squares step (damp) of the arm's "
+                   "Jacobian at the hand point (body + offset in that body's frame), built from each joint's axis and anchor "
+                   "(jids; hinge 1, slide 0); clipped to jlo..jhi, times gear. Everything else as in 'action'. "
+                   "run_policy.py does exactly this."}
 
 
 def export(task_path: Path, dest: Path | None = None) -> Path:
@@ -530,6 +594,7 @@ def export(task_path: Path, dest: Path | None = None) -> Path:
                     "act_hi": ix.act_hi.tolist()},
         "initial_qpos": d.qpos.tolist(), "training": {k: meta.get(k) for k in ("steps", "wall_s")},
         "mount": list(task["mount"]), "randomize": meta.get("randomize", "off"),
+        "hand_space": _hand_spec(ix) if ix.hand is not None else None,
         "residual": {"file": "recipe.npy", "scale": res.scale,
                      "meaning": "corrections on top of a recipe: action = recipe[t] + scale * output (t = control steps "
                                 "since the start, clipped to the recipe's last); the observation ends with t / len(recipe)"}
@@ -669,14 +734,17 @@ def diagnose(task_path: Path, policy_path: Path, n: int = 4) -> dict:
             f = task_path.parent / "starts.npz"
             qs, cs = np.array(starts), np.full((len(starts), m.nu), np.nan)  # no commands: hold the pose it's in
             ts = np.array(when, dtype=np.int32)
-            if f.exists() and task.get("demo"):  # keep the program's moments too
+            scaffold = bool((task.get("starts") or {}).get("scaffold"))
+            if f.exists() and (task.get("demo") or scaffold):  # keep the program's (or Morph's route's) moments too
                 old = np.load(f)
                 qs = np.concatenate([old["qpos"], qs])
                 cs = np.concatenate([old["ctrl"] if "ctrl" in old else np.full((len(old["qpos"]), m.nu), np.nan), cs])
                 ts = np.concatenate([old["t"] if "t" in old else np.zeros(len(old["qpos"]), np.int32), ts])
             np.savez(f, qpos=qs, ctrl=cs, t=ts)
-            task["starts"] = {"file": "starts.npz", "share": 0.5 if task.get("demo") else 0.3,
-                              "from": f"its closest moments on step {k + 1}" + (" and the program's" if task.get("demo") else "")}
+            task["starts"] = {"file": "starts.npz", "share": 0.5 if task.get("demo") or scaffold else 0.3,
+                              "from": f"its closest moments on step {k + 1}" + (" and the program's" if task.get("demo") else
+                                                                              " and Morph's route" if scaffold else ""),
+                              **({"scaffold": True} if scaffold else {})}
             task_path.write_text(json.dumps(task, indent=1))
             out["practice_from"] = f"{len(starts)} of its closest moments on step {k + 1}, for 30% of practice runs"
     e = {key: [w.ext[key] for w in watches] for key in watches[0].ext}
@@ -825,7 +893,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         emit(type="learn_round", round=r, rounds=rounds, stage="advice", said=said, rationale=why)
         if rev:
             t = load_task(task_path)
-            emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+            emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name), **{"from": t["steps_from"]},
                  rationale=why)
         return bool(rev)
 
@@ -885,6 +953,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         log(f"  round {r}: {res['success']}/{res['n']}" + (f"; stuck at step {stuck['step']} ({stuck['name']})" if stuck else ""))
         moved = _remount(task_path, diag, log)
         if moved:  # it couldn't reach: stand closer and start again (nothing it learned carries over)
+            _scaffold(task_path, pj, goal, log)  # its route from the new spot
             history[-1]["remounted"] = moved
             emit(type="learn_round", round=r, rounds=rounds, stage="remounted", text=moved)
             last_fit, stuck_before = None, None
@@ -900,7 +969,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             if chosen:
                 history[-1]["revision"] = f"best of {chosen['tried']} plans: {chosen['idea']}"
                 t = load_task(task_path)
-                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name), **{"from": t["steps_from"]},
                      rationale=chosen["idea"])
                 best = _keep_best(task_path, chosen["result"], best, f"best plan after round {r}")
                 if chosen["result"]["success"] >= math.ceil(0.6 * tries):  # the search itself got there
@@ -917,7 +986,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
                 history[-1]["revision"] = rev["rationale"]
                 log(f"  Nemotron revised the steps: {rev['rationale'][:300]}")
                 t = load_task(task_path)
-                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=t["steps"] + [t["steps_final"]], **{"from": t["steps_from"]},
+                emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name), **{"from": t["steps_from"]},
                      rationale=rev["rationale"])
                 emit(type="learn_round", round=r, rounds=rounds, stage="revised", rationale=rev["rationale"])
     if best is not None and _fitness(task_path.parent, res) < best[0]:  # a later round did worse: go back
@@ -965,7 +1034,7 @@ def _easy_first(task_path: Path, r: int, rounds: int, log=print) -> None:
     towards the beginning, so the end of the task is mastered first and every later skill builds on it."""
     task = load_task(task_path)
     st = task.get("starts")
-    if not task.get("demo") or not st or st.get("focus"):
+    if not st or not (task.get("demo") or st.get("scaffold")) or st.get("focus"):
         return
     z = np.load(task_path.parent / st["file"])
     if "t" not in z or not len(z["t"]):
@@ -1204,7 +1273,35 @@ def prepare_learning(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log
                 attach_grasp(task, pj, goal, log=log)  # learning from scratch: aim for the grip that held
     if info.get("demo") is False and prof.base == "fixed" and llm is not None and getattr(llm, "available", False):
         log("  (no working program to learn from: learning from scratch)")
+    if info.get("demo") is False:
+        # (use_hand_space(task) makes an arm act in hand space; not the default: on the Panda bin task it gripped no
+        # better and moved the parcel less than acting joint by joint, over the same 30M practice steps)
+        _scaffold(task, pj, goal, log)
     return task, info
+
+
+def _scaffold(task_path: Path, pj: Project, goal: GoalSpec, log=print) -> None:
+    """Practice starts near success from Morph's own route (scaffold.py). Never in the way of learning: if it can't be
+    built, learning goes ahead as before."""
+    from .scaffold import scaffold_starts
+    try:
+        scaffold_starts(task_path, pj, goal, log=log)
+    except Exception as e:  # noqa: BLE001
+        log(f"  (no practice starts near success: {type(e).__name__}: {e})")
+
+
+def use_hand_space(task_path: Path, log=print) -> bool:
+    """Learning from scratch with an arm: act in hand space (move the hand this way, turn it that way, open or close),
+    the way most robot learning does it, rather than discovering how seven joints combine to move a hand at all. A task
+    that copies a working program keeps acting joint by joint (the copying already works that way)."""
+    t = json.loads(Path(task_path).read_text())
+    if not t.get("hand_space") or t.get("demo"):
+        return False
+    t["action_space"] = "hand"
+    Path(task_path).write_text(json.dumps(t, indent=1))
+    log(f"  it learns to move its hand (which way, how to turn it, open or close) rather than each of its "
+        f"{len(t['hand_space']['joints'])} arm joints")
+    return True
 
 
 def replay_check(pj: Project, goal: GoalSpec, task_path: Path, n: int = 3) -> int:

@@ -537,7 +537,11 @@ class ReasoningService:
                        "goal, say so plainly and do what the measurements support instead. A suggestion about one part "
                        "of the reward reads 'About the reward part <part>: ...': change that part's reward_weights (less = "
                        "about 0.5, much less = 0.2, remove = 0, more = 1.5, within its range), or for 'only once it grips "
-                       "it' lower it and add a reward term that pays the same only when grip is high.")
+                       "it' lower it and add a reward term that pays the same only when grip is high. A suggestion "
+                       "about one step reads 'About plan step <n> (\"<name>\", done when: <formula> = <plain words>): ...': "
+                       "the person says how that step was understood wrongly. Rewrite that step as they say (its how and its "
+                       "done_when; use any number they give), keep the other steps unless they must change to fit, and say "
+                       "in the rationale what the step is now.")
         if ratings:  # practice tries the person marked as looking right / wrong, each with what it measurably did
             payload["person_rated_tries"] = [{"rating": a["rating"], "what_it_did": a.get("did", {})} for a in ratings][-12:]
             system += (" The person also rated practice tries they watched (person_rated_tries: good = looks right, bad = "
