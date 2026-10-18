@@ -13,6 +13,18 @@ from pathlib import Path
 os.environ.setdefault("MUJOCO_GL", "glfw")
 
 
+def _headless_gl() -> None:
+    """Use EGL for offscreen rendering unless MUJOCO_GL was set explicitly. Must run before mujoco's renderer is
+    imported."""
+    if os.environ.get("MUJOCO_GL") == "glfw" and "MORPH_KEEP_GL" not in os.environ:
+        os.environ["MUJOCO_GL"] = "egl"
+    # Under WSL, Mesa falls back to software rendering (llvmpipe, ~150 ms per frame for the Go1) unless
+    # told to use the GPU through D3D12 (~23 ms on an RTX 5070).
+    if Path("/usr/lib/wsl/lib/libd3d12.so").exists() and "GALLIUM_DRIVER" not in os.environ:
+        os.environ["GALLIUM_DRIVER"] = "d3d12"
+        os.environ.setdefault("MESA_D3D12_DEFAULT_ADAPTER_NAME", "NVIDIA")
+
+
 def _run_dir(name: str) -> Path:
     return Path("runs") / f"{time.strftime('%Y%m%d-%H%M%S')}_{name}"
 
@@ -257,6 +269,8 @@ def _spec_for(sc):
 def cmd_learn(a) -> int:
     """Learn a task for one robot from scratch on this GPU (no browser needed, e.g. on a server or in CI)."""
     import subprocess
+    if not a.no_video:
+        _headless_gl()
     from .learn_task import export, learn_in_rounds, prepare_learning
     from .project import load_project, resolve_goal
     from .reasoning import ReasoningService
@@ -303,7 +317,33 @@ def cmd_learn(a) -> int:
     print(f"learned skill: {res['success']}/{res['n']} tries succeeded")
     if (task.parent / "policy.npz").exists():
         print(f"export: {export(task)}")
+        if not a.no_video:
+            from .video import learning_video
+            print("rendering learning videos...")
+            learning_video(task.parent)
     return 0 if res["success"] else 2
+
+
+def cmd_video(a) -> int:
+    """Render the videos for a learned skill (or a single clip with --clip)."""
+    _headless_gl()
+    from .learn_task import LEARNED
+    from .video import clips_of, learning_clip, learning_video
+    folder = Path(a.learned)
+    if not folder.exists():
+        folder = LEARNED / a.learned
+    if not (folder / "policy.npz").exists():
+        print(f"no learned skill in {folder}")
+        return 1
+    if a.list:
+        for c in clips_of(folder):
+            print(f"  {c['clip']:16s} {'done' if c['made'] else '    '}  {c['label']}")
+        return 0
+    if a.clip:
+        print(learning_clip(folder, a.clip))
+    else:
+        learning_video(folder)
+    return 0
 
 
 def cmd_goal_bench(a) -> int:
@@ -337,6 +377,9 @@ def cmd_export(a) -> int:
 
 
 def cmd_do(a) -> int:
+    if a.video:
+        _headless_gl()
+    from . import project as P
     from .project import load_project, resolve_goal, run_on_robot, save_result
     from .reasoning import ReasoningService
     pj = load_project(a.project)
@@ -366,25 +409,33 @@ def cmd_do(a) -> int:
             print("stopped; edit the description or pass --demo and try again")
             return 0
     result = {"project": pj.name, "goal": goal.model_dump(), "goal_info": info, "robots": []}
-    for r in robots:
-        result["robots"].append(run_on_robot(pj, goal, r, n=a.run, llm=llm, record_demo=a.record_demo))
+    rec = None
+    if a.video:
+        from .video import TrialRecorder
+        rec = TrialRecorder(run_dir / "videos")
+        P.LISTENER = rec.on_event
+    try:
+        for r in robots:
+            result["robots"].append(run_on_robot(pj, goal, r, n=a.run, llm=llm, record_demo=a.record_demo))
+    finally:
+        if rec is not None:
+            P.LISTENER = None
+            rec.close()
     if len(result["robots"]) > 1:
         print("\nsummary:")
         for r in result["robots"]:
             print(f"  {r['robot']:14s} {r['plan']['plan_id']:20s} {r.get('success', 0)}/{r.get('n', 0)}")
     print(f"saved {save_result(run_dir, result)}")
+    if rec is not None and rec.items:
+        from .video import render_try
+        print(f"\nrendering {len(rec.items)} videos (~30 s each):")
+        for it in rec.items:
+            print(f"  {render_try(Path(it['path']))}  ({'success' if it['success'] else 'failed'})", flush=True)
     return 0
 
 
 def cmd_app(a) -> int:
-    # the app renders from worker threads: headless EGL unless the user chose a backend themselves
-    if os.environ.get("MUJOCO_GL") == "glfw" and "MORPH_KEEP_GL" not in os.environ:
-        os.environ["MUJOCO_GL"] = "egl"
-    # Under WSL, Mesa falls back to software rendering (llvmpipe, ~150 ms per frame for the Go1) unless
-    # told to use the GPU through D3D12 (~23 ms on an RTX 5070).
-    if Path("/usr/lib/wsl/lib/libd3d12.so").exists() and "GALLIUM_DRIVER" not in os.environ:
-        os.environ["GALLIUM_DRIVER"] = "d3d12"
-        os.environ.setdefault("MESA_D3D12_DEFAULT_ADAPTER_NAME", "NVIDIA")
+    _headless_gl()  # the app renders from worker threads
     from .app.server import serve
     serve(a.port, open_browser=not a.no_browser)
     return 0
@@ -417,6 +468,7 @@ def main(argv=None) -> int:
     s.add_argument("--record-demo", metavar="FILE", help="save the object's path from the first success")
     s.add_argument("--no-llm", action="store_true")
     s.add_argument("--yes", action="store_true", help="don't ask to confirm the goal")
+    s.add_argument("--video", action="store_true", help="save an mp4 of each try in <out>/videos/")
     s.add_argument("--out")
     s.set_defaults(fn=cmd_do)
 
@@ -431,7 +483,13 @@ def main(argv=None) -> int:
     s.add_argument("--rounds", type=int, default=4, help="practise in this many rounds; between them Nemotron "
                                                            "revises the steps from what the robot actually did")
     s.add_argument("--no-llm", action="store_true")
+    s.add_argument("--no-video", action="store_true", help="skip rendering the learning videos")
     s.set_defaults(fn=cmd_learn)
+    s = sub.add_parser("video", help="render videos of a learned skill (per round, final, before/after, combined)")
+    s.add_argument("learned", help="folder under runs/learned (or its path)")
+    s.add_argument("--clip", help="only this clip, e.g. final, compare, round_2, progress (see --list)")
+    s.add_argument("--list", action="store_true", help="list available clips")
+    s.set_defaults(fn=cmd_video)
     s = sub.add_parser("goal-bench", help="does Morph understand varied requests? (judged on example outcomes)")
     s.add_argument("--no-llm", action="store_true", help="the built-in reader instead of Nemotron")
     s.add_argument("--only", help="run the cases whose name contains this")

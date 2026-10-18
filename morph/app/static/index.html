@@ -199,6 +199,34 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .cap { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); background: rgba(7, 11, 19, .8); backdrop-filter: blur(6px);
   border: 1px solid var(--line); padding: 8px 16px; border-radius: 12px; font-size: 14px; max-width: 80%; text-align: center; }
 .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.viewer video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #070b13; cursor: default; }
+.viewer.vidmode .cap { bottom: 64px; }
+/* videos: the picker */
+.modal { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: rgba(4, 7, 13, .66); backdrop-filter: blur(3px); }
+.modal .box { width: min(780px, 100%); max-height: min(84vh, 920px); display: flex; flex-direction: column; background: var(--panel);
+  border: 1px solid var(--line2); border-radius: var(--r2); box-shadow: var(--shadow); }
+.modal .mhead { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.modal .mhead b { font-size: 15px; }
+.modal .mbody { overflow-y: auto; padding: 4px 16px 14px; }
+.modal .mfoot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); }
+.vsec { margin-top: 14px; }
+.vsec > h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 650; }
+.vgroup { padding: 10px 12px; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--line); margin-bottom: 8px; }
+.vgroup .vtop { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.vgroup .vtop b { font-weight: 600; }
+.vrobot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; }
+.vrobot > span { min-width: 92px; color: var(--dim); }
+.vtry { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px 3px 6px; border-radius: 99px; border: 1px solid var(--line2);
+  background: var(--panel); cursor: pointer; font-size: 12px; user-select: none; }
+.vtry input, .vclip input { margin: 0; accent-color: var(--accent); }
+.vtry.on { border-color: var(--accent); background: var(--accbg); }
+.vtry .ok { color: var(--ok); } .vtry .bad { color: var(--bad); }
+.vclip { display: flex; align-items: center; gap: 9px; padding: 5px 6px; border-radius: 8px; font-size: 12.5px; cursor: pointer; margin-top: 2px; }
+.vclip:hover { background: var(--hover); }
+.vclip .drawn { margin-left: auto; font-size: 11px; color: var(--faint); white-space: nowrap; }
+.linkbtn { background: none; border: 0; padding: 0; color: var(--accent); font-size: 12px; cursor: pointer; }
+.linkbtn:hover:not(:disabled) { background: none; text-decoration: underline; }
 .seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
 .seg button { border: 0; background: transparent; padding: 5px 10px; border-radius: 7px; font-size: 12.5px; color: var(--dim); }
 .seg button.on { background: var(--raise); color: var(--text); }
@@ -296,6 +324,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
   <span class="chip" data-tip="NVIDIA Nemotron (via Nebius) reads free-form goals and plans for each robot. Billed per token it reads and writes."><span class="dot" id="llmdot"></span><span id="llmtxt">Nemotron</span></span>
   <span class="chip" data-tip="Where the live picture is drawn. On a GPU it can be sharp and smooth; on the CPU pick Fast quality under the viewer."><span class="dot" id="renderdot"></span><span id="rendertxt">Renderer</span></span>
   <span class="chip click" onclick="showTab('compute')" data-tip="Where heavy learning (teaching a robot to walk) runs: this computer or a Nebius cloud GPU. Click to change."><span id="computetxt">Compute: this PC</span></span>
+  <button class="xs" onclick="openVideos()" data-tip="Download videos of past tries and learned skills">Videos</button>
   <a href="/api/report" download><button class="xs" id="reportbtn" disabled>Download report</button></a>
 </header>
 
@@ -371,6 +400,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
       <ol><li>Pick a scene</li><li>Pick the robots to try</li><li>Describe the goal and press <b>Understand goal</b></li><li>Press <b>Run</b></li></ol>
     </div></div>
     <img id="live" class="hidden" alt="live simulation">
+    <video id="vid" class="hidden" controls playsinline></video>
     <div class="hud hidden" id="hud"><span class="pill"><span class="live" id="livedot"></span><span id="hudtxt">LIVE</span></span></div>
     <div class="hud r hidden" id="hudr"><span class="pill" id="hudr1"></span></div>
     <div class="cap hidden" id="cap"></div>
@@ -443,12 +473,24 @@ header [data-tip]:hover::after { left: auto; right: 0; }
       <canvas id="curve" width="900" height="240"></canvas>
       <div class="small faint" style="margin-top:6px" id="curvenote">Score per practice run: higher means it walks and follows directions better.</div></div></div>
     <div class="sec"><h4>Rounds</h4><div id="trainrounds" class="small"></div></div>
+    <div class="sec hidden" id="learnvidsec"><h4>Videos</h4><div class="card small" id="learnvids"></div></div>
     <div id="trainsteps"></div>
   </div>
   <div class="pane hidden" id="p-log"><div class="log" id="log">Nothing yet.</div></div>
 </div>
 </main>
 <div id="toast" class="toast hidden"></div>
+<div id="vmodal" class="modal hidden" onclick="if (event.target === this) closeVideos()">
+  <div class="box" role="dialog" aria-label="Videos">
+    <div class="mhead"><b class="grow">Videos</b><span class="tiny faint">videos render on first download (~30 s each)</span>
+      <button class="xs ghost" onclick="closeVideos()" aria-label="Close">✕</button></div>
+    <div class="mbody" id="vbody"></div>
+    <div class="mfoot"><span class="small muted grow" id="vcount">Nothing picked</span>
+      <button class="xs ghost" onclick="vPickNone()">Clear</button>
+      <button class="xs" id="vzip" onclick="vBundle(true, this)" disabled>Download as .zip</button>
+      <button class="xs primary" id="vone" onclick="vBundle(false, this)" disabled data-tip="Joined into one mp4 with a title before each">Download as one video</button></div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -479,7 +521,7 @@ async function api(path, body) {
   return j;
 }
 function pick(id) { $(id).click(); }
-function toast(msg, bad) { const t = $("toast"); t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); clearTimeout(t._h); t._h = setTimeout(() => t.classList.add("hidden"), 4500); }
+function toast(msg, bad, keep) { const t = $("toast"); t.textContent = msg; t.className = "toast" + (bad ? " bad" : ""); clearTimeout(t._h); if (!keep) t._h = setTimeout(() => t.classList.add("hidden"), 4500); }
 window.addEventListener("error", e => toast("Page error: " + e.message, true));
 window.addEventListener("unhandledrejection", e => toast((e.reason && e.reason.message) || String(e.reason), true));
 function seg(id, opts, cur, onpick) {
@@ -516,7 +558,7 @@ function previewSize() { const r = $("viewer").getBoundingClientRect(), k = Math
   return [Math.round(r.width * devicePixelRatio * k), Math.round(r.height * devicePixelRatio * k)]; }
 function preview(robotIndex) {
   if (S.running || !S.scene) return;
-  S.replay = null; S.viewMode = "preview";
+  S.replay = null; S.viewMode = "preview"; hideVid();
   const r = robotIndex === undefined ? null : S.robots[robotIndex];
   S.previewRobot = robotIndex;
   const [w, h] = previewSize();
@@ -641,6 +683,7 @@ function initOrbit() {
   }, {passive: false});
   v.addEventListener("dblclick", e => { if (S.placing == null) resetView(); });
   document.addEventListener("keydown", e => { if (e.key === "Escape" && S.placing != null) placeMode(false); });
+  ["pointerdown", "pointermove", "pointerup", "wheel", "dblclick", "contextmenu"].forEach(t => $("vid").addEventListener(t, e => e.stopPropagation()));
 }
 function sendView() { const r = $("viewer").getBoundingClientRect(); control({view: {w: Math.round(r.width), h: Math.round(r.height), dpr: window.devicePixelRatio || 1}}); }
 $("scene").onchange = () => loadScene($("scene").value);
@@ -767,6 +810,8 @@ async function profile(i) {
       <div><span class="st ok">✓</span> ${esc(r.name)} has a skill it learned for this goal. Runs use it automatically.</div>
       <div class="row" style="margin-top:10px"><a href="/api/export?task=${encodeURIComponent(p.learned)}" download><button class="primary">Export the policy (.zip)</button></a>
       <span class="tiny faint grow">network weights, the model, a runner script, and a ROS 2 package (a node for your robot plus a simulated stand-in to try it)</span></div>
+      <div class="row" style="margin-top:10px"><button class="xs" onclick="downloadVideo('learn:${esc(p.learned)}:progress', this)" data-tip="All rounds, the final skill and a before/after comparison in one video. First download takes a few minutes.">Download learning video</button>
+      <button class="xs ghost" onclick="openVideos(['learn:${esc(p.learned)}:progress'])">Pick videos…</button></div>
       <div class="row" style="margin-top:10px"><button class="xs" onclick="robustTest(this, '${esc(p.learned)}')" data-tip="Ten tries in which the ${esc((S.scene && S.scene.summary.object.name) || "object")} is suddenly knocked (it slides a few cm) a quarter of the way through. Once with the program alone, replayed move for move, and once with the learned skill, which sees where things are and corrects. Takes a few seconds; no Nemotron calls.">Test it: knock the ${esc((S.scene && S.scene.summary.object.name) || "object")} mid-task</button>
       <span class="tiny muted grow" id="robust-${esc(p.learned)}"></span></div></div></div>` : ""}
     ${S.goal && !p.learned && !noGait && (p.plan === "learn_policy" || readyFailed(r) || recipeWorks(r)) ? learnCard(r, i, readyFailed(r)) : ""}
@@ -956,20 +1001,36 @@ async function pollJob() {
 }
 setInterval(pollJob, 2000);
 function showLive() {
-  S.replay = null; S.viewMode = "live"; S.pvTok = (S.pvTok || 0) + 1;  // cancel any preview still loading
+  S.replay = null; S.viewMode = "live"; S.pvTok = (S.pvTok || 0) + 1; hideVid();
   $("empty").classList.add("hidden"); $("live").classList.remove("hidden");
   ["hud", "hudr"].forEach(x => $(x).classList.remove("hidden"));
   $("hudtxt").textContent = "LIVE"; $("livedot").style.background = "var(--bad)"; $("livedot").style.animation = "";
   $("live").src = "/api/stream.mjpg?" + Date.now();
 }
 function replay(robot, i) {
-  S.replay = {robot, i}; S.viewMode = "replay"; S.pvTok = (S.pvTok || 0) + 1;
-  $("empty").classList.add("hidden"); $("live").classList.remove("hidden"); $("hud").classList.remove("hidden");
-  $("live").src = `/api/replay.mjpg?robot=${encodeURIComponent(robot)}&i=${i}&t=${Date.now()}`;
-  $("hudtxt").innerHTML = `REPLAY · ${esc(robot)}, try ${i + 1} <a href="#" onclick="showLive();return false" style="margin-left:6px">back to live</a>`;
-  $("livedot").style.background = "var(--accent2)";
   const t = S.results[robot].trials[i];
+  S.replay = {robot, i}; S.viewMode = "replay"; S.pvTok = (S.pvTok || 0) + 1;
+  $("empty").classList.add("hidden"); $("hud").classList.remove("hidden");
+  const dl = t && t.video ? ` <button class="linkbtn" style="margin-left:6px" onclick="downloadVideo('try:${esc(t.video)}', this)">⬇ video</button>` : "";
+  $("hudtxt").innerHTML = `REPLAY · ${esc(robot)}, try ${i + 1}${dl} <a href="#" onclick="showLive();return false" style="margin-left:6px">back to live</a>`;
+  $("livedot").style.background = "var(--accent2)";
+  if (t && t.replay) {  // frames still in memory
+    hideVid(); $("live").classList.remove("hidden");
+    $("live").src = `/api/replay.mjpg?robot=${encodeURIComponent(robot)}&i=${i}&t=${Date.now()}`;
+  } else if (t && t.video) playVid("try:" + t.video);
   if (t) { renderGoal(t.conditions); caption(t.success ? "This try succeeded" : "Why it failed: " + t.reasons.join("; ")); }
+}
+function playVid(item) {
+  const v = $("vid");
+  $("live").classList.add("hidden"); v.classList.remove("hidden"); $("viewer").classList.add("vidmode");
+  caption("Rendering video…");
+  v.onloadeddata = () => caption(`Try ${S.replay ? S.replay.i + 1 : ""} (recorded)`);
+  v.onerror = () => caption("Couldn't load the video");
+  v.src = `/api/video?item=${encodeURIComponent(item)}`; v.play().catch(() => {});
+}
+function hideVid() {
+  const v = $("vid"); if (v.classList.contains("hidden")) return;
+  v.pause(); v.removeAttribute("src"); v.load(); v.classList.add("hidden"); $("viewer").classList.remove("vidmode");
 }
 function renderResults() {
   $("results").innerHTML = S.order.length ? S.order.map(k => {
@@ -977,9 +1038,10 @@ function renderResults() {
     return `<div class="res"><div class="top"><b>${esc(k)}</b>${R.plan ? `<span class="plan ${R.plan}">${esc(PLAN[R.plan])}</span>` : `<span class="plan">waiting</span>`}
       <span class="score">${R.skip ? `<span class="muted">n/a</span>` : `${ok}/${ts.length}`}</span></div>
       ${R.skip ? `<div class="why">${esc(R.why || "")}</div>` : `<div class="sbar"><div style="width:${100 * ok / ts.length}%"></div></div>
-      <div class="sqs">${ts.map((t, i) => { const can = t && t !== "run" && t.replay;
+      <div class="sqs">${ts.map((t, i) => { const can = t && t !== "run" && (t.replay || t.video);
         return `<div class="sq ${t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad"} ${can ? "click" : ""}"
           title="try ${i + 1}${t && t.reasons ? (t.success ? ": success" : ": " + esc(t.reasons.join("; "))) : ""}${can ? " (click to replay)" : ""}" ${can ? `onclick="replay('${esc(k)}', ${i})"` : ""}></div>`; }).join("")}</div>`}
+      ${ts.some(t => t && t.video) ? `<div class="row" style="margin-top:6px"><button class="linkbtn" onclick="openVideos(S.results['${esc(k)}'].trials.filter(t => t && t.video).map(t => 'try:' + t.video))">⬇ Videos…</button></div>` : ""}
       ${R.how ? `<div class="how" onclick="this.classList.toggle('open')" title="click to expand">${esc(R.how)}</div>` : ""}
       ${(R.programs || []).map(pg => `<details class="prog" ${pg.open ? "open" : ""}><summary>Program ${pg.attempt}: ${pg.success === undefined ? "running…" : pg.success ? "✓ reached the goal" : "✕ " + esc((pg.reasons || [])[0] || "failed")}</summary>
         ${pg.rationale ? `<div class="why3">${esc(pg.rationale)}</div>` : ""}<ol>${pg.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>
@@ -1031,7 +1093,7 @@ function events() {
         $("hudr1").textContent = e.summary.map(s => `${s.robot} ${s.n ? `${s.success}/${s.n}` : "n/a"}`).join(" · ");
         progress("done", e.summary.map(s => `${s.robot} ${s.n ? `${s.success}/${s.n}` : "n/a"}`).join(" · "));
         (e.summary || []).forEach(x => { if (x.moveit && S.results[x.robot]) S.results[x.robot].moveit = x.moveit; }); renderResults();
-        caption("Done. Click any square on the right to replay a try."); refreshCosts(); break;
+        caption("Done. Click a square to replay a try."); refreshCosts(); break;
       case "stopped": setRunning(false); progress("plan", "Stopped"); caption("Stopped"); break;
       case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
       case "training_round_start": S.curve = []; S.trainSteps = e.steps; trainLabel(); break;
@@ -1104,12 +1166,87 @@ function events() {
         else toast(`${e.robot} didn't learn it well enough: ${e.success}/${e.n} tries succeeded, so runs won't use it. Try learning again, give it suggestions while it learns, or move the robot.`, true);
         S.lastLearn = e.folder;
         $("results").insertAdjacentHTML("beforeend", `<div class="res"><b>Learned skill</b> <span class="muted small">${esc(e.folder)}</span>
-          <div class="row" style="margin-top:8px"><a href="/api/export?task=${encodeURIComponent(e.folder)}" download><button class="primary xs">Export policy (.zip)</button></a></div></div>`);
+          <div class="row" style="margin-top:8px;flex-wrap:wrap"><a href="/api/export?task=${encodeURIComponent(e.folder)}" download><button class="primary xs">Export policy (.zip)</button></a>
+          <button class="xs" onclick="downloadVideo('learn:${esc(e.folder)}:progress', this)" >Download learning video</button></div></div>`);
+        showLearnVideos(e.folder);
         break;
+      case "learn_video": showLearnVideos(e.folder, e.state); break;
       case "cloud_job": showCloudJob(e); break;
     }
   };
 }
+// ------------------------------------------------------------ videos (morph/video.py)
+async function fetchFile(url, opts, btn, wait) {
+  const label = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = `<span class="spin"></span> ${wait ? "Rendering…" : "Downloading…"}`; }
+  toast(wait ? "Rendering video, the download starts when it's ready…" : "Downloading…", false, true);
+  try {
+    const r = await fetch(url, opts);
+    if (!r.ok) { let msg = r.statusText; try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ } throw new Error(msg); }
+    const blob = await r.blob(), m = (r.headers.get("Content-Disposition") || "").match(/filename="?([^";]+)"?/);
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = m ? m[1] : "morph_video.mp4";
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    toast(`Downloaded ${a.download}`);
+  } catch (e) { toast("Video failed: " + e.message, true); }
+  finally { if (btn) { btn.disabled = false; btn.innerHTML = label; } }
+}
+function downloadVideo(item, btn) { return fetchFile(`/api/video?dl=1&item=${encodeURIComponent(item)}`, {}, btn, true); }
+async function showLearnVideos(folder, state) {
+  $("learnvidsec").classList.remove("hidden");
+  S.lvState = S.lvState || {};
+  if (state) S.lvState[folder] = state; else state = S.lvState[folder];
+  if (state === "drawing") { $("learnvids").innerHTML = `<span class="spin"></span> Rendering videos (a few minutes)…`; return; }
+  let L; try { L = await api("/api/videos"); } catch (e) { return; }
+  const f = L.learned.find(x => x.folder === folder); if (!f || S.lvState[folder] === "drawing") return;
+  $("learnvids").innerHTML = (state === "failed" ? `<div class="err">Rendering failed, see the Log.</div>` : "")
+    + f.clips.map(c => `<div class="row" style="margin:3px 0"><span class="grow">${esc(c.label)}</span>
+      <button class="xs ${c.clip === "progress" ? "primary" : "ghost"}" onclick="downloadVideo('${esc(c.item)}', this)">⬇ Download</button></div>`).join("")
+    + `<div class="row" style="margin-top:8px"><button class="linkbtn" onclick="openVideos(['learn:${esc(folder)}:progress'])">Download several…</button></div>`;
+}
+function runName(r) {  // 20261018-181500_run_xarm7+panda -> "Run · xarm7, panda · 18 Oct 18:15"
+  const m = r.run.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\d{2}_(\w+?)(?:_(.*))?$/);
+  if (!m) return esc(r.run);
+  const when = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).toLocaleString([], {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"});
+  return `<b>${m[6] === "learn" ? "Learning tries" : "Run"}</b> · ${esc((m[7] || "").replace(/\+/g, ", "))} <span class="faint">· ${when}</span>`;
+}
+async function openVideos(pre) {
+  $("vmodal").classList.remove("hidden");
+  $("vbody").innerHTML = `<div class="muted small" style="padding:14px 0"><span class="spin"></span> Loading…</div>`;
+  S.vsel = new Set(pre || []);
+  try { S.vlist = await api("/api/videos"); } catch (e) { $("vbody").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  vRender();
+}
+function closeVideos() { $("vmodal").classList.add("hidden"); }
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("vmodal").classList.contains("hidden")) closeVideos(); });
+function vToggle(item, on) { on ? S.vsel.add(item) : S.vsel.delete(item); vRender(); }
+function vPickNone() { S.vsel.clear(); vRender(); }
+function vPickAll(items, on) { items.forEach(x => on ? S.vsel.add(x) : S.vsel.delete(x)); vRender(); }
+function vRender() {
+  const L = S.vlist, all = [];
+  const runs = L.runs.map((r, k) => {
+    const robots = [...new Set(r.tries.map(t => t.robot))], items = r.tries.map(t => t.item); all.push(...r.tries);
+    const every = items.every(x => S.vsel.has(x));
+    return `<div class="vgroup"><div class="vtop"><span class="grow">${runName(r)}</span>
+      <button class="linkbtn" onclick='vPickAll(${JSON.stringify(items)}, ${!every})'>${every ? "none" : "all"}</button></div>
+      ${robots.map(rb => `<div class="vrobot"><span>${esc(rb)}</span>${r.tries.filter(t => t.robot === rb).map(t => `<label class="vtry ${S.vsel.has(t.item) ? "on" : ""}" title="${esc(t.success ? "success" : "failed: " + (t.reasons || []).join("; "))}">
+        <input type="checkbox" ${S.vsel.has(t.item) ? "checked" : ""} onchange="vToggle('${esc(t.item)}', this.checked)">try ${t.i + 1}${t.set > 1 ? ` (set ${t.set})` : ""} <span class="${t.success ? "ok" : "bad"}">${t.success ? "✓" : "✕"}</span></label>`).join("")}</div>`).join("")}</div>`;
+  }).join("");
+  const learned = L.learned.map(f => { all.push(...f.clips);
+    return `<div class="vgroup"><div class="vtop"><b class="grow">${esc(f.robot)}</b><span class="tiny faint">${esc(f.folder.split("__")[1] || "").replace(/_/g, " ")}</span></div>
+      ${f.clips.map(c => `<label class="vclip"><input type="checkbox" ${S.vsel.has(c.item) ? "checked" : ""} onchange="vToggle('${esc(c.item)}', this.checked)">
+        <span>${esc(c.label)}</span><span class="drawn">${c.made ? "ready" : c.clip === "progress" ? "~3 min" : "~30 s"}</span></label>`).join("")}</div>`; }).join("");
+  $("vbody").innerHTML = (runs ? `<div class="vsec"><h4>Runs</h4>${runs}</div>` : "")
+    + (learned ? `<div class="vsec"><h4>Learned skills</h4>${learned}</div>` : "")
+    || `<div class="muted small" style="padding:14px 0">No videos yet. Tries are recorded when you press Run.</div>`;
+  const n = S.vsel.size, todo = all.filter(x => S.vsel.has(x.item) && !x.made).length;
+  $("vcount").textContent = n ? `${n} picked` + (todo ? ` (${todo} to render, ~${Math.max(1, Math.round(todo * 30 / 60))} min)` : "") : "Nothing picked";
+  $("vzip").disabled = $("vone").disabled = !n;
+}
+function vBundle(zip, btn) {
+  return fetchFile("/api/videos/bundle", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({items: [...S.vsel], zip})}, btn, true).then(() => { if (!$("vmodal").classList.contains("hidden")) openVideos([...S.vsel]); });
+}
+
 // ------------------------------------------------------------ the reward, part by part (morph/reward_parts.py)
 function rewardTotals(rec) {  // one check's per-part totals, Nemotron's own terms under their names
   const out = {...(rec.parts || {})};

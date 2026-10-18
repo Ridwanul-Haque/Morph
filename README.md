@@ -96,6 +96,7 @@ From the command line:
 .venv/bin/morph do examples/ball "put the ball into the bin"          # a real sphere: it rolls
 .venv/bin/morph learn examples/parcel "lift the parcel 10 cm and hold it" --robot <model.xml> --rounds 4
 .venv/bin/morph export runs/learned/<robot>__<goal>                    # policy + runner + ROS 2 package
+.venv/bin/morph video runs/learned/<robot>__<goal>                     # render learning videos
 .venv/bin/morph inspect <model.xml|.urdf|.xacro>                       # what Morph sees in a robot
 .venv/bin/morph goal-bench                                             # does it understand varied requests?
 ```
@@ -167,6 +168,19 @@ matches. Learning from legged programs isn't supported yet: legged robots learn 
   the same topics; `ros2 launch <pkg> policy.launch.py sim:=true`. Tested: the node rebuilds the training observation
   exactly, and the closed loop reaches the goal through ROS topics.
 * **MoveIt:** for scripted arm runs, a `moveit_py` script with the grasp and place waypoints in the robot's base frame.
+
+### Videos
+
+Tries are recorded as simulation state (not frames) and rendered to mp4 on demand, since rendering is slow under WSL
+(~30 s per try). Videos are 1280x720, real time, with captions and the result at the end.
+
+* `morph do ... --video` saves `<out>/videos/<robot>/try_NN.mp4`.
+* `morph learn` saves each round's policy in `rounds/` and renders `round_N.mp4`, `final.mp4`, `compare.mp4` (program
+  vs learned policy with the object knocked mid-task) and `learning_progress.mp4` into
+  `runs/learned/<robot>__<goal>/videos/`. `morph video <folder>` does the same for an existing skill
+  (`--list`, `--clip round_2`). Skills learned before this fall back to the trainer's checkpoints.
+* In the app, any result square can be replayed and downloaded, and the **Videos** button lets you pick several and
+  download them as one mp4 or a zip.
 
 ## Compute and cost
 

@@ -5,6 +5,8 @@ Same code as the command line (morph.project, morph.planner, ...); this file onl
     which renders a frame now and then, paces trials to the chosen speed, and handles pause/stop
   * progress events for the page (Server-Sent Events), fed by morph.project.emit
   * small JSON endpoints for scenes, robots, goals, runs, replays of failed trials and gait training
+  * videos (morph.video): tries are recorded during runs and rendered on request; learning videos are rendered
+    when learning finishes
 
 Standard library only (http.server); everything runs on this machine and listens on localhost.
 """
@@ -98,6 +100,8 @@ class Live:
         SimulationEnvironment.advance = advance
 
     def after(self, env):
+        if getattr(env, "offscreen", False):  # video rendering, not for the live view
+            return
         if self.cancel:
             raise Cancelled()
         while self.paused and not self.cancel:
@@ -212,6 +216,7 @@ class App:
         self.latest_ckpt = None
         self.demo: threading.Thread | None = None
         self.llm = None
+        self.videos = None  # TrialRecorder for the current job
         P.LISTENER = self.on_event
 
     # events
@@ -224,6 +229,11 @@ class App:
 
     def on_event(self, e: dict):
         t = e.get("type")
+        rec = self.videos
+        if rec is not None:
+            item = rec.on_event(e)
+            if item is not None:
+                e = e | {"video": item["id"]}
         if t == "trial_start":
             self.live.pace, self.live.recording, self.live.anchor = True, [], None
         elif t == "stage" and e.get("stage") == "setup":
@@ -433,6 +443,9 @@ class App:
         with self.lock:
             self.history = []
         self.live.cancel, self.live.paused = False, False
+        if kind in ("run", "learn"):
+            from ..video import TrialRecorder, new_run_dir
+            self.videos = TrialRecorder(new_run_dir(kind, robot.replace(", ", "+")))
         self.job = threading.Thread(target=self._guard, args=(target, *args), daemon=True)
         self.job.start()
 
@@ -444,6 +457,10 @@ class App:
             self.send(type="stopped")
         except Exception as e:  # noqa: BLE001
             self.send(type="error", text=f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-2000:])
+        finally:
+            if self.videos is not None:
+                self.videos.close()
+                self.videos = None
 
     def run(self, robots: list[str], n: int, use_llm: bool):
         # this run's scene and goal, as they were when it started: changing them in the page meanwhile (loading a scene
@@ -640,6 +657,27 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
     app.send(type="learn_done", robot=robot, success=res["success"], n=res["n"], folder=task.parent.name,
              rounds=len(res.get("rounds", [])) + 1)
     app.send(type="done", summary=[{"robot": robot, "plan": "learned_skill", "success": res["success"], "n": res["n"]}])
+    _learning_videos(app, task.parent, robot)
+
+
+def _learning_videos(app: "App", folder: Path, robot: str):
+    """Render the learning videos right after learning so the download buttons are instant. Takes a few minutes;
+    Stop skips the rest (finished clips are kept)."""
+    from ..video import learning_video
+    app.send(type="learn_video", robot=robot, folder=folder.name, state="drawing")
+    app.send(type="caption", text="Rendering the learning videos (a few minutes, Stop skips this)")
+    try:
+        learning_video(folder, stop=lambda: app.live.cancel,
+                       log=lambda t: app.send(type="log", robot=robot, text=t.strip()))
+    except InterruptedError:
+        app.send(type="learn_video", robot=robot, folder=folder.name, state="stopped")
+        return
+    except Exception as e:  # noqa: BLE001  learning already succeeded, don't fail the job
+        app.send(type="log", robot=robot, text=f"learning video skipped: {e}")
+        app.send(type="learn_video", robot=robot, folder=folder.name, state="failed", why=str(e))
+        return
+    app.send(type="learn_video", robot=robot, folder=folder.name, state="ready")
+    app.send(type="caption", text="Done. Videos are in the Learning tab")
 
 
 APP: App | None = None
@@ -748,6 +786,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+            elif u.path == "/api/videos":
+                from ..video import listing
+                self._json(listing())
+            elif u.path == "/api/video":  # ?item=try:<id> or learn:<folder>:<clip>, rendered on first request
+                from ..video import resolve
+                path, title = resolve(q.get("item", ""))
+                self._file(path, "video/mp4", f"{title}.mp4" if q.get("dl") else None)
             elif u.path == "/api/report":
                 b = json.dumps(APP.result or {}, indent=2, default=str).encode()
                 self.send_response(200)
@@ -839,6 +884,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("nothing learned under that name yet")
                 self._json(robustness(APP.project, APP.goal, folder / "task.json", n=int(min(max(int(b.get("n", 10)), 2), 30)),
                                       log=lambda s: None))
+            elif u.path == "/api/videos/bundle":
+                from ..video import bundle
+                items = [str(x) for x in (b.get("items") or [])][:60]
+                as_zip = bool(b.get("zip"))
+                path = bundle(items, as_zip)
+                self._file(path, "application/zip" if as_zip else "video/mp4", path.name)
             elif u.path == "/api/train":
                 APP.start(APP.train, b["path"], kind="train", robot=Path(b["path"]).stem)
                 self._json({"ok": True})
@@ -928,6 +979,37 @@ class Handler(BaseHTTPRequestHandler):
             return {"path": str(d / name)}
         raise ValueError(f"unknown upload kind {kind!r}")
 
+    def _file(self, path: Path, ctype: str, download: str | None = None):
+        """Serve a file. Supports Range so <video> can seek."""
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start, end = int(m.group(1)), min(int(m.group(2) or end), end)
+            else:
+                start = max(0, size - int(m.group(2)))
+        self.send_response(206 if m and (m.group(1) or m.group(2)) else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        if self.headers.get("Range") and m:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        if download:
+            name = re.sub(r"[^A-Za-z0-9_.()+ -]+", "_", download.replace(" · ", " - ").replace(": ", " - ")).strip() \
+                or "morph_video.mp4"
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        with path.open("rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = f.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+
     def _sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1001,6 +1083,8 @@ def _open_browser(url: str) -> None:
 def serve(port: int = 8765, open_browser: bool = True) -> None:
     global APP
     APP = App()
+    from ..video import cleanup_tmp
+    cleanup_tmp()
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:

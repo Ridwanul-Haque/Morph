@@ -847,8 +847,12 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
     folder = task_path.parent
     for c in folder.glob("candidate_*"):  # left over from an interrupted plan search
         shutil.rmtree(c, ignore_errors=True)
+    for d in ("rounds", "videos"):  # from a previous run
+        shutil.rmtree(folder / d, ignore_errors=True)
     (folder / "status.json").write_text(json.dumps({"state": "learning"}))
     res = _learn_rounds(pj, goal, task_path, train, llm, log, emit, total_steps, rounds, tries, candidates, advice)
+    if (folder / "rounds").exists():  # used for the video title cards
+        (folder / "rounds" / "history.json").write_text(json.dumps(res.get("rounds", []), indent=1, default=str))
     (folder / "status.json").write_text(json.dumps({"state": "done", "success": int(res.get("success", 0)),
                                                     "n": int(res.get("n", 0)), "tries": tries}))
     return res
@@ -905,6 +909,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         if train(task_path, 0, None):
             res = try_policy(pj, goal, task_path, n=tries, log=log, emit=emit)
             log(f"  copying the program: {res['success']}/{res['n']}")
+            _snapshot(task_path, 0, "Round 0 (imitating the program)", res)
             emit(type="learn_round", round=0, rounds=rounds, stage="tried", success=res["success"], n=res["n"],
                  note="copied from Nemotron's program, before any practice")
             if res["success"] >= math.ceil(0.6 * tries):
@@ -927,6 +932,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             res["why_not"] = "the trainer stopped (see the log)"
             break
         res = try_policy(pj, goal, task_path, n=tries, log=log, emit=emit)
+        _snapshot(task_path, r, f"Round {r} of {rounds}", res, note=f"{per * r / 1e6:.0f}M steps")
         emit(type="learn_round", round=r, rounds=rounds, stage="tried", success=res["success"], n=res["n"])
         best = _keep_best(task_path, res, best, f"round {r}")
         if res["success"] >= math.ceil(0.6 * tries) or r == rounds:
@@ -972,6 +978,8 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
                 emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name), **{"from": t["steps_from"]},
                      rationale=chosen["idea"])
                 best = _keep_best(task_path, chosen["result"], best, f"best plan after round {r}")
+                _snapshot(task_path, r, f"Round {r} (revised plan)", chosen["result"],
+                          note=f"best of {chosen['tried']} plans: {chosen['idea']}", key=f"round_{r}_plan")
                 if chosen["result"]["success"] >= math.ceil(0.6 * tries):  # the search itself got there
                     res = chosen["result"]
                     break
@@ -1323,6 +1331,23 @@ def replay_check(pj: Project, goal: GoalSpec, task_path: Path, n: int = 3) -> in
         r = check(goal, pj.scene, m, env.data, env.block_pose(), env.block_speed(), not held, history=hist)
         ok += bool(r["success"]) and not blew
     return ok
+
+
+def _snapshot(task_path: Path, r: int, label: str, res: dict, note: str = "", key: str = "") -> None:
+    """Copy the current policy and task.json into rounds/ for the learning video. Needed because policy.npz is
+    overwritten each round and the trainer's checkpoints restart from step 0."""
+    folder = task_path.parent
+    d = folder / "rounds"
+    d.mkdir(exist_ok=True)
+    key = key or f"round_{r}"
+    if not (folder / "policy.npz").exists():
+        return
+    shutil.copy(folder / "policy.npz", d / f"{key}.npz")
+    shutil.copy(task_path, d / f"{key}.task.json")
+    idx = json.loads((d / "index.json").read_text()) if (d / "index.json").exists() else []
+    idx = [e for e in idx if e["key"] != key] + [{"key": key, "round": r, "label": label, "note": note,
+                                                   "success": int(res.get("success", 0)), "n": int(res.get("n", 0))}]
+    (d / "index.json").write_text(json.dumps(idx, indent=1))
 
 
 def _keep_best(task_path: Path, res: dict, best, label: str):
