@@ -45,6 +45,16 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+
+GOAL_CONDITIONS_DOC = (
+    " measured.goal_conditions has one entry per goal condition, over the replays: in how many it was met, the share "
+    "of the time it held, how close it came (0 = met), the range of each quantity it reads, and for 'the whole time' "
+    "conditions when it first broke and the values at that moment. Start from the condition that fails earliest: if "
+    "a 'the whole time' condition breaks in the first second, the plan's first steps must keep it (put it in their "
+    "keep rule) before anything else can count. measured.handoffs says, for each step that was done, whether the next "
+    "step got anywhere from where it ended; a verdict there means that step ends in a state the next can't continue "
+    "from, so ask more of its ending (its done_when) rather than of the next step. ")
+
 class ReasoningUnavailable(RuntimeError):
     pass
 
@@ -102,6 +112,7 @@ class GoalProposal(BaseModel):
     why_not: str = Field(default="", max_length=600)
     warnings: list[str] = Field(default_factory=list, max_length=4)
     suggestion: str = Field(default="", max_length=400)
+    start: str = "scene"  # "in_hand": every try begins with the object already in the robot's hand
 
 
 # what a formula may call and name (goal_terms checks the same): one text for every prompt that asks for formulas
@@ -331,7 +342,8 @@ class ReasoningService:
         rec.accepted = True
         return plan, rec
 
-    def review_goal(self, request: str, checklist: list[str], scene: dict) -> tuple[GoalReview, InferenceRecord]:
+    def review_goal(self, request: str, checklist: list[str], scene: dict,
+                    morph_requires: list[str] | None = None) -> tuple[GoalReview, InferenceRecord]:
         system = (
             "You check the goal checklist another module wrote for a robot task, before anything runs. The robot "
             "will be judged ONLY on this checklist. Read the operator's request and the checklist (in plain words). "
@@ -341,10 +353,19 @@ class ReasoningService:
             "the request doesn't make (e.g. lifting for \"on the floor\"); or a number is clearly off. Small, "
             "reasonable tolerances are fine; don't nitpick wording. What a word means physically counts as asked for: "
             "a throw means it is let go while moving fast (e.g. speed > 1 m/s) away from where it lands; a drop means let "
-            "go above it; gently means let go almost at rest; knocking over means it ends on its side. Otherwise ok=true with no problems. Reply with "
+            "go above it; gently means let go almost at rest; knocking over means it ends on its side. The checklist may "
+            "also say the object starts in the robot's hand: that is right whenever the request is about handling it in the "
+            "hand (spinning, twirling or rolling it in, between or around the fingers or in the palm), which only makes "
+            "sense if it is already there; don't call that unasked for. Spinning or twirling means it keeps turning at a real "
+            "speed (e.g. over 90 deg/s for the last few seconds), not any rotation at some point; handling it in the hand "
+            "means it stays in the hand (not dropped) while that happens. Numbers that make a vague word measurable (how fast, how "
+            "long, how far) are part of reading the request, never an added demand; only complain about one that is clearly "
+            "off. morph_requires lists what Morph itself insists on for this kind of request: items that do that are correct, "
+            "never flag them. Otherwise ok=true with no problems. Reply with "
             "ONLY one JSON object: {\"ok\": bool, \"problems\": [...]}."
         )
-        user = json.dumps({"request": request, "checklist": checklist, "scene": scene}, indent=1, default=str)
+        user = json.dumps({"request": request, "checklist": checklist, "scene": scene,
+                           "morph_requires": morph_requires or []}, indent=1, default=str)
         return self._chat("review_goal", system, user, GoalReview)
 
     def goal_from_request(self, description: str, scene: dict, demo: dict | None,
@@ -422,7 +443,8 @@ class ReasoningService:
             "rests anyway) and never means lifting; \"near\", \"next to\", \"by\" with no distance given = near with "
             "tol 0.1; in formulas z is the object's centre (half its height up when resting), so heights of where it "
             "rests use bottom. Write only what the request asks for. Reply with ONLY one "
-            "JSON object with keys: conditions, rationale, ambiguities, feasible, refusal, why_not, suggestion, warnings."
+            "JSON object with keys: conditions, rationale, ambiguities, feasible, refusal, why_not, suggestion, warnings, "
+            "start."
         )
         system += (
             " GOALS ABOUT THE ROBOT'S OWN BODY: a request can be about the robot itself rather than the object (\"close "
@@ -439,6 +461,15 @@ class ReasoningService:
             "{\"kind\": \"expression\", \"expr\": \"joint_frac_min('pip|dip|mcp_pitch') > 0.8\", \"text\": \"every "
             "finger bent at least 80% of the way closed\"}. The object can be left out entirely; add object conditions "
             "only if the request mentions the object."
+            " WHICH PART TOUCHES IT: touching('pattern') is 1 while any matching finger or body touches the object "
+            "(finger labels are thumb, index, middle, ring, little, as listed in robots_selected[].hands; with two hands "
+            "left_thumb, right_index, ...), and fingers_touching counts the fingers touching it. E.g. \"without the "
+            "thumb\" -> {\"kind\": \"expression\", \"when\": \"always\", \"expr\": \"touching('thumb') == 0\", \"text\": "
+            "\"the thumb never touches it\"}; \"hold it with two fingers\" -> fingers_touching == 2 (when \"last\")."
+            " WHERE IT STARTS: set \"start\": \"in_hand\" when the request is about handling the object that is already in "
+            "the hand (spin / twirl / roll it in or between the fingers, juggle it in the palm, pass it from finger to "
+            "finger): every try then begins with the object held in the hand, and Morph puts it there. Otherwise "
+            "\"start\": \"scene\" (it starts where it is in the scene, e.g. \"pick it up and spin it\")."
         )
         payload = {"request": description or "(none: reproduce what the demonstration achieved)",
                    "scene": scene, "demonstration": demo}
@@ -504,7 +535,7 @@ class ReasoningService:
             "is rewarded for reaching each step of a plan in order, and for getting closer to the current step. You get "
             "the current steps and measurements of what the trained robot actually does: which step it gets stuck on, "
             "how close it comes, the range of each quantity in that step while it tries, how close its end parts get "
-            "to the object, how well it grips and lifts. Rewrite the steps so it can make progress from where it is, "
+            "to the object, how well it grips and lifts." + GOAL_CONDITIONS_DOC + "Rewrite the steps so it can make progress from where it is, "
             "the way a coach breaks a skill down: split the step it is stuck on into smaller ones it can almost do "
             "already (e.g. first get a fingertip or foot within a few cm of the object's surface, then get two tips on "
             "opposite sides, then close, then lift), loosen thresholds it never gets near, and prefer graded "
@@ -563,7 +594,7 @@ class ReasoningService:
             "2 to 6 steps, done_when is a boolean formula over: x, y, z, bottom, top, tilt_deg, yaw_deg, speed, vx, vy, "
             "vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), robot_x, "
             "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z" + MORE_NAMES_DOC + "; " + FUNCS_DOC
-            + "; Python syntax. grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
+            + "; Python syntax." + GOAL_CONDITIONS_DOC + "grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
             "how far the gripper is commanded shut. " + REWARD_TERMS_DOC + "A candidate can differ in its steps, its "
             "reward_terms, or both. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
             "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}], "

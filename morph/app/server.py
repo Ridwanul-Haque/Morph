@@ -391,6 +391,11 @@ class App:
              "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal, self.resolve(path))
                                                                   if self.goal else None),
              "recipes": P.program_body(prof)}
+        if self.goal is not None and self.goal.start == "in_hand" and not r["learned"]:  # learned, never a program
+            from ..project import body_problem
+            r["plan"], r["recipes"] = "learn_policy", None
+            if prof.gripper.get("type") != "multi_finger_hand":
+                r["plan"], r["why_not"] = "unsupported", body_problem(self.goal, self.resolve(path), prof)
         if self.goal is not None and not r["learned"]:  # an earlier attempt that didn't work (or didn't finish)
             from ..learn_task import learning_status, task_dir
             st = learning_status(task_dir(prof.name, self.goal))
@@ -415,13 +420,13 @@ class App:
         from ..goals import checked_when, explain
         return {"conditions": [c.model_dump() | {"text": c.describe(), "detail": explain(c, self.project.scene)}
                                for c in self.goal.conditions], "checked_when": checked_when(self.goal),
-                "notes": self.goal.notes, "warnings": self.goal.warnings, "from": self.goal_info.get("goal_from", ""), "demo": self.goal_info.get("demo")}
+                "start": self.goal.start_text(), "notes": self.goal.notes, "warnings": self.goal.warnings, "from": self.goal_info.get("goal_from", ""), "demo": self.goal_info.get("demo")}
 
     def set_conditions(self, conds: list[dict]) -> dict:
         from ..goals import Condition, GoalSpec, validate
         g = GoalSpec(object=self.project.scene.object_name,
                      conditions=[Condition(**{k: v for k, v in c.items() if k in Condition.model_fields}) for c in conds],
-                     notes=self.goal.notes if self.goal else [])
+                     notes=self.goal.notes if self.goal else [], start=self.goal.start if self.goal else "scene")
         errs = validate(g, self.project.scene)
         if errs:
             raise ValueError("; ".join(errs))

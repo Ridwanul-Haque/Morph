@@ -165,6 +165,9 @@ def _build(scene, robot_path, goal_xy_yaw, placement):
             base = tuple(placement) if placement else auto_placement(scene, robot_path, goal_xy_yaw)
             spec.option.impratio, spec.option.cone = robot.option.impratio, robot.option.cone
             spec.option.integrator = robot.option.integrator
+            for k in ("timestep", "density", "viscosity", "noslip_iterations", "iterations", "ls_iterations", "tolerance",
+                      "solver"):  # a picture only: the scene's settings, without MuJoCo warning about each one
+                setattr(robot.option, k, getattr(spec.option, k))
             frame = spec.worldbody.frames[0]
             if not free:
                 from ..introspect import floor_offset

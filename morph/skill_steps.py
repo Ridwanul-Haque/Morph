@@ -270,7 +270,8 @@ def plan_steps(prof, goal, scene, p: dict, llm=None, log=print) -> tuple[list[St
         try:
             errors, fix = [], None
             for attempt in range(2):  # one chance to fix formulas Morph can't read
-                prop, rec = llm.skill_steps(robot_brief(prof), [c.describe() for c in goal.conditions], scene.geometry(),
+                prop, rec = llm.skill_steps(robot_brief(prof), [c.describe() for c in goal.conditions]
+                                               + ([goal.start_text()] if goal.start_text() else []), scene.geometry(),
                                             scales(scene, p), fix, body=_body_facts(prof) if body else None)
                 raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
                 cand, errors = check_steps(raw, fixtures, obj)

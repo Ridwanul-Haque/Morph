@@ -20,6 +20,7 @@ Quantities an expression can use (metres, degrees):
   part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level), grip (0..1: how close
   the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
   its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut)
+  fingers_touching (how many of the robot's fingers touch it; with no hand, how many of its parts),
   roll_deg, pitch_deg (the object's tilt about its own long and short axes), goal_x, goal_y, goal_z (where the goal
   puts it, when it has a place; target_x ... mean the same), <fixture>_x, <fixture>_y, <fixture>_top (a fixture's
   centre and top, e.g. bin_x)
@@ -38,7 +39,7 @@ FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
              "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps", "roll_deg", "pitch_deg",
-             "goal_x", "goal_y", "goal_z"}
+             "goal_x", "goal_y", "goal_z", "fingers_touching"}
 GOAL_VARIABLES = {"goal_x", "goal_y", "goal_z"}  # only when the goal has a place (else not a number: the check says so)
 FIXTURE_ATTRS = ("_x", "_y", "_top")  # bin_x, bin_y, bin_top: a fixture's centre and top
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
@@ -47,7 +48,9 @@ ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_
 # a name pattern ("pip", "index|middle", "foot") matched against the robot's joint / end-part names. joint_frac: how far
 # the matching joints are through their range, 0 at the lower limit, 1 at the upper (mean; _min / _max: the least / most).
 # part_x / part_y / part_z: where the matching end parts (fingertips, hand, feet) are (their mean), in metres.
-BODY_FUNCS = {"joint_frac", "joint_frac_min", "joint_frac_max", "part_x", "part_y", "part_z"}
+# touching: 1 if any matching finger ("thumb", "index|middle") or body touches the object. Judged on the contacts; the
+# learner on the GPU only sees fingertips, counted as touching within 6 mm of the surface.
+BODY_FUNCS = {"joint_frac", "joint_frac_min", "joint_frac_max", "part_x", "part_y", "part_z", "touching"}
 # the maths a shaping term needs (Eureka-style terms are often exp(-d / scale), tanh, a squared error, an angle)
 MATH_FUNCS = {"exp", "log", "tanh", "cos", "sin", "atan2", "cosd", "sind", "atan2d", "clip", "pow"}
 FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | MATH_FUNCS | BODY_FUNCS
@@ -56,6 +59,8 @@ MAX_POWER = 4.0  # x ** n with a number n, |n| <= 4 (a squared or cubed error; n
 GENERIC = ("orientation", "height", "away_from", "moved", "expression")
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce
 ANGLE_UNIT, LENGTH_UNIT = 90.0, 0.3  # a violation of 90 degrees or 30 cm counts as "1" in the reward
+SPIN_UNIT, FLAG_UNIT = 90.0, 1.0  # ... and so does 90 deg/s, or a yes/no (touching, held) that is the wrong way round
+FLAGS = {"held", "grip", "closure", "fingers_touching"}
 
 
 class ExprError(ValueError):
@@ -166,8 +171,17 @@ def uses(expr: str) -> set[str]:
 
 
 def _unit(node) -> float:
-    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-    return ANGLE_UNIT if any(v.endswith("_deg") for v in names) else LENGTH_UNIT
+    """What counts as 1 for a comparison: by what it compares. Spin in deg/s once shared the 30 cm unit, so missing
+    60 deg/s weighed as much as being 18 m off and swamped every other part of the reward."""
+    calls = {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} - calls
+    if any(v.endswith("_dps") for v in names):
+        return SPIN_UNIT
+    if any(v.endswith("_deg") for v in names):
+        return ANGLE_UNIT
+    if (names or calls) and names <= FLAGS and calls <= {"touching"}:
+        return FLAG_UNIT
+    return LENGTH_UNIT
 
 
 def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
@@ -240,7 +254,7 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
             for op, right in zip(n.ops, n.comparators):
                 a, b, u = val(left), val(right), _unit(n)
                 if isinstance(op, (ast.Eq, ast.NotEq)):
-                    tol = xp.maximum(0.01 if u == LENGTH_UNIT else 2.0, 0.02 * xp.abs(b))
+                    tol = xp.maximum(2.0 if u in (ANGLE_UNIT, SPIN_UNIT) else 0.01, 0.02 * xp.abs(b))
                     d = xp.maximum(xp.abs(a - b) - tol, 0.0)
                     flip = neg != isinstance(op, ast.NotEq)
                     total = total + (xp.maximum(tol - xp.abs(a - b), 0.0) if flip else d) / u
@@ -285,6 +299,12 @@ def body_names(pattern: str, names) -> list[str]:
 def body_value(xp, f: str, pattern: str, v: dict):
     """joint_frac / part_x ... for this robot (see BODY_FUNCS). NaN if it has no joint or part of that name (NumPy;
     the checklist then says so), 0 under JAX (Morph doesn't train for a body that can't be measured)."""
+    if f == "touching":
+        src = v.get("touch") or {}
+        vals = [src[k] for k in body_names(pattern, [k for k in src if k != "fingers_touching"])]
+        if not vals:
+            return xp.asarray(float("nan") if xp.__name__ == "numpy" else 0.0)
+        return xp.max(xp.stack([xp.asarray(x, dtype=float) for x in vals]))
     if f.startswith("joint_frac"):
         src = v.get("joints") or {}
         vals = [src[k] for k in body_names(pattern, src)]
@@ -297,6 +317,45 @@ def body_value(xp, f: str, pattern: str, v: dict):
     if not vals:
         return xp.asarray(float("nan") if xp.__name__ == "numpy" else 0.0)
     return xp.mean(xp.stack([xp.asarray(x) for x in vals]), axis=0)["xyz".index(f[-1])]
+
+
+def missing_parts(conditions: list[dict], names: dict[str, list[str]]) -> list[str]:
+    """Name patterns in the goal's formulas that match nothing on this robot (fingers.part_names), e.g. 'thumb' in
+    touching('thumb') on a parallel gripper."""
+    out = []
+    for c in conditions:
+        if not c.get("expr"):
+            continue
+        try:
+            tree = ast.parse(normalize(c["expr"]), mode="eval")
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in BODY_FUNCS and n.args \
+                    and isinstance(n.args[0], ast.Constant):
+                pat = str(n.args[0].value)
+                src = names["touch"] if n.func.id == "touching" else names["joints"] if n.func.id.startswith("joint") \
+                    else names["parts"]
+                if not body_names(pat, src):
+                    out.append(pat)
+    return sorted(set(out))
+
+
+MOTION = {"speed", "vx", "vy", "vz", "spin_dps", "spin_z_dps"}
+
+
+def needs_motion_at_rest(c: dict) -> bool:
+    """A formula only about how the object moves that fails while it is still ("spin_dps > 60"): it can't hold the
+    whole time, since every try starts with the object at rest."""
+    if c.get("kind") != "expression" or not c.get("expr"):
+        return False
+    try:
+        names = uses(normalize(c["expr"]))
+    except SyntaxError:
+        return False
+    if not names or not names <= MOTION:
+        return False
+    return float(violation(__import__("numpy"), parse(c["expr"], {}), {n: 0.0 for n in MOTION})) > 1e-9
 
 
 def term_value(xp, tree: ast.Expression, v: dict):
@@ -401,7 +460,7 @@ def snapshot(v: dict) -> dict:
     for k, x in v.items():
         if k in ("dist", "R", "parts"):
             continue
-        if k == "joints":
+        if k in ("joints", "touch"):
             out[k] = {n: float(j) for n, j in x.items()}
         elif isinstance(x, dict) or getattr(x, "ndim", 0):
             continue  # not a single number
@@ -409,6 +468,21 @@ def snapshot(v: dict) -> dict:
             out[k] = float(x)
     out["dist"] = {n: float(x) for n, x in v["dist"].items()}
     return out
+
+
+FLICKER_TICKS = 5  # contacts come and go for a tick or two even in a steady grip: a break shorter than 0.1 s isn't one
+CONTACT_NAMES = {"held", "fingers_touching"}
+
+
+def contact_based(c: dict) -> bool:
+    """A condition judged from the contacts (held, touching(...), fingers_touching): yes/no readings that flicker."""
+    e = c.get("expr") or ""
+    if c.get("kind") != "expression" or not e:
+        return False
+    try:
+        return bool(uses(e) & CONTACT_NAMES) or "touching(" in e
+    except SyntaxError:
+        return False
 
 
 class History:
@@ -424,6 +498,7 @@ class History:
         self.was_held = False
         self.released = False
         self.window: dict[int, list] = {}
+        self.streak: dict[int, int] = {}  # ticks in a row a contact-based condition has been broken
 
     def update(self, v: dict) -> None:
         held = float(v["held"]) > 0.5
@@ -432,6 +507,9 @@ class History:
         for i, c in self.items:
             x = float(condition_violation(self.np, {**c, "when": "end"}, v, self.fx, self.half))
             w = c["when"]
+            if w in ("always", "last") and contact_based(c):  # a flicker of the contacts isn't a break
+                self.streak[i] = self.streak.get(i, 0) + 1 if x > 1e-6 else 0
+                x = x if self.streak[i] >= FLICKER_TICKS else 0.0
             keep = False
             if w == "release":
                 keep = let_go  # the last release counts
@@ -529,8 +607,13 @@ WORDS = {
     "hand_x": ("the hand's x", "m"), "hand_y": ("the hand's y", "m"), "hand_z": ("the hand's height", "m"),
     "robot_x": ("the robot's x", "m"), "robot_y": ("the robot's y", "m"), "base_z": ("the robot body's height", "m"),
     "base_tilt_deg": ("the robot body's tilt", "deg"), "spin_dps": ("how fast it spins", "deg/s"),
+    "spin_z_dps": ("how fast it turns about the vertical", "deg/s"), "fingers_touching": ("the number of fingers touching it", ""),
     "goal_x": ("the goal's x", "m"), "goal_y": ("the goal's y", "m"), "goal_z": ("the goal's height", "m"),
 }
+def _negate(words: str) -> str:
+    return words.replace("the robot holding", "the robot not holding").replace(" touching ", " not touching ")
+
+
 _OPS = {ast.Lt: "under", ast.LtE: "at most", ast.Gt: "over", ast.GtE: "at least", ast.Eq: "about", ast.NotEq: "not"}
 
 
@@ -559,6 +642,9 @@ def describe_formula(expr: str, object_name: str = "the object") -> str:
                 return {"": obj, "hand": "the hand", "robot": "the robot", "goal": "the goal",
                         "start": "where it started"}.get(base, f"the {base}")
             return f"{thing(n.args[0].left.id)}'s distance to {thing(n.args[0].right.id)}", "m"
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "touching" and n.args \
+                and isinstance(n.args[0], ast.Constant):
+            return f"the {str(n.args[0].value).replace('|', ' or ')} touching {obj}", "flag"
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "dist_to" and n.args:
             a = n.args[0]
             return f"{obj}'s distance to the {a.value if isinstance(a, ast.Constant) else getattr(a, 'id', '?')}", "m"
@@ -603,7 +689,7 @@ def describe_formula(expr: str, object_name: str = "the object") -> str:
         if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
             w = word(n.operand)
             if w and w[1] == "flag":  # "not held"
-                return w[0].replace("the robot holding", "the robot not holding")
+                return _negate(w[0])
             return f"not ({text(n.operand)})"
         w = word(n)
         if w and w[1] == "flag":  # a bare "held"
@@ -615,7 +701,7 @@ def describe_formula(expr: str, object_name: str = "the object") -> str:
             if w and const is not None:
                 if w[1] == "flag":
                     on = (op in (ast.Eq, ast.GtE, ast.Gt) and const >= 0.5) or (op in (ast.Lt, ast.LtE, ast.NotEq) and const <= 0.5)
-                    return w[0] if on else w[0].replace("the robot holding", "the robot not holding")
+                    return w[0] if on else _negate(w[0])
                 return f"{w[0]} {_OPS[op]} {number(float(const), w[1])}"
             # abs(a - b) < c: a within c of b
             if (isinstance(left, ast.Call) and isinstance(left.func, ast.Name) and left.func.id == "abs" and left.args

@@ -212,6 +212,22 @@ def convert_urdf(urdf_path: str | Path, floating: bool | None = None,
     if big:
         notes.append(f"the URDF says {big[0]} can push with {effort[big[0]]:g} Nm, far more than a part that light needs "
                      "(often a placeholder value in the file)")
+    # CAD exports often have neighbouring parts' meshes overlapping where they meet (a LinkerHand's knuckles): MuJoCo
+    # only ignores parent and child, so those pairs push each other apart forever and the fingers never hold still.
+    # Pairs already touching at rest don't collide with each other (as MoveIt's setup assistant does)
+    m1 = spec.compile()
+    d1 = mujoco.MjData(m1)
+    mujoco.mj_forward(m1, d1)
+    pairs = set()
+    for i in range(d1.ncon):
+        b1, b2 = int(m1.geom_bodyid[d1.contact[i].geom1]), int(m1.geom_bodyid[d1.contact[i].geom2])
+        if b1 and b2 and b1 != b2:
+            pairs.add(tuple(sorted((m1.body(b1).name, m1.body(b2).name))))
+    for a, b in sorted(pairs):
+        spec.add_exclude(bodyname1=a, bodyname2=b)
+    if pairs:
+        notes.append(f"{len(pairs)} pair(s) of its parts already overlap at rest (e.g. {' and '.join(sorted(pairs)[0])}, "
+                     "common in CAD exports): those pairs don't collide with each other")
     spec.meshdir = str(meshes)
     xml_path = out / f"{name}.xml"
     xml_path.write_text(spec.to_xml())

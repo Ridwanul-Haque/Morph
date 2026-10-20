@@ -122,7 +122,7 @@ def test_several_step_plans_are_tried_and_the_best_is_kept(tmp_path, monkeypatch
                                               {"idea": "get behind it", "steps": [mk("behind", "hand_x < x - 0.03")]}],
                                   rationale="stuck at step 1"), None
 
-    scores = {"keep the current steps": 1.0, "touch it first": 9.0, "get behind it": 4.0}
+    scores = {"keep the current steps": 1.0, "touch it first": 9.0, "get behind it": 4.0}  # the explorers: 1.0 too
 
     def fake_train(tp, n, restore):  # a policy, and a training evaluation that scores each plan differently
         t = _json.loads(tp.read_text())
@@ -133,9 +133,18 @@ def test_several_step_plans_are_tried_and_the_best_is_kept(tmp_path, monkeypatch
         (tp.parent / "params.pkl").write_bytes(idea.encode())
         return True
 
+    trained = []
+    _fake = fake_train
+
+    def fake_train(tp, n, restore):
+        trained.append(tp.parent.name)
+        return _fake(tp, n, restore)
+
     chosen = lt.search_step_plans(pj, goal, task_path, fake_train, FakeLLM(), {"stuck_at": {}}, [{"round": 1}], 1000,
                                   tries=1, k=2, log=lambda s: None)
-    assert chosen["idea"] == "touch it first" and chosen["tried"] == 3
+    # the 2 plans, and the current one as it is and exploring 2 other ways (a population)
+    assert chosen["idea"] == "touch it first" and chosen["tried"] == 5
+    assert len(trained) == 5 + 3  # the weaker 2 stop after the first half; the other 3 practise again
     assert load_task(task_path)["steps"][0]["done_when"] == "touch_dist < 0.05"
     assert (task_path.parent / "params.pkl").read_bytes() == b"touch it first"  # the winner's policy continues
     assert not list(task_path.parent.glob("candidate_*"))

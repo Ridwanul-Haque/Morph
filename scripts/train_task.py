@@ -37,8 +37,8 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.goal_terms import (BODY_FUNCS, HOLD_TICKS, condition_violation, is_generic, is_temporal, normalize,  # noqa: E402
-                              parse, term_value, uses, violation)
+from morph.goal_terms import (BODY_FUNCS, FLICKER_TICKS, HOLD_TICKS, condition_violation, is_generic, is_temporal,  # noqa: E402
+                              normalize, parse, term_value, uses, violation)
 from morph.reward_parts import weights as reward_weights  # noqa: E402
 from morph.task_model import (CTRL_DT, SIM_DT, Residual, apply_action, build_task_model, indices, load_task, measure,  # noqa: E402
                               next_ctrl,  # noqa: E402
@@ -91,7 +91,8 @@ def domain_randomize(env: "TaskLearn", level: str):
 
 
 class TaskLearn(mjx_env.MjxEnv):
-    def __init__(self, task: dict, envs: int = 2048, randomize: str = "off", practice_starts: bool = True):
+    def __init__(self, task: dict, envs: int = 2048, randomize: str = "off", practice_starts: bool = True,
+                 eased: bool = True):
         cfg = config_dict.create(ctrl_dt=CTRL_DT, sim_dt=SIM_DT, episode_length=int(task["episode_s"] / CTRL_DT),
                                  action_repeat=1, impl="warp", naconmax=24 * envs, njmax=160)
         super().__init__(cfg, None)
@@ -113,6 +114,20 @@ class TaskLearn(mjx_env.MjxEnv):
         self.generic = [c for c in task["conditions"] if is_generic(c) and not is_temporal(c)]
         # conditions about a moment during the task: when it lets go (throwing), the whole time, at some point
         self.temporal = [c for c in task["conditions"] if is_temporal(c)]
+        # early termination (DeepMimic, Peng et al. 2018): once a "the whole time" condition is broken the try can't
+        # succeed, so it ends there instead of practising on in a state that no longer counts (the thumb on the pen,
+        # the pen on the floor). Only conditions that held when the try began can end it: a stand-in measure that
+        # reads differently from the judge's at the start mustn't end every try at once
+        self.stop_rules = [c for c in self.temporal if c["when"] == "always"] if task.get("early_stop", True) else []
+        # an easier version of the goal first (task["ease"], set by learn_task._ease between rounds): each condition may
+        # miss by up to its slack (goal_terms units), scaled per try by a random share, so practice covers the range
+        # from the eased goal to the real one (as automatic domain randomization widens what it practises on only as
+        # the policy copes). The evaluation, and every judgement of success, is on the real goal
+        slack = (task.get("ease") or {}).get("slack") or {} if eased else {}
+        idx = {id(c): i for i, c in enumerate(task["conditions"])}
+        at = lambda cs: jp.array([float(slack.get(str(idx[id(c)]), 0.0)) for c in cs])  # noqa: E731
+        self._slack_g, self._slack_t, self._slack_s = at(self.generic), at(self.temporal), at(self.stop_rules)
+        self._eased = bool(slack) and any(float(v) > 0 for v in slack.values())
         # every condition about the robot's own body (joint_frac, part_z: a fist, a raised arm), none about the object
         self.body_goal = bool(task["conditions"]) and all(
             c.get("kind") == "expression" and c.get("expr") and uses(normalize(c["expr"])) & BODY_FUNCS
@@ -158,6 +173,12 @@ class TaskLearn(mjx_env.MjxEnv):
             z = task.get("base_z", 0.4)
             q[self.ix.base_q:self.ix.base_q + 7] = [mx, my, z, np.cos(myaw / 2), 0, 0, np.sin(myaw / 2)]
         self._q_init = jp.array(q)
+        self._in_hand = bool(task.get("start_state"))
+        self._hand_starts = None
+        if self._in_hand:  # every try starts with the object in the hand (morph/in_hand.py), in one of its poses
+            self._q_init = jp.array(task["start_state"]["qpos"])
+            poses = task.get("start_states") or [task["start_state"]]
+            self._hand_starts = jp.array([st["qpos"] for st in poses])
         # practice from where it got closest last round (diagnose saves them): a share of resets start there
         st = task.get("starts")
         self._starts, self._start_share = None, 0.0
@@ -188,12 +209,13 @@ class TaskLearn(mjx_env.MjxEnv):
         self.residual = Residual.of(task, task.get("_dir", "."))
         # asymmetric actor-critic (Pinto et al. 2018): the critic also sees what the robot can't (how well it really
         # grips, how far through the steps it is, this copy's true parcel weight and friction); the policy is unchanged
-        self.n_extra = 9 if task.get("critic_extras") else 0
+        # (version 2 also tells the critic how eased this try's goal is)
+        self.n_extra = {True: 9, 1: 9, 2: 10}.get(task.get("critic_extras"), 0)
         self._obj_geom = int(np.flatnonzero(np.asarray(self._mj_model.geom_bodyid) == self.ix.block)[0])
         self._mass0 = float(self._mj_model.body_mass[self.ix.block])
         self._fric0 = float(self._mj_model.geom_friction[self._obj_geom, 0])
 
-    def _dist(self, data, info=None):
+    def _dist(self, data, info=None, u=None):
         """How far from done, in metres: distance to the place (if the goal has one) plus how unmet the
         other conditions are (goal_terms units, 1 ~ 30 cm). Returns (distance, updated tracking of the
         conditions about a moment during the task)."""
@@ -202,12 +224,15 @@ class TaskLearn(mjx_env.MjxEnv):
         d = jp.hypot(p[0] - tx, p[1] - ty) + jp.abs(p[2] - tz) if self.has_place else jp.zeros(())
         if not self.generic and not self.temporal:
             return d, {}
+        u = info["ease_u"] if u is None and info is not None and "ease_u" in info else (u if u is not None else 0.0)
         # graded "held" (grip) here: this is the learner's sense of how far it is, not the judgement of success
         v = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
-        unmet = sum((condition_violation(jp, c, v, self.fx, self.half) for c in self.generic), jp.zeros(()))
+        unmet = sum((jp.maximum(condition_violation(jp, c, v, self.fx, self.half) - u * self._slack_g[k], 0.0)
+                     for k, c in enumerate(self.generic)), jp.zeros(()))
         track = {}
         if self.temporal:
             x = jp.stack([condition_violation(jp, {**c, "when": "end"}, v, self.fx, self.half) for c in self.temporal])
+            x = jp.maximum(x - u * self._slack_t, 0.0)
             held = v["held"]
             if info is None:  # the start of an episode
                 tv, released, let_go = x, jp.zeros(()), jp.zeros(())
@@ -231,6 +256,12 @@ class TaskLearn(mjx_env.MjxEnv):
             unmet = unmet + sum(terms)
             track = {"tv": tv, "released": released, "was_held": held}
         return d + 0.3 * unmet, track
+
+    def _broken(self, data, u=0.0):
+        """Per "the whole time" condition: is it broken now (strict, as judged; by more than its slack when eased)."""
+        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
+        return jp.stack([condition_violation(jp, {**c, "when": "end"}, v, self.fx, self.half) > u * self._slack_s[k] + 1e-6
+                         for k, c in enumerate(self.stop_rules)])
 
     def _grasp_aim(self, data, bp, R):
         """(distance from the planned grip point, 0..1 how well the hand matches the planned grip there). The fingers
@@ -280,11 +311,15 @@ class TaskLearn(mjx_env.MjxEnv):
     def reset(self, rng):
         rng, k1, k2, k3 = jax.random.split(rng, 4)
         q = self._q_init
-        dxy = jax.random.uniform(k1, (2,), minval=-0.02, maxval=0.02)
-        q = q.at[self.ix.block_q:self.ix.block_q + 2].add(dxy)
-        dy = jax.random.uniform(k2, (), minval=-0.17, maxval=0.17)
-        yaw0 = self.task["start"][2] + dy
-        q = q.at[self.ix.block_q + 3:self.ix.block_q + 7].set(jp.array([jp.cos(yaw0 / 2), 0.0, 0.0, jp.sin(yaw0 / 2)]))
+        if self._hand_starts is not None:
+            rng, kh = jax.random.split(rng)
+            q = self._hand_starts[jax.random.randint(kh, (), 0, self._hand_starts.shape[0])]
+        if not self._in_hand:  # vary where it starts (in the hand it stays where the grip put it)
+            dxy = jax.random.uniform(k1, (2,), minval=-0.02, maxval=0.02)
+            q = q.at[self.ix.block_q:self.ix.block_q + 2].add(dxy)
+            dy = jax.random.uniform(k2, (), minval=-0.17, maxval=0.17)
+            yaw0 = self.task["start"][2] + dy
+            q = q.at[self.ix.block_q + 3:self.ix.block_q + 7].set(jp.array([jp.cos(yaw0 / 2), 0.0, 0.0, jp.sin(yaw0 / 2)]))
         ctrl0 = self._ctrl0
         if self._starts is not None:
             rng, k4, k5 = jax.random.split(rng, 3)
@@ -305,12 +340,21 @@ class TaskLearn(mjx_env.MjxEnv):
             ctrl0 = jp.where(use, held_ctrl, self._ctrl0)
             data = data.replace(ctrl=ctrl0)
         delay = (jax.random.uniform(k3) < self.rand["delay_prob"]).astype(jp.float32) if self.rand else jp.zeros(())
-        d0, track = self._dist(data)
+        u = jp.zeros(())
+        if self._eased:  # how eased this try's goal is: anywhere from the real goal (0) to the eased one (1)
+            rng, ke = jax.random.split(rng)
+            u = jax.random.uniform(ke)
+        d0, track = self._dist(data, u=u)
         t0 = jp.where(use, self._start_t[i_start], 0) if self._starts is not None else jp.zeros((), jp.int32)
         info = {"rng": rng, "last_act": jp.zeros(self.nu), "prev_d": d0, "ctrl": ctrl0, "delay": delay,
-                "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), **track}
+                "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), "ease_u": u,
+                **track}
         info["phi"] = self._steps(data, info["step"], info["streak"])[1]
-        metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done")}
+        if self.stop_rules:
+            info["armed"] = ~self._broken(data, u)
+            info["broke"] = jp.zeros(len(self.stop_rules), jp.int32)
+        metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done",
+                                             "ended_early")}
         metrics |= {f"term_{k}": jp.zeros(()) for k in range(len(self.terms))}
         metrics |= {f"termw_{k}": jp.zeros(()) for k in range(len(self.terms))}
         metrics |= {f"part_{k}": jp.zeros(()) for k in self.parts}
@@ -335,7 +379,8 @@ class TaskLearn(mjx_env.MjxEnv):
         return jp.stack([v["grip"], jp.minimum(v["touch_dist"], 0.5) * 4.0, jp.minimum(v["lifted"], 0.5) * 4.0,
                          v["closure"], jp.asarray(v["held"], jp.float32), info["step"].astype(jp.float32) / n,
                          info["t"].astype(jp.float32) * CTRL_DT / self.task["episode_s"],
-                         m.body_mass[self.ix.block] / self._mass0, m.geom_friction[self._obj_geom, 0] / self._fric0])
+                         m.body_mass[self.ix.block] / self._mass0, m.geom_friction[self._obj_geom, 0] / self._fric0]
+                        + ([info["ease_u"]] if self.n_extra > 9 else []))
 
     def _demo_reward(self, obs, action):
         """How much this action looks like the demonstration's, in the most similar situation it went through
@@ -394,7 +439,8 @@ class TaskLearn(mjx_env.MjxEnv):
                 "success": 3.0 * ok,
                 "reach": 0.5 * (1 - jp.tanh(reach / 0.25)) * (1 - close) + 0.5 * jp.exp(-reach / 0.05) * aim_ok * (1 - close),
                 "smooth": -0.02 * jp.sum(jp.square(action - info["last_act"])),
-                "fling": -1.0 * jp.maximum(jp.linalg.norm(data.qvel[ix.block_v:ix.block_v + 3]) - 0.5, 0.0)}
+                # capped: a copy whose physics nearly blew up (a pen at 100 m/s) once outweighed the whole batch
+                "fling": -1.0 * jp.clip(jp.linalg.norm(data.qvel[ix.block_v:ix.block_v + 3]) - 0.5, 0.0, 5.0)}
         if self.heading:
             part["heading"] = 0.5 * jp.exp(-yaw_err ** 2 / 0.3) * close
         if self.upright:
@@ -418,6 +464,15 @@ class TaskLearn(mjx_env.MjxEnv):
             info["step"], info["phi"] = step, phi
         part = {k: w[k] * v for k, v in part.items()}
         r = sum(part.values(), jp.zeros(()))
+        ended, end_pen = jp.zeros(()), jp.zeros(())
+        if self.stop_rules:  # a "the whole time" condition broken for longer than a contact flicker: the try is over
+            info["broke"] = jp.where(self._broken(data, info["ease_u"]), info["broke"] + 1, 0).astype(jp.int32)
+            ended = jp.any(info["armed"] & (info["broke"] >= FLICKER_TICKS)).astype(jp.float32)
+            # what the rest of the try could have earned is lost, so ending it never pays (otherwise a try whose
+            # reward runs negative would learn to break a rule on purpose to stop early)
+            left = jp.maximum(self.task["episode_s"] - (info["t"] + 1) * self.dt, 0.0)
+            end_pen = ended * 3.0 * left
+            done = jp.maximum(done, ended)
         tvals = []
         if self.terms:  # Nemotron's terms, on the graded quantities (each clipped: one term can't swamp the rest)
             vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
@@ -426,7 +481,7 @@ class TaskLearn(mjx_env.MjxEnv):
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
-        state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), grasp_aim=z(aim_ok),
+        state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), grasp_aim=z(aim_ok), ended_early=ended,
                              success=ok.astype(jp.float32), dist=z(d),
                              steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)},
                              # what each part paid this tick (summed over a run: its total), the step bonus included
@@ -436,7 +491,7 @@ class TaskLearn(mjx_env.MjxEnv):
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own
         # environments; otherwise one bad copy turns the whole batch's numbers into NaN
         bad = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(r) | jp.isnan(shaped)
-        reward = jp.where(bad, 0.0, r * self.dt + shaped)
+        reward = jp.where(bad, 0.0, r * self.dt + shaped - end_pen)
         done = jp.where(bad, 1.0, done)
         obs = jax.tree_util.tree_map(lambda o: jp.where(jp.isnan(o), 0.0, o), obs)
         return state.replace(data=data, obs=obs, reward=reward, done=done)
@@ -555,7 +610,8 @@ def main():
     task["_dir"] = str(task_path.parent)
     out = task_path.parent
     # the evaluation always starts from the scene's start: the numbers are the real task, not the practice starts
-    env, eval_env = TaskLearn(task, a.envs, a.randomize), TaskLearn(task, 128, a.randomize, practice_starts=False)
+    env, eval_env = TaskLearn(task, a.envs, a.randomize), TaskLearn(task, 128, a.randomize, practice_starts=False,
+                                                                        eased=False)
     n_obs = obs_size(env.ix) + (1 if env.residual is not None else 0)
     print(json.dumps({"obs": n_obs, "actions": env.nu, "residual": env.residual is not None, "tips": [env.mj_model.body(int(b)).name for b in env.ix.tips]}),
           flush=True)
@@ -579,7 +635,9 @@ def main():
                "dist": float(metrics.get("eval/episode_dist", float("nan"))),
                # how many of the steps it gets through, on average by the end of an episode (the metric is
                # summed over the episode, so the running count's mean is a lower bound)
-               "steps_done": float(metrics.get("eval/episode_steps_done", 0.0)) / p.episode_length}
+               "steps_done": float(metrics.get("eval/episode_steps_done", 0.0)) / p.episode_length,
+               # the share of evaluation tries that ended early because a "the whole time" condition broke
+               "ended_early": float(metrics.get("eval/episode_ended_early", 0.0))}
         if env.terms:  # each of Nemotron's reward terms: its average value per control step in the evaluation
             rec["terms"] = [round(float(metrics.get(f"eval/episode_term_{k}", 0.0)) / p.episode_length, 4)
                             for k in range(len(env.terms))]
@@ -625,6 +683,12 @@ def main():
         weight = a.keep_copying * max(trust, 0.2)
         if weight > 0 and (out / task["demo"]).exists():
             keep_copying(out / task["demo"], env.nu, weight, n_extra=env.n_extra)
+    tw = task.get("ppo_tweaks") or {}  # this variant's exploration and learning speed (learn_task's population search)
+    if tw:
+        kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) * float(tw.get("entropy", 1.0))
+        kw["learning_rate"] = kw.get("learning_rate", 3e-4) * float(tw.get("lr", 1.0))
+        print(json.dumps({"ppo_tweaks": tw, "entropy_cost": kw["entropy_cost"], "learning_rate": kw["learning_rate"]}),
+              flush=True)
     if a.restore and Path(a.restore).exists():  # a later round: continue from where the last one got to
         restore = pickle.loads(Path(a.restore).read_bytes())
         print(json.dumps({"restored": a.restore}), flush=True)
@@ -644,7 +708,7 @@ def main():
     meta = {"task": str(task_path), "steps": a.steps, "num_envs": a.envs, "randomize": a.randomize,
             "randomize_ranges": ranges(a.randomize), "wall_s": round(time.time() - t0, 1),
             "network": shapes, "curve": log, "obs_size": n_obs, "actions": env.nu,
-            "keep_copying": a.keep_copying if task.get("demo") else 0.0, "stopped_early": stopped,
+            "keep_copying": a.keep_copying if task.get("demo") else 0.0, "stopped_early": stopped, "ppo_tweaks": tw,
             "residual": task.get("residual") if env.residual is not None else None}
     (out / "train_meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps({k: v for k, v in meta.items() if k != "curve"}), flush=True)

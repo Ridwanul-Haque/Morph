@@ -227,9 +227,24 @@ def goal_from_description_rules(text: str, scene: UserScene) -> GoalSpec:
     if m and not any(c.kind in ("at_position", "inside", "on_top_of", "touching") and not c.negate for c in conds):
         conds.append(Condition(kind="moved", tol=float(m.group(1)) / (100 if m.group(2) == "cm" else 1),
                                side=m.group(3), source="description"))
+    if re.search(r"\b(spin|twirl|twiddle|rotate|roll)\w*\b", t) and re.search(IN_HAND, t):
+        conds.append(Condition(kind="expression", expr="spin_dps > 180", when="last", seconds=2.0,
+                               text="spinning at over half a turn per second", source="description"))
+    m = re.search(r"\b(?:without|not|no|except|but not|other than)\s+(?:using\s+|with\s+|for\s+)?(?:the\s+|its\s+|a\s+)?"
+                  r"(thumb|index|middle|ring|little|pinky)\b", t)
+    if m:
+        finger = {"pinky": "little"}.get(m.group(1), m.group(1))
+        conds.append(Condition(kind="expression", expr=f"touching('{finger}') == 0", when="always",
+                               text=f"the {finger} never touches it", source="description"))
     if not conds:
         notes.append("no condition found in the description (try Nemotron for free-form requests)")
-    return GoalSpec(object=scene.object_name, conditions=conds, notes=notes)
+    start = "in_hand" if re.search(IN_HAND, t) else "scene"
+    return GoalSpec(object=scene.object_name, conditions=conds, notes=notes, start=start)
+
+
+# the request is about handling it in the hand, so it starts there (spinning a pen, rolling a ball in the palm)
+IN_HAND = (r"\b(in|within|between|across|over|around|through|along)\s+(the\s+|its\s+|one\s+|a\s+)?(fingers?|palm|hand)\b"
+           r"|\bin-hand\b|\bfinger\s?tips?\b")
 
 
 def merge(demo_goal: GoalSpec | None, text_goal: GoalSpec | None) -> GoalSpec:
@@ -249,7 +264,7 @@ def merge(demo_goal: GoalSpec | None, text_goal: GoalSpec | None) -> GoalSpec:
         keep.append(c)
     extra = [c for c in text_goal.conditions if c.source == "description"]
     notes = demo_goal.notes + text_goal.notes + ([f"description overrides the demo for: {', '.join(sorted(said))}"] if said else [])
-    return GoalSpec(object=demo_goal.object, conditions=keep + extra, notes=notes)
+    return GoalSpec(object=demo_goal.object, conditions=keep + extra, notes=notes, start=text_goal.start)
 
 
 def check_goal(goal: GoalSpec, scene: UserScene) -> GoalSpec:

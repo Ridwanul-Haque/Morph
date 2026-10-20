@@ -104,9 +104,13 @@ class GoalSpec(BaseModel):
     conditions: list[Condition] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)  # possible but unlikely: Morph still tries
+    start: Literal["scene", "in_hand"] = "scene"  # where the object is when a try begins (in_hand: in_hand.py)
 
     def describe(self) -> list[str]:
         return [f"{c.describe()}  [{c.source}]" for c in self.conditions]
+
+    def start_text(self) -> str:
+        return "starts in the robot's hand" if self.start == "in_hand" else ""
 
 
 def warnings(goal: GoalSpec, scene: UserScene) -> list[str]:
@@ -399,6 +403,9 @@ def _measure(goal, scene, model, data, pose, released) -> tuple[dict, dict]:
                    held=0.0 if released else 1.0,
                    goal=(p["x"], p["y"], p["support_z"] + b.half_z) if p.get("has_place") else None, **kw)
     v |= body
+    from .fingers import touching
+    v["touch"] = touching(model, data, bid)
+    v["fingers_touching"] = v["touch"]["fingers_touching"]
     return v, fx
 
 
@@ -457,11 +464,13 @@ def _body_text(expr: str, v: dict) -> list[str]:
     for n in _ast.walk(_ast.parse(normalize(expr), mode="eval")):
         if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name) and n.func.id in BODY_FUNCS and n.args:
             pat = getattr(n.args[0], "value", "")
-            kind = "joints" if n.func.id.startswith("joint") else "parts"
-            hits = body_names(str(pat), v.get(kind) or {})
+            kind = "joints" if n.func.id.startswith("joint") else "touch" if n.func.id == "touching" else "parts"
+            names = [k for k in (v.get(kind) or {}) if k != "fingers_touching"]
+            hits = body_names(str(pat), names)
             if not hits:
-                have = ", ".join(sorted(v.get(kind) or {})[:12]) or "none"
-                out.append(f"this robot has no {kind[:-1]} matching '{pat}' (its {kind}: {have})")
+                have = ", ".join(sorted(names)[:12]) or "none"
+                what = {"joints": "joint", "parts": "part", "touch": "part"}[kind]
+                out.append(f"this robot has no {what} matching '{pat}' (it has: {have})")
             else:
                 out.append(f"{n.func.id}('{pat}') = {float(body_value(np, n.func.id, str(pat), v)):.2f} "
                            f"({', '.join(hits[:6])}{'…' if len(hits) > 6 else ''})")
@@ -649,7 +658,12 @@ def unsatisfiable(goal: GoalSpec, scene: UserScene) -> list[str]:
     (on the floor, on fixtures' tops and floors; upright, on a side, upside down; turned four ways; and held,
     if the goal lets the robot hold on). Returns the items no state satisfies (alone or together), in words."""
     from .goal_bench import Moment, _end_ok, _v
-    from .goal_terms import fixtures_geometry
+    from .goal_terms import fixtures_geometry, needs_motion_at_rest
+    still = [f"{c.describe()}: every try starts with the object at rest, so it can't move the whole time; say how long "
+             "it must keep it up at the end instead (when \"last\" with seconds)"
+             for c in goal.conditions if c.when == "always" and needs_motion_at_rest(c.model_dump())]
+    if still:
+        return still
     ends = [c for c in goal.conditions if c.when == "end" and not about_body(c)]  # the robot's own body: can't
     if not ends:                                                                     # be judged from the scene
         return []

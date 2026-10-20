@@ -1,0 +1,11 @@
+<mujoco model="pencil_cell">
+  <!-- A 15 cm pencil (7 mm thick, 8 g) on the floor. Coordinates in metres, z up. -->
+  <worldbody>
+    <geom name="floor" type="plane" size="2 2 0.1"/>
+
+    <body name="pencil" pos="0.35 0 0.0035">
+      <freejoint/>
+      <geom type="box" size="0.075 0.0035 0.0035" mass="0.008" friction="0.9 0.005 0.0001" rgba="0.95 0.75 0.15 1"/>
+    </body>
+  </worldbody>
+</mujoco>

@@ -78,7 +78,9 @@ class RobotProfile:
             kind = self.gripper.get("type", "gripper").replace("_", " ")
             bits.append(f"{kind} opens {self.gripper.get('max_opening_m', 0) * 100:.1f} cm")
         elif self.gripper.get("type") == "multi_finger_hand":
-            bits.append(f"{self.gripper['n_fingers']}-finger hands")
+            names = self.gripper.get("finger_names")
+            many = names and len(names) > self.gripper["n_fingers"]
+            bits.append(f"{self.gripper['n_fingers']}-finger hand{'s' if many else ''}" + (f" ({', '.join(names)})" if names else ""))
         return ", ".join(bits)
 
 
@@ -558,6 +560,14 @@ def profile_robot(path: str | Path, name: str | None = None) -> RobotProfile:
         for c in chains:
             if c.role == "leg" and any(j in wheels for j in c.joints):
                 c.role = "wheel"
+    from .fingers import finger_names
+    hand_list = finger_names(m)  # also finds hands that aren't on an arm (a Shadow hand on its own has 5 "arms")
+    legs_ = {c.leaf for c in chains if c.role == "leg"}
+    hand_list = [h for h in hand_list if not any(c[-1] in legs_ for c in h["fingers"].values())]
+    finger_leaves = {c[-1] for h in hand_list for c in h["fingers"].values()}
+    for c in chains:
+        if c.leaf in finger_leaves:
+            c.role = "finger"
     legs = [c for c in chains if c.role == "leg"]
     arms = [c for c in chains if c.role == "arm"]
 
@@ -576,9 +586,13 @@ def profile_robot(path: str | Path, name: str | None = None) -> RobotProfile:
             gripper_info |= _gripper_opening(m, [], e["_acts"], q0, sides=e["_sides"])
         else:
             gripper_info |= _gripper_opening(m, e["_bodies"], e["_acts"], q0, direct=e.get("_direct"))
-    elif hands:
-        gripper_info = {k: v for k, v in hands[0].items() if not k.startswith("_")}
-        notes.append(f"multi-finger hand ({hands[0]['n_fingers']} fingers): no generic grasp skill for dexterous hands yet")
+    elif hands or hand_list:
+        gripper_info = {k: v for k, v in hands[0].items() if not k.startswith("_")} if hands else \
+            {"type": "multi_finger_hand", "fingers": [c[-1] for c in hand_list[0]["fingers"].values()],
+             "n_fingers": len(hand_list[0]["fingers"])}
+        if hand_list:
+            gripper_info["finger_names"] = {lab: c[-1] for h in hand_list for lab, c in h["fingers"].items()}
+        notes.append(f"multi-finger hand ({gripper_info['n_fingers']} fingers): no generic grasp skill for dexterous hands yet")
     if wheels:
         notes.append(f"wheeled base ({len(wheels)} wheel joints: {', '.join(wheels)})")
 
@@ -594,6 +608,8 @@ def profile_robot(path: str | Path, name: str | None = None) -> RobotProfile:
         kind = "mobile_manipulator" if arms else "wheeled_base"
     elif arms:
         kind = "fixed_arm"
+    elif hand_list:
+        kind = "hand"
     else:
         kind = "unknown"
 
@@ -630,10 +646,11 @@ def profile_robot(path: str | Path, name: str | None = None) -> RobotProfile:
 # ----------------------------------------------------------------------------------------- capabilities
 def capabilities_from_profile(p: RobotProfile, object_size_m=(0.05, 0.05, 0.06)) -> Capabilities:
     """What this body could plausibly do with generic skills, before anything is validated."""
-    prehensile = p.has_gripper and p.n_arms > 0
+    hand = p.gripper.get("type") == "multi_finger_hand"
+    prehensile = (p.has_gripper and p.n_arms > 0) or hand
     opening = p.gripper.get("max_opening_m", 0.0)
     push = p.kind in ("quadruped", "legged", "legged_manipulator", "biped", "humanoid", "wheeled_base",
-                      "mobile_manipulator", "fixed_arm")
+                      "mobile_manipulator", "fixed_arm", "hand")
     if p.base == "fixed" and p.reach_m:
         r = max(p.reach_m.values(), key=lambda v: v["max_horizontal"])
         ws = {"type": "annulus", "center": r["base_xy"], "r_min": r["min_horizontal"], "r_max": r["max_horizontal"],

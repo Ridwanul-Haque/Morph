@@ -139,9 +139,25 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **The steps a person would take** (Nemotron, per body: which parts, in what order) are the reward: progress
   towards the current step, and a step only counts after it has held for 0.2 s.
 * **Eureka-style revision:** after each round Morph replays the policy, measures where it gets stuck and what it
-  actually does, and sends that to Nemotron. Nemotron rewrites the steps and can add weighted **reward terms**
-  (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in training. When progress
-  stalls it proposes several different plans; each practises briefly and the best is kept.
+  actually does, and sends that to Nemotron: per goal condition, how often it was met, how close it came, and for
+  "the whole time" ones when it first broke and what things looked like then; which fingers touched the object and
+  for how long; and, per step, whether the next step got anywhere from where it ended (a step that ends somewhere the
+  next can't continue from is flagged, as in Sequential Dexterity). Nemotron rewrites the steps and can add weighted
+  **reward terms** (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in
+  training.
+* **A small population when progress stalls** (Population Based Training, DexPBT): Nemotron's different plans, plus the
+  current plan exploring more and with calmer updates, each practise briefly; the weaker half is dropped and the rest
+  practise again; the best plan, policy and settings are kept. They take turns on the GPU.
+* **An easier version of the goal first** (automatic curriculum): a goal condition it keeps missing may be missed by
+  about as much as it misses it now (spin 180 deg/s may first be 100), practice spreads between that and the real goal,
+  and the slack shrinks as it improves and is gone after a real success. Rules (no thumb, keep holding it) are never
+  eased, and every judgement is on the real goal.
+* **Tries end when they can no longer succeed** (early termination, DeepMimic): once a "the whole time" condition has
+  broken (the thumb on the pen, the pen on the floor), the practice try stops there and loses what the rest of it
+  could have earned.
+* **It senses what the goal is about:** if the goal is about spin, the policy also sees how fast the object turns; if
+  it's about which fingers touch, it feels each finger's distance to the object (whole fingers, not only the tips:
+  the judge counts a thumb's base on the pen too).
 * **You can coach it too:** while it practises, type what you see it doing wrong in the Learning tab ("it grabs the
   top edge and it slips; grab it lower"), or rate the practice try you just watched 👍 / 👎. At the end of the round
   (or right away, keeping what it learned so far) Nemotron reads your words, and compares what the tries you liked
@@ -151,7 +167,8 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **A critic that sees more** (asymmetric actor-critic, Pinto et al. 2018): during training, the part that judges its
   moves also sees how well it really grips, how far through the steps it is, and each practice copy's true object
   weight and friction. The exported policy only uses what a robot can sense.
-* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept.
+* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept. Contacts come and
+  go for a tick or two even in a steady grip, so a "held" or "touching" that flickers for under 0.1 s isn't a break.
 * **Out of reach:** a bolted-down robot that never gets near the object because it stands too far away is moved
   closer, once (not if you placed it yourself).
 * Varied physics per practice copy (friction, object mass, motor strength, a one-step delay, sensor noise).
@@ -181,6 +198,21 @@ Tries are recorded as simulation state (not frames) and rendered to mp4 on deman
   (`--list`, `--clip round_2`). Skills learned before this fall back to the trainer's checkpoints.
 * In the app, any result square can be replayed and downloaded, and the **Videos** button lets you pick several and
   download them as one mp4 or a zip.
+
+### Hands
+
+Morph finds hands in any model (on an arm or on their own) and labels the fingers from their names, or from the
+hand's shape when the names don't say (the thumb is the finger set apart from the others). Goals can say which part
+touches the object: `touching('thumb') == 0` the whole time, `fingers_touching >= 2`. Tries are judged on the real
+contacts; the GPU learner counts a finger as touching when any part of it is within 6 mm of the surface. A robot
+without the named part is refused before anything runs.
+
+A request about handling the object in the hand ("spin the pencil around the fingers") starts with it there: Morph
+turns the hand palm up, drops the object onto the palm or fingers, and tries grips (which fingers close, how far)
+until one holds it, already meets the goal's "the whole time" conditions, and keeps doing so untouched for 3 s in both
+the accurate and the learner's physics. That grip is what the policy holds when it does nothing; tries start from it
+with the object laid a few slightly different ways, so practice can't depend on one lucky resting pose. In-hand goals
+are learned, not programmed (`examples/pencil`).
 
 ## Compute and cost
 
@@ -215,13 +247,16 @@ Tries are recorded as simulation state (not frames) and rendered to mp4 on deman
   models writing robot programs, and using them to make training data. Morph's programs follow this idea.
 * **Deep RL from human preferences** (Christiano et al. 2017), **asymmetric actor-critic** (Pinto et al. 2018),
   **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
-  **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017): the learning methods above.
+  **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017), **DeepMimic** (Peng et al. 2018),
+  **DexPBT** (Petrenko et al. 2023), **Sequential Dexterity** (Chen et al. 2023), **Prioritized Level Replay** (Jiang et
+  al. 2021) and **automatic domain randomization** (OpenAI 2019): the learning methods above.
 
 ## Robots and assets
 
 Any MJCF, URDF or xacro (ROS packages next to it are found). Tested with these MuJoCo Menagerie models
 (`scripts/fetch_assets.sh --extra`, pinned commit `c96a32d`): Franka Panda, UFactory xArm7 and Lite6, AgileX Piper,
-Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1 and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch.
+Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1 and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch,
+Shadow Hand and Allegro Hand.
 Walking policies are included for the Go1 (`artifacts/go1_walk/`) and the Go2 (`artifacts/walk/go2/`); `morph app`
 can train one for another legged robot.
 
@@ -230,7 +265,9 @@ can train one for another legged robot.
 * A simulation workbench: it reads simulator ground truth (no perception) and has no real-robot validation. The ROS 2
   export is meant as a starting point to fine-tune on hardware.
 * Programs can't express everything: dexterous in-hand skills (spinning a pen), balancing, catching. Those need
-  learning from scratch, which is much less reliable and needs far more compute.
+  learning from scratch, which is much less reliable and needs far more compute. In-hand goals do start in the hand
+  and are judged per finger (see Hands), but a 20 min test run on the Shadow Hand only got as far as keeping the
+  pencil and turning it at 163°/s, with the thumb still touching it.
 * Humanoids and robots without a walking policy get no programs yet; learning from legged programs isn't supported.
 * Objects are boxes, spheres, upright cylinders or capsules (other shapes are treated as their bounding box).
 * A program's accuracy is limited by its open-loop moves (pushing to within 2 cm is hard); that's what learning

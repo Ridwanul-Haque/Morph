@@ -66,6 +66,13 @@ def load_project(root: str | Path) -> Project:
                    description=task.get("description", ""), demo=rel(task.get("demo")))
 
 
+def _spins(c) -> bool:
+    """A condition that it keeps turning at a real speed: spin_dps (or spin_z_dps) over 60 deg/s, for a stretch of
+    time (the last N seconds, or the whole time)."""
+    m = re.search(r"\bspin(?:_z)?_dps\s*>=?\s*(\d+(?:\.\d+)?)", c.expr or "")
+    return c.kind == "expression" and c.when in ("last", "always") and m is not None and float(m.group(1)) >= 60
+
+
 _MUST = [  # words in a request -> what its checklist has to contain (checked without the model)
     (r"\b(throw|toss|lob|fling|chuck)\w*\b|(?<!don't )(?<!not )(?<!no )\bdrop(s|ped|ping)?\b(?! it gently)",
      lambda c: c.when == "release",
@@ -74,6 +81,8 @@ _MUST = [  # words in a request -> what its checklist has to contain (checked wi
      "the request has something that happens on the way (first ... then ...), so it needs an 'at some point' condition"),
     (r"\b(never|without (ever )?(lifting|tipping|touching|dropping)|the whole (time|way)|all the way)\b",
      lambda c: c.when == "always", "the request says something must hold the whole time, so it needs a 'the whole time' condition"),
+    (r"\b(spin|twirl|twiddle)\w*\b", _spins,
+     "the request is to spin it, so the checklist needs it turning at a real speed (spin_dps over 60) for a while"),
     (r"\b(knock|tip|topple|push)\w*\s+(?:\w+\s+){0,2}over\b|\bon its side\b",
      lambda c: c.kind == "orientation" and c.up_face == "side", "the request is to knock it over, so it must end lying on its side"),
 ]
@@ -104,7 +113,10 @@ def robot_bodies(paths) -> list[dict]:
                 joints[m.joint(j).name] = [round(math.degrees(v) if deg else v, 1 if deg else 3) for v in r]
         has_child = {int(m.body_parentid[b]) for b in range(1, m.nbody)}
         parts = [m.body(b).name for b in range(1, m.nbody) if b not in has_child]
-        out.append({"robot": Path(xml).stem, "joints": dict(list(joints.items())[:40]), "end_parts": parts[:20]})
+        from .fingers import finger_names
+        hands = [{"side": h["side"], "fingers": list(h["fingers"])} for h in finger_names(m)]
+        out.append({"robot": Path(xml).stem, "joints": dict(list(joints.items())[:40]), "end_parts": parts[:20]}
+                   | ({"hands": hands} if hands else {}))
     return out
 
 
@@ -148,14 +160,16 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
                                       {"source": "description" if description else "demo"})) for c in prop.conditions]
                 cand = GoalSpec(object=pj.scene.object_name, conditions=conds,
                                 notes=[f"Nemotron: {prop.rationale}"] + [f"assumed: {a}" for a in prop.ambiguities],
-                                warnings=list(prop.warnings))
+                                warnings=list(prop.warnings), start="in_hand" if prop.start == "in_hand" else "scene")
                 errs = validate(cand, pj.scene) or (missing_intent(description, cand) if description else []) \
                     or unsatisfiable(cand, pj.scene)
                 problems = errs
                 if not errs and description and attempt < 2:
                     # does the checklist, read back in plain words, mean what was asked? (catches reversals like
                     # "knock it over" -> "stays upright", and conditions nobody asked for)
-                    rv, rrec = llm.review_goal(description, [c.describe() for c in cand.conditions], pj.scene.geometry())
+                    rv, rrec = llm.review_goal(description, [c.describe() for c in cand.conditions]
+                                               + ([cand.start_text()] if cand.start_text() else []), pj.scene.geometry(),
+                                               [why for pat, _, why in _MUST if re.search(pat, description.lower())])
                     total_s += rrec.latency_s or 0.0
                     problems = [] if rv.ok else (rv.problems or ["the checklist doesn't match the request"])
                 if not problems:
@@ -180,6 +194,15 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
                     goal.conditions += extra
                     goal.notes.append(f"added from the built-in reader: {why}")
                     log(f"  (added from the built-in reader: {why})")
+    if description and goal is not None and text_goal is not None and text_goal.start != goal.start \
+            and text_goal.start == "in_hand":
+        goal.start = "in_hand"  # "spin it in the fingers" can't start on the floor
+        goal.notes.append("starts in the hand (from the built-in reader)")
+    if goal is not None and goal.start == "in_hand" and not any(
+            c.when == "always" and (c.kind == "height" or "bottom" in (c.expr or "") or "held" in (c.expr or ""))
+            for c in goal.conditions):  # handled in the hand: dropping it and rolling it on the floor doesn't count
+        goal.conditions.append(Condition(kind="expression", expr="bottom > 0.02", when="always", source="default",
+                                         text="it never falls to the floor"))
     if goal is None:
         raise ValueError("no goal: give a description, a demonstration, or both")
     errs = validate(goal, pj.scene)
@@ -273,6 +296,11 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         emit(type="plan", robot=prof.name, plan_id="learned_skill", planner="learned", how=plan["how"], what_is_it=prof.summary(),
              templates=[{"id": c.id, "ok": c.applicable, "met": c.met, "missing": c.missing} for c in checks])
     out = {"robot": prof.name, "plan": plan, "placement": p, "templates": [c.__dict__ for c in checks]}
+    why = body_problem(goal, robot_path, prof)
+    if why and plan["plan_id"] != "learned_skill":
+        log(f"  {why}")
+        emit(type="robot_done", robot=prof.name, plan_id=plan["plan_id"], success=0, n=0, why_not=why)
+        return out | {"success": 0, "n": 0, "why_not": why}
     if plan["plan_id"] == "learned_skill":
         from .learn_task import try_policy
         emit(type="stage", robot=prof.name, stage="trials", text="using its learned skill")
@@ -330,6 +358,26 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
     emit(type="robot_done", robot=prof.name, plan_id=plan["plan_id"], success=out.get("success", 0), n=out.get("n", 0),
          why_not=out.get("why_not", ""))
     return out
+
+
+def body_problem(goal: GoalSpec, robot_path: str, prof) -> str:
+    """Why this robot can't run this goal at all, before anything runs: a finger or joint the goal names that it doesn't
+    have, or a goal that starts in the hand. "" if none."""
+    import mujoco
+    from .fingers import part_names
+    from .goal_terms import missing_parts
+    try:
+        miss = missing_parts([c.model_dump() for c in goal.conditions], part_names(mujoco.MjModel.from_xml_path(robot_path), ""))
+    except Exception:  # noqa: BLE001  (a model that won't load is reported elsewhere)
+        miss = []
+    if miss:
+        return f"{prof.name} has nothing called {' or '.join(repr(x) for x in miss)}, which the goal refers to"
+    if goal.start == "in_hand":
+        if prof.gripper.get("type") != "multi_finger_hand":
+            return f"the {goal.object} starts in the hand, and {prof.name} has no hand with fingers to hold it in"
+        return ("the goal starts with the object in the hand: programs pick things up from the floor, so this is "
+                "learned: open the Robot tab and choose Learn this task")
+    return ""
 
 
 def program_body(prof) -> str | None:

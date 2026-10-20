@@ -10,7 +10,7 @@ if [ ! -d "$DEST/.git" ]; then
 fi
 MODELS="unitree_go1 franka_emika_panda ufactory_xarm7"
 if [ "${1:-}" = "--extra" ]; then  # robots Morph was never configured for, used to test `morph inspect`
-  MODELS="$MODELS kinova_gen3 universal_robots_ur5e ufactory_lite6 trs_so_arm100 agilex_piper unitree_go2 anybotics_anymal_c boston_dynamics_spot unitree_h1 unitree_g1 skydio_x2 hello_robot_stretch"
+  MODELS="$MODELS kinova_gen3 universal_robots_ur5e ufactory_lite6 trs_so_arm100 agilex_piper unitree_go2 anybotics_anymal_c boston_dynamics_spot unitree_h1 unitree_g1 skydio_x2 hello_robot_stretch shadow_hand wonik_allegro"
 fi
 git -C "$DEST" sparse-checkout set $MODELS
 git -C "$DEST" fetch -q --depth 1 origin "$REV" || true

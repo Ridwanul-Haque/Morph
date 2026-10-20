@@ -953,6 +953,7 @@ function renderGoal(results) {
   }).join("");
   const d = g.demo, from = g.from.replace(/nemotron \(([\d.]+)s\)/, "Nemotron ($1 s)").replace("rules", "built-in reader").replace("measured", "measured from the demo");
   $("goalnotes").innerHTML = (g.warnings || []).map(w => `<div class="note" style="border-color:rgba(251,191,36,.45);color:var(--warn)">⚠ ${esc(w)}</div>`).join("") +
+    (g.start ? `<div class="note">✋ The ${esc((S.scene && S.scene.summary.object.name) || "object")} ${esc(g.start)}: Morph puts it there before every try.</div>` : "") +
     (g.checked_when ? `<div class="tiny muted" style="margin-top:6px">${esc(g.checked_when)}</div>` : "") +
     `<div class="tiny faint" style="margin-top:6px">Understood by: ${esc(from)}</div>` +
     (d ? `<div class="note">The demo moved the object ${d.moved_cm} cm, turned it ${d.turned_deg}°, lifted it ${d.max_height_cm} cm, and it ended ${esc(d.end_relations.join(", ") || "on the floor")}.</div>` : "") +

@@ -174,7 +174,9 @@ def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
         setattr(robot.option, k, getattr(scene.option, k))
     frame = scene.worldbody.frames[0]
     mx, my, myaw = task["mount"]
-    if not task["floating"]:
+    if task.get("mount_pose"):  # a hand turned palm up for an in-hand goal (in_hand.py)
+        frame.pos, frame.quat = task["mount_pose"]["pos"], task["mount_pose"]["quat"]
+    elif not task["floating"]:
         from .introspect import floor_offset
         frame.pos = [mx, my, floor_offset(task["robot_xml"])]
         frame.quat = [math.cos(myaw / 2), 0, 0, math.sin(myaw / 2)]
@@ -216,6 +218,15 @@ class Indices:
     jnt_hi: np.ndarray | None = None
     tip_names: list | None = None  # the end parts' names (tips order, without robot_)
     hand: dict | None = None  # acting in hand space (hand_ctrl): the arm's joints, actuators and the hand's point
+    tip_labels: list | None = None  # per end part, the finger it ends ("thumb", ...) or None
+    # every finger's surface, as points on its parts (fingers.finger_points): touch for the whole finger, not only its tip
+    finger_body: np.ndarray | None = None  # per point: the body it's on, its place in that body's frame, how thick the
+    finger_off: np.ndarray | None = None   # part is there, and which finger (index into finger_labels)
+    finger_rad: np.ndarray | None = None
+    finger_of: np.ndarray | None = None
+    finger_labels: list | None = None
+    block_half: tuple = (0.0, 0.0, 0.0)  # the object's half sizes
+    senses: tuple = ()  # extra things the policy sees, from what the goal is about (task["senses"]: "spin", "touch")
 
 
 def is_position(m: mujoco.MjModel, a: int) -> bool:
@@ -273,14 +284,63 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
     bj = m.joint("block_free")
     rng = [(m.jnt_range[j][0], m.jnt_range[j][1]) if m.jnt_limited[j] and m.jnt_range[j][1] > m.jnt_range[j][0]
            else (-math.pi, math.pi) for j in js]
+    from .fingers import finger_of_body
+    fingers = finger_of_body(m)
     ix_extra = dict(jnt_lo=np.array([r[0] for r in rng]), jnt_hi=np.array([r[1] for r in rng]),
-                    tip_names=[m.body(int(b)).name.removeprefix("robot_") for b in tips], hand=_hand_indices(m, task))
+                    tip_names=[m.body(int(b)).name.removeprefix("robot_") for b in tips], hand=_hand_indices(m, task),
+                    tip_labels=[fingers.get(int(b)) for b in tips], senses=tuple(task.get("senses") or ()),
+                    block_half=(task["block"]["half_x"], task["block"]["half_y"], task["block"]["half_z"]))
+    fp = finger_points(m)
+    if fp is not None:
+        ix_extra.update(finger_body=fp[0], finger_off=fp[1], finger_rad=fp[2], finger_of=fp[3], finger_labels=fp[4])
     return Indices(home_adr, np.array(vals, dtype=float), joint_vadr, names, np.array(task["q0"]), pos_mask,
                    np.array(tips, dtype=int), base, base_q, base_v,
                    int(m.body("block").id), int(bj.qposadr[0]), int(bj.dofadr[0]), np.array(lo), np.array(hi), tip_off,
                    np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] in set(robot_bodies)], dtype=int),
                    np.array([g for g in range(m.ngeom) if m.geom_bodyid[g] == m.body("block").id], dtype=int), *grip,
                    act_scale, act_step, **ix_extra)
+
+
+def finger_points(m: mujoco.MjModel):
+    """Points along every finger's collision shapes (centre and both ends of each, in its body's frame), with how thick
+    the shape is there: (bodies, offsets, radii, finger index per point, finger labels), or None without a hand."""
+    from .fingers import hands
+    hs = hands(m)
+    if not hs:
+        return None
+    labels, body, off, rad, of = [], [], [], [], []
+    for h in hs:
+        for lab, chain in h["fingers"].items():
+            k = len(labels)
+            labels.append(lab)
+            for b in chain:
+                for g in range(m.ngeom):
+                    if m.geom_bodyid[g] != b or not (m.geom_contype[g] or m.geom_conaffinity[g]):
+                        continue
+                    c, half = m.geom_aabb[g][:3], m.geom_aabb[g][3:]
+                    Rg = np.zeros(9)
+                    mujoco.mju_quat2Mat(Rg, m.geom_quat[g])
+                    Rg = Rg.reshape(3, 3)
+                    long = int(np.argmax(half))
+                    r = float(np.sort(half)[1])  # the shape's thickness across its length
+                    for t in (-1.0, 0.0, 1.0):
+                        e = np.zeros(3)
+                        e[long] = t * max(half[long] - r, 0.0)
+                        body.append(b)
+                        off.append(m.geom_pos[g] + Rg @ (c + e))
+                        rad.append(r)
+                        of.append(k)
+    if not body:
+        return None
+    return np.array(body, dtype=int), np.array(off), np.array(rad), np.array(of, dtype=int), labels
+
+
+def finger_gaps(xp, xpos, xmat, bp, R, half, ix: "Indices"):
+    """How far each finger is from the object's surface (m, per finger_labels): its nearest point, less its thickness."""
+    pts = xpos[ix.finger_body] + xp.einsum("kij,kj->ki", xmat[ix.finger_body].reshape(-1, 3, 3), xp.asarray(ix.finger_off))
+    out = xp.maximum(xp.abs((pts - bp) @ R) - xp.asarray(half), 0.0)
+    gap = xp.sqrt(xp.sum(out * out, axis=1)) - xp.asarray(ix.finger_rad)
+    return xp.stack([xp.min(xp.where(xp.asarray(ix.finger_of) == k, gap, 9.0)) for k in range(len(ix.finger_labels))])
 
 
 def _hand_indices(m: mujoco.MjModel, task: dict) -> dict | None:
@@ -343,7 +403,8 @@ def _tip_points(m: mujoco.MjModel, task: dict, tips, home_adr, home_val) -> np.n
 
 def obs_size(ix: Indices) -> int:
     n = len(ix.q0)
-    return 3 * n + 3 + 3 + 2 + 3 + 3 * len(ix.tips) + (12 if ix.base >= 0 else 0)
+    extra = (3 if "spin" in ix.senses else 0) + (len(ix.finger_labels or []) if "touch" in ix.senses else 0)
+    return 3 * n + 3 + 3 + 2 + 3 + 3 * len(ix.tips) + (12 if ix.base >= 0 else 0) + extra
 
 
 def observe(xp, qvel, act_len, act_vel, xpos, xmat, last_act, ix: Indices, target) -> "array":
@@ -364,6 +425,11 @@ def observe(xp, qvel, act_len, act_vel, xpos, xmat, last_act, ix: Indices, targe
         Rb = xmat[ix.base].reshape(3, 3)
         parts += [xpos[ix.base] - bp, Rb.T @ xp.array([0.0, 0.0, -1.0]),
                   Rb.T @ qvel[ix.base_v:ix.base_v + 3] * 0.5, qvel[ix.base_v + 3:ix.base_v + 6] * 0.2]
+    if "spin" in ix.senses:  # how it turns (world frame, rad/s x 0.1): the goal is about spin, and that isn't in the rest
+        parts.append(R @ qvel[ix.block_v + 3:ix.block_v + 6] * 0.1)
+    if "touch" in ix.senses and ix.finger_labels:  # per finger, 1 touching .. 0 at 2 cm or more (a sense of touch)
+        gaps = finger_gaps(xp, xpos, xmat, bp, R, ix.block_half, ix)
+        parts.append(xp.clip(1.0 - gaps / 0.02, 0.0, 1.0))
     return xp.concatenate(parts)
 
 
@@ -461,6 +527,32 @@ def contact_held(m: mujoco.MjModel, d: mujoco.MjData, ix: Indices) -> float:
     return 0.0
 
 
+def contact_touch(m: mujoco.MjModel, d: mujoco.MjData, ix: Indices) -> dict:
+    """Which fingers and parts touch the object, from the contacts (fingers.touching): for measure(touch=...)."""
+    from .fingers import touching
+    return touching(m, d, ix.block)
+
+
+def tip_touch(xp, pts, bp, R, half, ix: Indices, xpos=None, xmat=None) -> dict:
+    """The learner's stand-in for contact_touch: an end part within 6 mm of the object's surface touches it; with a
+    hand (and xpos, xmat), a finger touches if any part of it does (the judge's contacts count a thumb's base too:
+    with tips alone, practice never saw the thumb resting on the pen that failed every try)."""
+    out_ = xp.maximum(xp.abs((pts - bp) @ R) - xp.asarray(half), 0.0)
+    near = (xp.sqrt(xp.sum(out_ * out_, axis=1)) < 0.006).astype(xp.float32)
+    out = {n: near[k] for k, n in enumerate(ix.tip_names or [])}
+    if ix.finger_labels and xpos is not None:
+        gaps = finger_gaps(xp, xpos, xmat, bp, R, half, ix)
+        labels = list(ix.finger_labels)
+        for k, lab in enumerate(labels):
+            out[lab] = (gaps[k] < 0.006).astype(xp.float32)
+    else:
+        labels = sorted({lab for lab in (ix.tip_labels or []) if lab})
+        for lab in labels:
+            out[lab] = xp.max(xp.stack([near[k] for k, x in enumerate(ix.tip_labels) if x == lab]))
+    out["fingers_touching"] = sum(out[lab] for lab in labels) if labels else xp.sum(near)
+    return out
+
+
 def pinch_held(xp, pts, bp, R, half, task: dict):
     """The learner's stand-in for contact_held (contacts aren't available per copy on the GPU): two of the
     robot's tips at opposite faces of the object, and the object raised above whatever is under it."""
@@ -517,11 +609,11 @@ def _goal_xyz(task: dict):
     return (t["x"], t["y"], t.get("z", 0.0)) if t.get("has_place", True) and "x" in t else None
 
 
-def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None, qpos=None) -> dict:
+def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None, qpos=None, touch=None) -> dict:
     """Every quantity a goal condition or a skill step can read (goal_terms), from the simulation state.
     Same code for training (JAX) and trying / practice runs (NumPy). held: from contact_held when the
     contacts are at hand (NumPy); otherwise the learner's geometric stand-in. ctrl: the commands (for how far the
-    gripper is closed)."""
+    gripper is closed). touch: contact_touch when the contacts are at hand, else tip_touch."""
     from .goal_terms import quantities
     b = task["block"]
     half = (b["half_x"], b["half_y"], b["half_z"])
@@ -553,6 +645,8 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None,
     v["closure"] = closure if closure is not None else xp.asarray(0.0)
     v["grip"] = xp.maximum(v["grip"], xp.asarray(held, dtype=float) if xp is np else held)  # a real hold is a full grip
     v["parts"] = {n: pts[k] for k, n in enumerate(ix.tip_names or [])}  # the robot's own body (goal_terms BODY_FUNCS)
+    v["touch"] = touch if touch is not None else tip_touch(xp, pts, bp, R, half, ix, xpos, xmat)
+    v["fingers_touching"] = v["touch"]["fingers_touching"]
     if qpos is not None and ix.jnt_lo is not None:
         frac = (qpos[ix.home_adr] - ix.jnt_lo) / (ix.jnt_hi - ix.jnt_lo)
         v["joints"] = {n: frac[k] for k, n in enumerate(ix.joints)}

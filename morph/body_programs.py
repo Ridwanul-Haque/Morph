@@ -31,7 +31,7 @@ import numpy as np
 from .goal_terms import History
 from .goals import GoalSpec, check
 from .programs import SPEEDS, ProgramError, _formula, scene_names
-from .task_model import CTRL_DT, build_task_model, contact_held, indices, is_position, opposite_sides
+from .task_model import CTRL_DT, build_task_model, contact_held, contact_touch, indices, is_position, opposite_sides
 
 BODY_OPS = {"move", "push", "grip", "joints", "home", "wait", "repeat_if", "pick", "push_object", "tip_over", "throw"}
 POINTS = {"down": (0, 0, -1), "up": (0, 0, 1), "north": (0, 1, 0), "south": (0, -1, 0), "east": (1, 0, 0),
@@ -591,7 +591,8 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
         state["t"] += CTRL_DT
         for p in rn.parts.values():
             state["touched"] |= _touching(rn, p.bodies)
-        v = measure(np, d.xpos, d.xmat, d.qvel, ix, rn.task, held=contact_held(m, d, ix), ctrl=d.ctrl, qpos=d.qpos)
+        v = measure(np, d.xpos, d.xmat, d.qvel, ix, rn.task, held=contact_held(m, d, ix), ctrl=d.ctrl, qpos=d.qpos,
+                    touch=contact_touch(m, d, ix))
         hist.update(v)
 
     def fell() -> bool:
@@ -608,7 +609,8 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
         nxt += 1
         if st["do"] == "repeat_if":  # reactive: measure now, and go back if the condition holds
             from .goal_terms import parse, violation
-            v = measure(np, rn.d.xpos, rn.d.xmat, rn.d.qvel, ix, rn.task, held=contact_held(m, rn.d, ix), ctrl=rn.d.ctrl, qpos=rn.d.qpos)
+            v = measure(np, rn.d.xpos, rn.d.xmat, rn.d.qvel, ix, rn.task, held=contact_held(m, rn.d, ix), ctrl=rn.d.ctrl, qpos=rn.d.qpos,
+                    touch=contact_touch(m, rn.d, ix))
             holds = float(violation(np, parse(st["condition"], rn.task.get("fixtures", {})), v)) <= 1e-6
             if holds and jumps.get(i, 0) < st["times"]:
                 jumps[i] = jumps.get(i, 0) + 1

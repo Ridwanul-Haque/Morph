@@ -118,9 +118,10 @@ class MorphPolicy:
         self.t = 0  # control steps since the start (how far through the recipe, if there is one)
 
     def set_state(self, joint_pos, joint_vel, obj_pos, obj_quat, obj_vel=(0, 0, 0),
-                  base_pos=None, base_quat=None, base_lin_vel=None, base_ang_vel=None):
+                  base_pos=None, base_quat=None, base_lin_vel=None, base_ang_vel=None, obj_ang_vel=(0, 0, 0)):
         """joint_* in `joints` order; poses in the input frame (quaternions w, x, y, z);
-        base velocities as nav_msgs/Odometry gives them (in the base's own frame)."""
+        base velocities as nav_msgs/Odometry gives them (in the base's own frame); obj_ang_vel in the input frame
+        (only read by policies that sense spin)."""
         d, ix, f = self.d, self.ix, self.to_scene
         d.qpos[self.qadr] = joint_pos
         d.qvel[self.vadr] = joint_vel
@@ -128,6 +129,8 @@ class MorphPolicy:
         d.qpos[b:b + 3] = f.point(obj_pos)
         d.qpos[b + 3:b + 7] = f.quat(obj_quat)
         d.qvel[ix["block_v"]:ix["block_v"] + 3] = f.vector(obj_vel)
+        mujoco.mj_kinematics(self.m, d)
+        d.qvel[ix["block_v"] + 3:ix["block_v"] + 6] = d.xmat[ix["block"]].reshape(3, 3).T @ f.vector(obj_ang_vel)
         if self.floating and base_pos is not None:
             a = self.m.jnt_qposadr[self.m.body_jntadr[ix["base"]]]
             d.qpos[a:a + 3] = f.point(base_pos)
@@ -151,6 +154,14 @@ class MorphPolicy:
             Rb = d.xmat[ix["base"]].reshape(3, 3)
             v = ix["base_v"]
             parts += [d.xpos[ix["base"]] - bp, Rb.T @ [0, 0, -1.0], Rb.T @ d.qvel[v:v + 3] * 0.5, d.qvel[v + 3:v + 6] * 0.2]
+        sn = self.spec.get("senses") or {}
+        if sn.get("spin"):  # how the object turns (world frame, rad/s x 0.1)
+            parts.append(R @ d.qvel[ix["block_v"] + 3:ix["block_v"] + 6] * 0.1)
+        if sn.get("touch"):  # per finger: 1 touching the object .. 0 at 2 cm or more
+            tc = sn["touch"]; fb = np.array(tc["body"]); of = np.array(tc["finger"])
+            pts = d.xpos[fb] + np.einsum("kij,kj->ki", d.xmat[fb].reshape(-1, 3, 3), np.array(tc["offset"]))
+            gap = np.linalg.norm(np.maximum(np.abs((pts - bp) @ R) - tc["half"], 0), axis=1) - np.array(tc["radius"])
+            parts.append(np.clip(1 - np.array([gap[of == k].min() for k in range(len(tc["labels"]))]) / 0.02, 0, 1))
         if self.recipe is not None:
             parts.append([min(self.t / len(self.recipe), 1.5)])
         return np.concatenate(parts)
