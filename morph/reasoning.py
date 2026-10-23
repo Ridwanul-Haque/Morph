@@ -120,17 +120,22 @@ FUNCS_DOC = ("functions abs, min, max, sqrt, hypot, exp, log, tanh, clip(x, lo, 
              "(radians), cosd, sind, atan2d (degrees); powers x ** n with a number n from -4 to 4; constant pi")
 MORE_NAMES_DOC = ("; also goal_x, goal_y, goal_z (where the goal puts the object, when it has a place), each fixture's "
                   "<name>_x, <name>_y, <name>_top (its centre and top, e.g. bin_x), roll_deg and pitch_deg (the object's "
-                  "tilt about its own long and short axes)")
+                  "tilt about its own long and short axes), grip_gap (m from the hand's point to where Morph's own "
+                  "planned grip puts it on the object: near the object isn't enough to grip it, a hand resting on top "
+                  "of it is near; the step before closing the gripper should have grip_gap < 0.03)")
 REWARD_TERMS_DOC = (
     "You may also add up to 4 reward_terms: extra shaping on top of the steps, as Eureka does: each {\"name\", "
     "\"formula\", \"weight\", \"why\"}. formula is a NUMBER formula over the same quantities (e.g. \"closure * "
     "(touch_dist < 0.03)\" rewards closing only with the fingers at the object, \"-speed\" penalises flinging it, "
     "\"min(lifted, 0.1)\" rewards lifting up to 10 cm, \"exp(-touch_dist / 0.05)\" pulls a fingertip to it, sharper "
     "up close, \"-(hypot(x - goal_x, y - goal_y)) ** 2\" a squared miss), or a condition (then its graded distance from true counts, 0 "
-    "when it holds). weight -5..5: > 0 rewards the value, < 0 penalises it; the value is clipped to -3..3 and earned "
-    "every tick (about 1 per second of weight x value). measured.reward_terms says how each current term behaved in "
-    "the last practice (its average value per tick at the start and end): a term that never moves is not helping; one "
-    "that rose while the steps stayed stuck may be rewarding the wrong thing (fix or drop it). "
+    "when it holds). weight -5..5: > 0 rewards the value, < 0 penalises it; the value is clipped to -3..3. A term is a "
+    "GUIDE, paid as a potential (Ng et al. 1999): the robot earns 0.5 x weight x the change in its value (raising it "
+    "pays, letting it fall costs back what was earned), never for keeping it high, so it can't make stopping halfway "
+    "(hovering over the object, holding still) pay. It can't make anything required either: what the result must "
+    "satisfy belongs in the steps' done_when and keep rules. measured.reward_terms says how each current term behaved "
+    "in the last practice (its average value per tick at the start and end): a term that never moves is not helping; "
+    "one that rose while the steps stayed stuck points at the wrong thing (fix or drop it). "
 )
 
 

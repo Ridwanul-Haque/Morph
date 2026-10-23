@@ -19,7 +19,9 @@ Quantities an expression can use (metres, degrees):
   hand_dist (the robot's nearest end part to the object's centre), hand_x, hand_y, hand_z (that end
   part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level), grip (0..1: how close
   the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
-  its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut)
+  its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut),
+  grip_gap (m from the hand's point to where Morph's own planned grip puts it on the object: near 0 means the open
+  hand is where closing it grips; hand_dist when there's no planned grip)
   fingers_touching (how many of the robot's fingers touch it; with no hand, how many of its parts),
   roll_deg, pitch_deg (the object's tilt about its own long and short axes), goal_x, goal_y, goal_z (where the goal
   puts it, when it has a place; target_x ... mean the same), <fixture>_x, <fixture>_y, <fixture>_top (a fixture's
@@ -39,11 +41,11 @@ FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
              "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps", "roll_deg", "pitch_deg",
-             "goal_x", "goal_y", "goal_z", "fingers_touching"}
+             "goal_x", "goal_y", "goal_z", "fingers_touching", "grip_gap"}
 GOAL_VARIABLES = {"goal_x", "goal_y", "goal_z"}  # only when the goal has a place (else not a number: the check says so)
 FIXTURE_ATTRS = ("_x", "_y", "_top")  # bin_x, bin_y, bin_top: a fixture's centre and top
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
-                   "touch_dist"}
+                   "touch_dist", "grip_gap"}
 # the robot's own body (goals about the robot, not the object: "make a fist", "raise the arm", "lift a foot"): each takes
 # a name pattern ("pip", "index|middle", "foot") matched against the robot's joint / end-part names. joint_frac: how far
 # the matching joints are through their range, 0 at the lower limit, 1 at the upper (mean; _min / _max: the least / most).
@@ -604,6 +606,7 @@ WORDS = {
     "held": ("the robot holding it", "flag"), "grip": ("the grip score (0 to 1)", "frac"),
     "closure": ("the gripper closed", "pct"), "touch_dist": ("the nearest fingertip's gap to it", "m"),
     "lifted": ("it lifted", "m"), "hand_dist": ("the hand's distance to it", "m"),
+    "grip_gap": ("the hand's distance from Morph's grip", "m"),
     "hand_x": ("the hand's x", "m"), "hand_y": ("the hand's y", "m"), "hand_z": ("the hand's height", "m"),
     "robot_x": ("the robot's x", "m"), "robot_y": ("the robot's y", "m"), "base_z": ("the robot body's height", "m"),
     "base_tilt_deg": ("the robot body's tilt", "deg"), "spin_dps": ("how fast it spins", "deg/s"),

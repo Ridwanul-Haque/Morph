@@ -59,7 +59,7 @@ def scaffold_starts(task_path: Path, pj, goal: GoalSpec, log=print, every: int =
                   {"do": "move", "part": hand, "x": "goal_x", "y": "goal_y", "z": "goal_z + 0.03", "speed": "slow"}]
         if lets_go(goal) and not any(c.when == "release" for c in goal.conditions):
             route += [{"do": "grip", "how": "open"}]
-    base_path = _drive_up(rn, scene, hand) if rn.ix.base >= 0 else [None]
+    base_path = _drive_up_to_grip(rn, scene, hand, log) if rn.ix.base >= 0 else [None]
     if base_path is None:
         return None
     if base_path[-1] is not None:  # the route (and its grasp planning, which resets the robot per try) starts there
@@ -87,8 +87,12 @@ def scaffold_starts(task_path: Path, pj, goal: GoalSpec, log=print, every: int =
     grip_at = next((n for n, st in marks if st["do"] == "grip" and st["how"] == "close"), None)
     open_at = next((n for n, st in marks if st["do"] == "grip" and st["how"] == "open" and n > (grip_at or 0)), None)
     scratch = mujoco.MjData(m)
-    kept_held = 0
-    for k in range(0, len(rec), every):
+    geom = _route_grip(rn, hand, rec, grip_at, open_at, scratch)
+    ready = _about_to_grip(rn, hand, rec, grip_at, geom, scratch)
+    kept_held, flags = 0, [False] * len(qs)  # (the drive up: not about to grip)
+    for k in range(len(rec)):
+        if k % every and k not in ready:  # the moments just before its grip: every one of them
+            continue
         q, _, c = rec[k]
         if grip_at is not None and k > grip_at + 25 and (open_at is None or k < open_at):
             scratch.qpos[:] = q
@@ -99,21 +103,79 @@ def scaffold_starts(task_path: Path, pj, goal: GoalSpec, log=print, every: int =
         qs.append(q.copy())
         cs.append(c.copy())
         ts.append(len(base_path) + k)
+        flags.append(k in ready)
     if not qs:
         return None
-    np.savez(Path(task_path).parent / "starts.npz", qpos=np.array(qs), ctrl=np.array(cs), t=np.array(ts, dtype=np.int32))
+    np.savez(Path(task_path).parent / "starts.npz", qpos=np.array(qs), ctrl=np.array(cs), t=np.array(ts, dtype=np.int32),
+             ready=np.array(flags, dtype=bool))
     t = json.loads(Path(task_path).read_text())
     t["starts"] = {"file": "starts.npz", "share": share, "scaffold": True,
                    "from": "Morph's own route: " + ("driving up, " if len(base_path) > 1 else "")
                            + "its planned grip, carrying it to the goal" + (" and letting go" if open_at else "")}
+    if any(flags):
+        t["starts"]["ready"] = READY_SHARE
+    if geom and not t.get("grasp"):  # the learner aims for the grip Morph's own route held it with (train_task)
+        t["grasp"] = geom
+    from .plan_check import require_grip
+    note = require_grip(t)
     Path(task_path).write_text(json.dumps(t, indent=1))
     info = {"starts": len(qs), "holding": kept_held, "route_reached_goal": bool(run["success"]),
-            "drive": len(base_path) - 1}
+            "drive": len(base_path) - 1, "ready": int(sum(flags)), "grasp": bool(t.get("grasp"))}
     log(f"  practice starts near success: {len(qs)} moments along Morph's own route"
         + (f" ({info['drive']} on the drive up)" if info["drive"] else "")
-        + f", {kept_held} with the {scene.object_name} in its grip; "
+        + f", {kept_held} with the {scene.object_name} in its grip"
+        + (f", {info['ready']} with its open hand where Morph grips it (a {READY_SHARE:.0%} share of practice starts "
+           "there every round, to practise closing)" if info["ready"] else "") + "; "
         + ("the route itself reaches the goal" if run["success"] else "the learner works out the rest"))
+    if geom and t.get("grasp") is geom:
+        log("  the learner aims for the grip Morph's own route used")
+    if note:
+        log(f"  {note}")
     return info
+
+
+READY_SHARE = 0.3  # of the practice runs that start from Morph's route, how many start just before its grip
+READY_GAP = 0.04  # m: the hand's point this close to where it grips the object, the gripper still open
+
+
+def _route_grip(rn, hand: str, rec: list, grip_at, open_at, scratch) -> dict | None:
+    """How Morph's own route held the object (contact_plan.grasp_geometry), measured once it really had it."""
+    from .contact_plan import grasp_geometry
+    if grip_at is None:
+        return None
+    end = open_at if open_at is not None else len(rec)
+    for k in range(grip_at + 25, min(end, len(rec))):
+        rn.d.qpos[:] = rec[k][0]
+        rn.d.qvel[:] = 0.0
+        mujoco.mj_forward(rn.m, rn.d)
+        if contact_held(rn.m, rn.d, rn.ix) > 0.5:
+            g = grasp_geometry(rn, hand)
+            return g if g.get("fingers") and g.get("close") is not None else None
+    return None
+
+
+def _about_to_grip(rn, hand: str, rec: list, grip_at, geom, scratch) -> set[int]:
+    """The route's moments just before it closes the gripper: the open hand where its grip will be. Practice starts
+    there too, every round, so closing on the object gets practised on its own (the Stretch learned to drive up and
+    rest its hand on top of the parcel, and never once had its fingers either side of it with the gripper open)."""
+    if grip_at is None or not geom:
+        return set()
+    part = rn.parts[hand]
+    point = np.array(geom["point"])
+    ix = rn.ix
+    out = set()
+    for k in range(grip_at, -1, -1):
+        if ix.grip_act >= 0 and ix.grip_close != ix.grip_open:  # (grip_at is where the closing has finished)
+            if (rec[k][2][ix.grip_act] - ix.grip_open) / (ix.grip_close - ix.grip_open) > 0.2:
+                continue
+        scratch.qpos[:] = rec[k][0]
+        mujoco.mj_kinematics(rn.m, scratch)
+        R = scratch.xmat[rn.ix.block].reshape(3, 3)
+        gap = np.linalg.norm(R.T @ (rn.tip(part, scratch) - scratch.xpos[rn.ix.block]) - point)
+        if gap > READY_GAP:
+            break
+        out.add(k)
+    return out
 
 
 def _drive_only(task_path: Path, rn, scene, share: float, log) -> dict | None:
@@ -158,6 +220,111 @@ def _put_base(rn, pose) -> None:
     d.qpos[ix.base_q:ix.base_q + 7] = [x, y, rn.task.get("base_z", 0.0), math.cos(yaw / 2), 0, 0, math.sin(yaw / 2)]
     d.qvel[:] = 0
     mujoco.mj_forward(m, d)
+
+
+def _grip_spots(rn, scene, hand: str) -> list[tuple[float, tuple]]:
+    """A wheeled base: where to set it down to grip the object from each of its sides, the hand level and pointing at
+    it (a Stretch can't point its gripper down, and with its base still its hand only reaches along its arm's line, so
+    a spot chosen to put its folded hand over the object left every grip out of reach). Per side: (IK error, pose),
+    best first. The base's heading is tried all round; its position then follows from where the hand lands."""
+    m, d, ix = rn.m, rn.d, rn.ix
+    part = rn.parts[hand]
+    rn.reset(0, scene.start, None)
+    ox, oy, oyaw = (float(v) for v in scene.start)
+    oz = float(d.xpos[ix.block][2])
+    b = scene.block
+    obj = np.array([ox, oy, oz])
+    from .contact_plan import level_tilt
+    pz = level_tilt(rn, part)
+    c = math.sqrt(max(1.0 - pz * pz, 0.0))
+    out = []
+    for side in (0, 90, 180, 270):
+        a = oyaw + math.radians(side)
+        u = np.array([c * math.cos(a), c * math.sin(a), pz])
+        across = np.array([-math.sin(a), math.cos(a), 0.0])
+        ext = abs(b.half_x * math.cos(math.radians(side))) + abs(b.half_y * math.sin(math.radians(side)))
+        flat = np.array([math.cos(a), math.sin(a), 0.0])
+        pre, grab = obj - (ext + 0.08) * flat, obj + 0.3 * ext * flat  # as the side grasps go (contact_plan)
+        best = None
+        for k in range(24):
+            yaw = k * math.tau / 24
+            x, y = ox, oy
+            ok = True
+            for _ in range(4):  # move the base by however far the hand misses, and solve again
+                _put_base(rn, (x, y, yaw))
+                q, pe, ae = rn.ik(part, pre, point=u, across=across, q_start=rn.q(part), iters=120)
+                rn.scratch.qpos[:] = rn.d.qpos
+                rn._set(rn.scratch, part, q)
+                mujoco.mj_kinematics(m, rn.scratch)
+                miss = pre - rn.tip(part, rn.scratch)
+                if np.hypot(miss[0], miss[1]) < 0.003:
+                    break
+                x, y = x + miss[0], y + miss[1]
+            if math.hypot(x - ox, y - oy) < 0.12 or any(
+                    f.lo[0] - 0.25 < x < f.hi[0] + 0.25 and f.lo[1] - 0.25 < y < f.hi[1] + 0.25 for f in scene.fixtures.values()):
+                ok = False
+            if not ok:
+                continue
+            _put_base(rn, (x, y, yaw))
+            _, pe1, ae1 = rn.ik(part, pre, point=u, across=across, q_start=rn.q(part), iters=150)
+            _, pe2, ae2 = rn.ik(part, grab, point=u, across=across, q_start=rn.q(part), iters=150)
+            err = max(pe1, pe2) + 0.05 * max(ae1, ae2)
+            if best is None or err < best[0]:
+                best = (err, (x, y, yaw))
+        if best is not None:
+            out.append(best)
+    rn.reset(0, scene.start, None)
+    return sorted(out, key=lambda e: e[0])
+
+
+def _drive_up_to_grip(rn, scene, hand: str, log=print, n_path: int = 4) -> list | None:
+    """Where to set a wheeled base down for the pick: the spot from which Morph's grasp planning grips the object best,
+    of those where the hand can reach it from one side (_grip_spots); else beside it as _drive_up does. With the points
+    on the straight way there from where it starts."""
+    from .contact_plan import plan_grasp
+    home = list(rn.task["mount"])
+    spots = [pose for err, pose in _grip_spots(rn, scene, hand) if err < 0.02]
+    best = None
+    for pose in spots:
+        rn.task = dict(rn.task, mount=list(pose))
+        g = plan_grasp(rn, scene, hand)
+        if g and (best is None or g["score"] > best[0]):
+            best = (g["score"], pose, g["max"])
+    rn.task = dict(rn.task, mount=home)
+    if best is None or best[0] <= 0:
+        low = _lowest_grip(rn, scene, hand)
+        top = 2 * scene.block.half_z
+        log(f"  Morph couldn't grip the {scene.object_name} from anywhere it can set the base down"
+            + (f": the point between its fingertips gets no lower than {low * 100:.1f} cm, and the {scene.object_name} is "
+               f"only {top * 100:.1f} cm tall, so its fingers can't get around it" if low is not None and low > 0.6 * top
+               else ""))
+        return _drive_up(rn, scene, hand, n_path)
+    rn.reset(0, scene.start, None)
+    base, yaw0 = rn.d.xpos[rn.ix.base].copy(), float(home[2])
+    x1, y1, yaw1 = best[1]
+    log(f"  set down to grip it: the base {math.hypot(x1 - base[0], y1 - base[1]):.2f} m from where it starts; "
+        f"Morph's grip held {best[0]:.0f}/{best[2]:.0f} in its grasp planning there")
+    return [(base[0] + (x1 - base[0]) * f, base[1] + (y1 - base[1]) * f,
+             yaw0 + math.remainder(yaw1 - yaw0, math.tau) * f) for f in (i / n_path for i in range(n_path + 1))]
+
+
+def _lowest_grip(rn, scene, hand: str) -> float | None:
+    """How low the point between the fingertips gets, set down beside the object and reaching for the floor."""
+    spots = _grip_spots(rn, scene, hand)
+    if not spots:
+        return None
+    part, low = rn.parts[hand], None
+    for _, pose in spots:
+        _put_base(rn, pose)
+        target = np.array([*rn.d.xpos[rn.ix.block][:2], 0.0])
+        q, _, _ = rn.ik(part, target, q_start=rn.q(part), iters=150)
+        rn.scratch.qpos[:] = rn.d.qpos
+        rn._set(rn.scratch, part, q)
+        mujoco.mj_kinematics(rn.m, rn.scratch)
+        z = float(rn.tip(part, rn.scratch)[2])
+        low = z if low is None else min(low, z)
+    rn.reset(0, scene.start, None)
+    return low
 
 
 def _drive_up(rn, scene, hand: str, n_path: int = 4) -> list | None:

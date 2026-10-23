@@ -92,10 +92,14 @@ def part_totals(rec: dict, task: dict) -> dict[str, float]:
 def loophole(curve: list[dict], task: dict) -> dict | None:
     """The reward going up while the checklist doesn't: which part is paying for it. Only in the second half of a round
     (early on, the reward rises as the hand learns to reach the object: that's progress, not a loophole): the first
-    evaluation from half-way against the latest."""
+    evaluation from half-way against the latest. Or one part paying more and more while the task itself gets worse
+    (traded_for)."""
     pts = [c for c in curve if c.get("parts")]
     if not pts:
         return None
+    traded = traded_for(pts, task)
+    if traded:
+        return traded
     pts = [c for c in pts if c.get("step", 0) >= pts[-1].get("step", 0) / 2]
     if len(pts) < 2:
         return None
@@ -115,6 +119,30 @@ def loophole(curve: list[dict], task: dict) -> dict | None:
             "text": f"its score rose from {ra:.0f} to {rb:.0f} but it isn't meeting the checklist more often; most of the "
                     f"rise comes from \"{label}\" ({pa.get(k, 0.0):.1f} → {pb[k]:.1f}). It may be earning that without "
                     "getting closer to the goal"}
+
+
+def traded_for(pts: list[dict], task: dict) -> dict | None:
+    """One part paying far more at the end of a round than at its start while the time spent in the goal fell by more
+    than half: the learner traded the task for that part. The total needn't rise (the Stretch's round 3: its score fell
+    from 26 to 12, but a term for keeping the hand over the parcel went from 1.0 to 7.3 while the success part fell from
+    10 to 0.2: it learned to hover)."""
+    a, b = pts[0], pts[-1]
+    sa, sb = a.get("success") or 0.0, b.get("success") or 0.0
+    sa, sb = (0.0 if sa != sa else sa), (0.0 if sb != sb else sb)
+    if not (sa > 1.0 and sb < 0.5 * sa):
+        return None
+    pa, pb = part_totals(a, task), part_totals(b, task)
+    rise = {k: pb[k] - pa.get(k, 0.0) for k in pb if k != "success"}
+    if not rise:
+        return None
+    k = max(rise, key=rise.get)
+    if rise[k] <= max(1.0, 0.5 * abs(pa.get(k, 0.0))):
+        return None
+    label = REWARD_PARTS[k][0] if k in REWARD_PARTS else k
+    return {"part": k, "label": label, "from": round(pa.get(k, 0.0), 2), "to": round(pb[k], 2),
+            "reward_from": round(a.get("reward", 0.0), 1), "reward_to": round(b.get("reward", 0.0), 1),
+            "text": f"it got worse at the task (time in the goal {sa:.0f} → {sb:.0f}) while \"{label}\" paid more and more "
+                    f"({pa.get(k, 0.0):.1f} → {pb[k]:.1f}): it is earning that instead of doing the task"}
 
 
 def view(task: dict) -> dict:

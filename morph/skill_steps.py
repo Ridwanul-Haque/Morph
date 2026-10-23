@@ -238,7 +238,7 @@ def rule_steps(prof, goal, scene, p: dict) -> list[Step]:
 
 
 OBJECT_VARS = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "held", "grip",
-               "touch_dist", "lifted", "hand_dist", "spin_dps", "spin_z_dps", "dist_to"}
+               "touch_dist", "lifted", "hand_dist", "spin_dps", "spin_z_dps", "dist_to", "grip_gap"}
 
 
 def body_only(goal) -> bool:
@@ -259,8 +259,10 @@ def object_steps(steps: list[Step]) -> list[str]:
     return out
 
 
-def plan_steps(prof, goal, scene, p: dict, llm=None, log=print) -> tuple[list[Step], dict]:
-    """Nemotron's steps if it's available and they check out, else Morph's own. The goal is always last."""
+def plan_steps(prof, goal, scene, p: dict, llm=None, log=print, check=None) -> tuple[list[Step], dict]:
+    """Nemotron's steps if it's available and they check out, else Morph's own. The goal is always last.
+    check(steps as dicts) -> problems (plan_check): what it finds goes back to Nemotron once; a plan that still has
+    them on the second try is used anyway (they're judgement calls, not formulas Morph can't read), with a note."""
     fixtures = list(scene.fixtures)
     info = {"from": "rules", "notes": []}
     steps = None
@@ -277,10 +279,16 @@ def plan_steps(prof, goal, scene, p: dict, llm=None, log=print) -> tuple[list[St
                 cand, errors = check_steps(raw, fixtures, obj)
                 if body:
                     errors += object_steps(cand)
-                if cand and not errors:
+                found = check([c.model_dump() for c in cand]) if check and cand and not errors else []
+                if found:
+                    log("  (Morph found problems in Nemotron's plan: " + "; ".join(found) + ")")
+                if cand and not errors and (not found or attempt == 1):
                     steps, info["from"] = cand, f"nemotron ({rec.latency_s}s)"
                     info["rationale"] = prop.rationale
+                    if found:
+                        info["notes"].append("Nemotron's second plan still has: " + "; ".join(found))
                     break
+                errors += found
                 fix = {"your_previous_steps": [s.model_dump() for s in raw], "problems": errors}
             if steps is None:
                 info["notes"].append("Nemotron's steps had formulas Morph can't measure (" + "; ".join(errors[:2])

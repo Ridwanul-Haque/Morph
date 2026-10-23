@@ -71,22 +71,36 @@ def test_practice_starts_near_success_from_morphs_own_route(parcel_bin, monkeypa
     assert t["starts"]["scaffold"] and len(z["qpos"]) == info["starts"] and np.all(np.diff(z["t"]) >= 0)
 
 
-def test_a_wheeled_base_is_set_down_beside_the_object(parcel_bin, monkeypatch):
-    """The Stretch never got within 50 cm of the parcel: practice now also starts with it driven up (and its gripper
-    lowered to just above the parcel)."""
+def test_a_wheeled_base_is_set_down_where_it_can_grip_the_object(parcel_bin, monkeypatch):
+    """The Stretch never got within 50 cm of the parcel; then Morph could drive it up but not work its gripper (only
+    bolted-down arms had theirs recognised), so practice never started with the parcel held. Now the base is set down
+    where its hand can reach the parcel from one side, Morph grips it there itself, and practice also starts holding
+    it."""
+    import morph.contact_plan as cp
     from morph.scaffold import scaffold_starts
+    from morph.task_model import contact_held
     pj, goal, tmp = parcel_bin
     monkeypatch.setattr(lt, "LEARNED", tmp)
+    monkeypatch.setattr(cp, "GRASP_CACHE", tmp / "grasps_stretch")
     tp = lt.make_task(pj, goal, str(MEN / "hello_robot_stretch" / "stretch.xml"), plan=False, folder=tmp / "stretch")
     t = json.loads(tp.read_text())
     assert "ppo" not in t  # a mobile base keeps the walking-robot settings
+    assert t["gripper"]["actuator"] == "grip"  # the jaws' motor, not the wrist's
     info = scaffold_starts(tp, pj, goal, log=lambda s: None)
-    assert info and info["drive"] >= 4
+    assert info and info["drive"] >= 4 and info["holding"] >= 10
     task = load_task(tp)
-    m = build_task_model(task)
+    m = build_task_model(task, accurate=True)
     ix = indices(m, task)
     d = mujoco.MjData(m)
-    d.qpos[:] = np.load(tp.parent / "starts.npz")["qpos"][-1]
-    mujoco.mj_forward(m, d)
-    near = min(np.linalg.norm(d.xpos[b][:2] - d.xpos[ix.block][:2]) for b in ix.tips)
-    assert near < 0.06  # an end part right beside the parcel
+    z = np.load(tp.parent / "starts.npz")
+    held = 0
+    for q in z["qpos"]:
+        d.qpos[:] = q
+        mujoco.mj_forward(m, d)
+        held += contact_held(m, d, ix) > 0.5
+    assert held >= 10  # real states with the parcel in its grip
+    # and the moments just before Morph's grip, gripper open, to practise closing from; the learner aims for that grip
+    assert info["ready"] >= 5 and json.loads(tp.read_text())["grasp"]["fingers"]
+    ready = z["ready"]
+    gi = ix.grip_act
+    assert all((z["ctrl"][i][gi] - ix.grip_open) / (ix.grip_close - ix.grip_open) < 0.2 for i in np.flatnonzero(ready))

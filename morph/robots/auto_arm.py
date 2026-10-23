@@ -81,6 +81,61 @@ def _tool_frame(m, d, tip: int, left: list[int], right: list[int], act_ids: list
             "gap_open_m": float(gap), "q_open": q_open, "q_closed": q_closed}
 
 
+def _jaw_motor(m, q0, acts: list[int], left: list[int], right: list[int]) -> int:
+    """Of the motors at the hand, the one that opens and closes the jaws: the one that changes the gap between them most
+    (the Stretch's hand also has its wrist yaw, listed first)."""
+    if len(acts) == 1:
+        return acts[0]
+    d = mujoco.MjData(m)
+
+    def gap(a, end):
+        d.qpos[:], d.qvel[:] = q0, 0.0
+        mujoco.mj_forward(m, d)
+        d.ctrl[:] = 0.0
+        lo, hi = m.actuator_ctrlrange[a] if m.actuator_ctrllimited[a] else (-1.0, 1.0)
+        d.ctrl[a] = (lo, hi)[end]
+        for _ in range(int(0.5 / m.opt.timestep)):
+            mujoco.mj_step(m, d)
+        return float(np.linalg.norm(d.xpos[left].mean(0) - d.xpos[right].mean(0)))
+    return max(acts, key=lambda a: abs(gap(a, 1) - gap(a, 0)))
+
+
+def gripper_config(model_path: str | Path) -> dict:
+    """Just the gripper, on any robot that has one (a mobile manipulator too: auto_arm_config wants a bolted-down arm,
+    and the Stretch's gripper went unrecognised, so Morph couldn't read how closed it was, plan a grip or run a pick of
+    its own): which actuator drives it and which end of its range is open. Raises NotAGraspingArm without one."""
+    path = Path(model_path).resolve()
+    m = I.load_model(path)
+    d = mujoco.MjData(m)
+    q0 = I.home_qpos(m)
+    d.qpos[:] = q0
+    mujoco.mj_forward(m, d)
+    roots = I._root_bodies(m)
+    geoms_all = {r: I._robot_geoms(m, r) for r in roots}
+    root = max(roots, key=lambda r: (len(geoms_all[r]), m.body_subtreemass[r]))
+    act_j = I._actuated_joints(m)
+    lo, _ = I._bbox(m, d, geoms_all[root])
+    chains = I._chains(m, d, root, act_j)
+    I._classify_chains(m, d, chains, I._base_type(m, root), float(lo[2]))
+    graspers = [e for e in I._end_effectors(m, chains, act_j) if e["type"] in ("parallel_gripper", "single_jaw_gripper")]
+    if not graspers:
+        raise NotAGraspingArm("no gripper")
+    eff = graspers[0]
+    grip_acts = list(eff["_acts"])
+    if eff["type"] == "single_jaw_gripper":
+        left, right = eff["_sides"]
+        tip = int(m.body_parentid[left[0]])
+    else:
+        left, right = I.finger_sides(m, d, eff["_bodies"], eff.get("_direct"), q0)
+        tip = I._common_ancestor(m, left + right)
+    grip_acts = [_jaw_motor(m, q0, grip_acts, left, right)]
+    tf = _tool_frame(m, d, tip, left, right, grip_acts, q0)
+    return {"actuator": I._name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, grip_acts[0]), "open": tf["ctrl_open"],
+            "close": tf["ctrl_close"], "gain_scale": 1.0,
+            # the grip point: between the fingers' inner surfaces, in this body's frame
+            "tcp_body": I._name(m, mujoco.mjtObj.mjOBJ_BODY, tip), "tcp_pos": [round(float(v), 5) for v in tf["tcp_pos"]]}
+
+
 def auto_arm_config(model_path: str | Path, name: str | None = None) -> tuple[MenagerieArmConfig, dict]:
     """Derive a MenagerieArmConfig for an arm with a gripper. Returns (config, derivation report)."""
     path = Path(model_path).resolve()

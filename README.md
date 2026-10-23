@@ -144,7 +144,29 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   for how long; and, per step, whether the next step got anywhere from where it ended (a step that ends somewhere the
   next can't continue from is flagged, as in Sequential Dexterity). Nemotron rewrites the steps and can add weighted
   **reward terms** (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in
-  training.
+  training. A term is paid as a potential (Ng, Harada & Russell 1999): for raising its value, never for keeping it
+  high, so it can guide the robot but can't make stopping halfway pay (a term for keeping the hand over the parcel once
+  taught the Stretch to hover there instead of picking it up). A revision is only kept if it practises better than the
+  plan it replaces, from the same point (a suggestion of yours also wins a tie).
+* **Plans are checked before any practice** (LLM-Modulo, Kambhampati et al. 2024): Morph sends a plan back to
+  Nemotron, with the reason, if its last step never gets the object where the goal wants it, or if a step's keep rule
+  is already broken where that step starts (the robot's start, or saved states where the step before is done), so
+  the step would be penalised from its first moment, or if the steps are out of order: an object that has to be
+  carried mustn't be asked to be at the goal before it's picked up, and along Morph's own route to the goal the steps
+  must come true in their order.
+* **A place it has to be carried into isn't eased** (missed by 29 cm, "in the bin" was met by nudging a pen along the
+  floor, and practice learned to push it). Practice starts with it already held help there instead.
+* **Wheeled robots grip too:** a gripper is recognised on a mobile base as well, a telescoping arm driven by one motor
+  through a tendon is moved as one joint, and the base is set down where the hand can reach the object from one side.
+  Morph then grips it itself and practice also starts holding it. If no grip is possible it says why (a Stretch's
+  fingertips get no lower than about 5 cm, too high for a pen lying flat).
+* **Ready to grip, not just near it:** a step that sets up a grasp has to have the open hand where Morph's own grip
+  puts it (`grip_gap`, the hand's distance from that grip), not just near the object: the Stretch learned to rest its
+  hand on top of the parcel, which was "within 6 cm", and closing there gripped nothing. Morph adds this to the plan
+  itself if Nemotron leaves it out, and the reach reward aims for that grip. A share of practice runs also starts at
+  the moment just before Morph's own grip, the gripper still open, so closing on the object is practised every round.
+* **A part it earns instead of the task is flagged:** if one part of the reward pays more and more while the time in
+  the goal falls by over half, Nemotron is told which part it is.
 * **A small population when progress stalls** (Population Based Training, DexPBT): Nemotron's different plans, plus the
   current plan exploring more and with calmer updates, each practise briefly; the weaker half is dropped and the rest
   practise again; the best plan, policy and settings are kept. They take turns on the GPU.
@@ -167,7 +189,8 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **A critic that sees more** (asymmetric actor-critic, Pinto et al. 2018): during training, the part that judges its
   moves also sees how well it really grips, how far through the steps it is, and each practice copy's true object
   weight and friction. The exported policy only uses what a robot can sense.
-* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept. Contacts come and
+* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept, both across
+  rounds and within one (practice that wrecks what it learned hands the next round its best snapshot, not the wreck). Contacts come and
   go for a tick or two even in a steady grip, so a "held" or "touching" that flickers for under 0.1 s isn't a break.
 * **Out of reach:** a bolted-down robot that never gets near the object because it stands too far away is moved
   closer, once (not if you placed it yourself).

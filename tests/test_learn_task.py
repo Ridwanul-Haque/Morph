@@ -118,8 +118,9 @@ def test_several_step_plans_are_tried_and_the_best_is_kept(tmp_path, monkeypatch
 
         def step_candidates(self, *a, **k):
             mk = lambda name, f: {"name": name, "done_when": f}
-            return StepCandidates(candidates=[{"idea": "touch it first", "steps": [mk("touch", "touch_dist < 0.05")]},
-                                              {"idea": "get behind it", "steps": [mk("behind", "hand_x < x - 0.03")]}],
+            push = mk("push", "dist_to('wall') < 0.01")  # a plan must lead to the goal (plan_check)
+            return StepCandidates(candidates=[{"idea": "touch it first", "steps": [mk("touch", "touch_dist < 0.05"), push]},
+                                              {"idea": "get behind it", "steps": [mk("behind", "hand_x < x - 0.03"), push]}],
                                   rationale="stuck at step 1"), None
 
     scores = {"keep the current steps": 1.0, "touch it first": 9.0, "get behind it": 4.0}  # the explorers: 1.0 too
@@ -240,7 +241,8 @@ def test_what_the_person_watching_says_reaches_nemotron_and_changes_the_plan(tmp
 
         def revise_steps(self, *a, advice=None, **k):
             heard.append(advice)
-            return SkillStepsProposal(steps=[{"name": "get the tip low behind it", "done_when": "touch_dist < 0.03"}],
+            return SkillStepsProposal(steps=[{"name": "get the tip low behind it", "done_when": "touch_dist < 0.03"},
+                                             {"name": "push", "done_when": "dist_to('wall') < 0.01"}],
                                       reward_terms=[{"name": "low", "formula": "-abs(hand_z - z)", "weight": 1}],
                                       rationale="You said: push it lower. Added a step that gets the tip low first."), None
 
@@ -303,7 +305,8 @@ def test_rated_practice_tries_reach_nemotron_with_what_each_did(tmp_path, monkey
 
         def revise_steps(self, *a, advice=None, ratings=None, **k):
             got.update(advice=advice, ratings=ratings)
-            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"}],
+            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"},
+                                             {"name": "push", "done_when": "dist_to('wall') < 0.01"}],
                                       rationale="The tries you liked moved it further."), None
 
     def fake_train(tp, n, restore):
@@ -350,7 +353,8 @@ def test_a_suggestion_about_a_reward_part_changes_its_weight(tmp_path, monkeypat
 
         def revise_steps(self, robot, goal_, steps, diagnosis, *a, advice=None, ratings=None, **k):
             seen.update(diagnosis=diagnosis, advice=advice)
-            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"}],
+            return SkillStepsProposal(steps=[{"name": "touch it", "done_when": "touch_dist < 0.03"},
+                                             {"name": "push", "done_when": "dist_to('wall') < 0.01"}],
                                       reward_weights={"reach": 0.4, "near": 0.0}, rationale="You said: less reach."), None
 
     def fake_train(tp, n, restore):

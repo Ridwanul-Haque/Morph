@@ -84,8 +84,12 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
             gcfg, _ = auto_arm_config(xml)
             gripper = {"actuator": gcfg.gripper_actuator, "open": gcfg.ctrl_open, "close": gcfg.ctrl_close,
                        "gain_scale": float(getattr(gcfg, "gripper_gain_scale", 1.0))}
-        except Exception:  # noqa: BLE001  (not an arm Morph can set up: no closure measure, the rest still works)
-            gripper = None
+        except Exception:  # noqa: BLE001  (not a bolted-down arm Morph can set up, e.g. on wheels: just its gripper)
+            try:
+                from .robots.auto_arm import gripper_config
+                gripper = gripper_config(xml)
+            except Exception:  # noqa: BLE001  (no gripper Morph can work: no closure measure, the rest still works)
+                gripper = None
     q0 = [0.0] * m.nu  # measured on the task model by write_task
     home = {m.joint(j).name: float(q[m.jnt_qposadr[j]]) for j in range(m.njnt)
             if int(m.jnt_type[j]) in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))}
@@ -123,7 +127,9 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
             from .project import GoalNotPossible
             raise GoalNotPossible(f"{prof.name} can't start with the {goal.object} in its hand: {e}") from None
     if plan:
-        steps, info = plan_steps(prof, goal, pj.scene, p, llm, log)
+        from .plan_check import plan_checker
+        check = plan_checker(dict(task, _dir=str(out)), task["conditions"], log) if llm is not None else None
+        steps, info = plan_steps(prof, goal, pj.scene, p, llm, log, check=check)
         task["steps"] = [st.model_dump() for st in steps[:-1]]  # the last step is the goal itself
         task["steps_final"] = steps[-1].model_dump()
         task["steps_from"] = info["from"]
@@ -287,7 +293,24 @@ def _behind(pj: Project, start, target, centre, dist: float) -> tuple[float, flo
 
 
 def task_dir(robot_name: str, goal: GoalSpec) -> Path:
-    return LEARNED / f"{robot_name}__{slug(' '.join(c.describe() for c in goal.conditions if c.kind != 'upright')) or 'goal'}"
+    """Per robot, object and goal: "put it in the bin" for a pen and for a parcel once shared a folder, and learning the
+    pen overwrote the Stretch's working parcel skill."""
+    return LEARNED / f"{robot_name}__{slug(goal.object) or 'object'}__{_goal_slug(goal)}"
+
+
+def _goal_slug(goal: GoalSpec) -> str:
+    return slug(' '.join(c.describe() for c in goal.conditions if c.kind != 'upright')) or 'goal'
+
+
+def _legacy_dir(robot_name: str, goal: GoalSpec) -> Path | None:
+    """A skill learned before folders named the object (robot and goal only), if it was learned on this object."""
+    from .user_scene import load_scene
+    d = LEARNED / f"{robot_name}__{_goal_slug(goal)}"
+    try:
+        scene = json.loads((d / "task.json").read_text())["scene"]
+        return d if load_scene(scene).object_name == goal.object else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def learning_status(folder: Path) -> dict:
@@ -306,8 +329,9 @@ def learning_status(folder: Path) -> dict:
     finished = (folder / "train_meta.json").exists() and not list(folder.glob("candidate_*"))
     reached = False
     if finished:  # it must have reached the goal in its last evaluation at least some of the time
-        curve = json.loads((folder / "train_meta.json").read_text()).get("curve") or [{}]
-        reached = (curve[-1].get("success") or 0) > 0
+        meta = json.loads((folder / "train_meta.json").read_text())
+        kept = meta.get("kept") or (meta.get("curve") or [{}])[-1]  # the snapshot it kept (its best evaluation)
+        reached = (kept.get("success") or 0) > 0
     return {"state": "done" if finished else "learning", "good": finished and reached}
 
 
@@ -316,6 +340,8 @@ def learned_for(robot_name: str, goal: GoalSpec, robot_xml: str | Path | None = 
     (learning_status good), and (given robot_xml) it was learned on this very robot file, not another one with the same
     name (a hand re-imported with its meshes is a different body from the one without). Else None."""
     d = task_dir(robot_name, goal)
+    if not (d / "task.json").exists():
+        d = _legacy_dir(robot_name, goal) or d
     if not learning_status(d)["good"]:
         return None
     if robot_xml is not None:
@@ -938,16 +964,20 @@ def diagnose(task_path: Path, policy_path: Path, n: int = 4) -> dict:
             qs, cs = np.array(starts), np.full((len(starts), m.nu), np.nan)  # no commands: hold the pose it's in
             ts = np.array(when, dtype=np.int32)
             scaffold = bool((task.get("starts") or {}).get("scaffold"))
+            ready = np.zeros(len(qs), bool)
             if f.exists() and (task.get("demo") or scaffold):  # keep the program's (or Morph's route's) moments too
                 old = np.load(f)
                 qs = np.concatenate([old["qpos"], qs])
                 cs = np.concatenate([old["ctrl"] if "ctrl" in old else np.full((len(old["qpos"]), m.nu), np.nan), cs])
                 ts = np.concatenate([old["t"] if "t" in old else np.zeros(len(old["qpos"]), np.int32), ts])
-            np.savez(f, qpos=qs, ctrl=cs, t=ts)
+                ready = np.concatenate([old["ready"] if "ready" in old else np.zeros(len(old["qpos"]), bool), ready])
+            np.savez(f, qpos=qs, ctrl=cs, t=ts, ready=ready)
+            was = task.get("starts") or {}
             task["starts"] = {"file": "starts.npz", "share": 0.5 if task.get("demo") or scaffold else 0.3,
                               "from": f"its closest moments on step {k + 1}" + (" and the program's" if task.get("demo") else
                                                                               " and Morph's route" if scaffold else ""),
-                              **({"scaffold": True} if scaffold else {})}
+                              **({"scaffold": True} if scaffold else {}),
+                              **({"ready": was["ready"]} if was.get("ready") and ready.any() else {})}
             task_path.write_text(json.dumps(task, indent=1))
             out["practice_from"] = (f"{n_close} of its closest moments on step {k + 1}"
                                     + (f" and {len(starts) - n_close} moments where step {k} ended" if len(starts) > n_close
@@ -1017,9 +1047,11 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
     thresholds, graded quantities); Morph checks the new steps and writes them into the task."""
     from .introspect import profile_robot
     from .skill_steps import Step, body_only, check_steps, check_terms, object_steps, robot_brief, scales
+    from .plan_check import plan_checker, require_grip
     task = load_task(task_path)
     prof = profile_robot(task["robot_xml"])
     p = placement(goal, scene)
+    check = plan_checker(task, task["conditions"], log)
     errors, fix = [], None
     for attempt in range(2):
         prop, rec = llm.revise_steps(robot_brief(prof), [c.describe() for c in goal.conditions], task.get("steps", []),
@@ -1036,8 +1068,16 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
         errors += w_err
         if body_only(goal):
             errors += object_steps(new)
+        found = check([s.model_dump() for s in new]) if new and not errors else []
+        if found:
+            log("  (Morph found problems in the revised plan: " + "; ".join(found) + ")")
+            if attempt == 0:
+                errors += found
         if new and not errors:
             task["steps"] = [s.model_dump() for s in new]
+            note = require_grip(task)
+            if note:
+                log(f"  {note}")
             task["reward_terms"] = terms
             task["dropped_terms"] = t_err if attempt else []
             if wts != (task.get("reward_weights") or {}):
@@ -1099,6 +1139,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         diag = diagnose(task_path, task_path.parent / "policy.npz")
         history.append({"round": r, "tries_succeeded": f"{res['success']}/{res['n']}", "diagnosis": diag, "person_said": said})
         log(f"  you said: {' / '.join(said)}")
+        before = task_path.read_text()
         try:
             rev = revise_task_steps(task_path, llm, diag, goal, pj.scene, history, log, advice=said, ratings=rated)
         except Exception as e:  # noqa: BLE001
@@ -1106,15 +1147,22 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             log(f"  (Nemotron's revision couldn't be used: {e})")
         why = rev["rationale"] if rev else ("Nemotron's answer couldn't be turned into steps Morph can measure, so the plan "
                                             "stays as it was (see the Log)")
+        tried = bool(rev)
+        if rev and r > 0 and not _tested_revision(pj, goal, task_path, before, rev, train, each, tries, history, log,
+                                                  lambda **e: emit(**e, round=r, rounds=rounds), theirs=True):
+            why = f"tried your suggestion as Nemotron wrote it ({rev['rationale'][:200]}), but it practised worse " \
+                  "than the current plan, so the current plan stays"
+            rev = None
         history[-1]["revision"] = why
         emit(type="learn_round", round=r, rounds=rounds, stage="advice", said=said, rationale=why)
         if rev:
             t = load_task(task_path)
             emit(type="skill_steps", **reward_view(t), robot=t["robot"], steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name), **{"from": t["steps_from"]},
                  rationale=why)
-        return bool(rev)
+        return tried  # this round's change was the person's (kept or not): no second revision on top
 
     per = max(5_000_000, total_steps // rounds)
+    each = max(2_000_000, per // (max(candidates, 1) + 1 + len(EXPLORE)))  # one variant's practice in a comparison
     history, res, best, last_fit = [], {"success": 0, "n": 0}, None, None
     task = load_task(task_path)
     if task.get("demo"):  # copied from a working program: maybe that's already enough
@@ -1140,6 +1188,7 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
     for r in range(1, rounds + 1):
         restore = task_path.parent / "params.pkl" if (r > 1 or task.get("demo")) else None
         _easy_first(task_path, r, rounds, log)
+        _grip_first(task_path, log)
         emit(type="learn_round", round=r, rounds=rounds, stage="practice", steps=per)
         if not train(task_path, per, restore):
             res["why_not"] = "the trainer stopped (see the log)"
@@ -1190,7 +1239,6 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             history[-1]["practice_goal"] = eased
             emit(type="learn_round", round=r, rounds=rounds, stage="eased", text=eased)
         if candidates > 0:  # a population: Nemotron's plans (if it's on) and the current plan exploring differently
-            each = max(2_000_000, per // (candidates + 1 + len(EXPLORE)))
             chosen = search_step_plans(pj, goal, task_path, train, llm, diag, history, each, tries, candidates, log,
                                        lambda **e: emit(**e, round=r, rounds=rounds))
             if chosen:
@@ -1206,11 +1254,16 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
                     break
                 continue
         if llm is not None and getattr(llm, "available", False):
+            before = task_path.read_text()
             try:
                 rev = revise_task_steps(task_path, llm, diag, goal, pj.scene, history, log)
             except Exception as e:  # noqa: BLE001  (no revision: keep practising with the same steps)
                 rev = None
                 log(f"  (Nemotron couldn't revise the steps: {e})")
+            if rev and not _tested_revision(pj, goal, task_path, before, rev, train, each, tries, history, log,
+                                            lambda **e: emit(**e, round=r, rounds=rounds)):
+                history[-1]["revision"] = f"Nemotron's revision practised no better, kept the current plan: {rev['rationale']}"
+                rev = None
             if rev:
                 history[-1]["revision"] = rev["rationale"]
                 log(f"  Nemotron revised the steps: {rev['rationale'][:300]}")
@@ -1225,6 +1278,32 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         res = best[1]
     res["rounds"] = history
     return res
+
+
+def _tested_revision(pj: Project, goal: GoalSpec, task_path: Path, before: str, rev: dict, train, each: int, tries: int,
+                     history: list, log=print, emit=None, theirs: bool = False) -> bool:
+    """A revision is only kept if it practises better than the plan it replaces, from the same point (Eureka judges
+    every reward by training on it; Booth et al. 2023: a change that reads well can still be worse). revise_task_steps
+    has written it into the task; this puts the current plan back and races the two. True if the revision won (a
+    tie goes to the current plan, unless the revision is the person's own suggestion: theirs)."""
+    new, old = load_task(task_path), json.loads(before)
+    changed = {k: v for k, v in new.items() if k != "_dir" and v != old.get(k)}
+    task_path.write_text(before)
+    chosen = search_step_plans(pj, goal, task_path, train, None, {}, history, each, tries, 0, log, emit, explore=False,
+                               extra=[{"idea": "Nemotron's revision: " + rev["rationale"][:160], "set": changed}],
+                               prefer=1 if theirs else 0)
+    if chosen is None:  # neither could practise (the trainer failed): take the revision as Nemotron meant it
+        t = load_task(task_path)
+        t.update(changed)
+        task_path.write_text(json.dumps(t, indent=1))
+        return True
+    won = chosen["index"] == 1
+    t = load_task(task_path)
+    t["steps_from"] = old.get("steps_from", "") if not won else changed.get("steps_from", t.get("steps_from"))
+    task_path.write_text(json.dumps(t, indent=1))
+    log(f"  Nemotron's revision {'practised better: using it' if won else 'practised no better than the current plan: keeping the current plan'}"
+        f" ({chosen['tries']})")
+    return won
 
 
 def _remount(task_path: Path, diag: dict, log=print) -> str | None:
@@ -1255,6 +1334,16 @@ def _remount(task_path: Path, diag: dict, log=print) -> str | None:
            f"it reaches about {reach:.2f} m, so it now stands {step:.2f} m closer")
     log(f"  {msg}")
     return msg
+
+
+def _grip_first(task_path: Path, log=print) -> None:
+    """The plan as it trains: with Morph's grip known, the step before the grasp has the hand at it (plan_check)."""
+    from .plan_check import require_grip
+    t = json.loads(Path(task_path).read_text())
+    note = require_grip(t)
+    if note:
+        Path(task_path).write_text(json.dumps(t, indent=1))
+        log(f"  {note}")
 
 
 def _easy_first(task_path: Path, r: int, rounds: int, log=print) -> None:
@@ -1297,6 +1386,8 @@ def _ease(task_path: Path, diag: dict | None, res: dict, log=print) -> str | Non
         for i, r in enumerate(diag.get("goal_conditions", [])):
             if _yes_no(task["conditions"][i], task.get("fixtures", {})):
                 continue  # a rule (no thumb, keep holding it) isn't a distance: it isn't eased
+            if _carried_there(task["conditions"][i], task):
+                continue  # eased, a place it must be lifted into is one it can be pushed towards (see there)
             misses = [m for m in r.get("miss_each_replay (by its rule, same units)", []) if np.isfinite(m)]
             if not misses or sum(m <= 1e-6 for m in misses) * 2 >= len(misses):
                 continue  # already met in most replays: no help needed
@@ -1320,6 +1411,21 @@ def _ease(task_path: Path, diag: dict | None, res: dict, log=print) -> str | Non
         msg = "practising an easier version first: " + "; ".join(parts)
     log(f"  {msg}")
     return msg
+
+
+def _carried_there(c: dict, task: dict) -> bool:
+    """A place the object has to be lifted and carried into (in a bin, on a shelf). Missed by 29 cm, "in the bin" was
+    met by nudging the Stretch's pen 7 cm along the floor, and practice learned to push it instead of picking it up.
+    Practice starts with it already held (scaffold) help there instead."""
+    from .goal_terms import PLACES, uses
+    if not (task.get("target") or {}).get("lift"):
+        return False
+    if c.get("kind") in PLACES:
+        return True
+    try:
+        return c.get("kind") == "expression" and bool({"x", "y", "goal_x", "goal_y"} & uses(c["expr"]))
+    except (SyntaxError, KeyError):
+        return False
 
 
 def _yes_no(c: dict, fixtures: dict) -> bool:
@@ -1497,9 +1603,13 @@ def attach_grasp(task_path: Path, pj: Project, goal: GoalSpec, log=print, progra
     if not g or not g.get("geom"):
         return g
     task["grasp"] = dict(g["geom"], desc=g["desc"])
+    from .plan_check import require_grip
+    note = require_grip(task)
     task.pop("_dir", None)
     task_path.write_text(json.dumps(task, indent=1))
     log(f"  the learner aims for Morph's planned grip: {g['desc']}")
+    if note:
+        log(f"  {note}")
     return g
 
 
@@ -1659,7 +1769,7 @@ def _fitness(folder: Path, res: dict) -> tuple:
     """One yardstick for every candidate, whatever its steps: real successes in the tries, then how much of the
     time the training evaluation spent in the goal state, then how close it got."""
     meta = json.loads((folder / "train_meta.json").read_text()) if (folder / "train_meta.json").exists() else {}
-    last = (meta.get("curve") or [{}])[-1]
+    last = meta.get("kept") or (meta.get("curve") or [{}])[-1]  # the snapshot the learner kept, not just its last
     in_goal = last.get("success", 0.0)
     in_goal = 0.0 if in_goal != in_goal else in_goal  # NaN
     dist = last.get("dist", 1e9)
@@ -1682,14 +1792,17 @@ EXPLORE = [("the current steps, exploring more", {"entropy": 3.0}),
 
 
 def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, diagnosis: dict, rounds: list,
-                      steps_each: int, tries: int = 5, k: int = 3, log=print, emit=None) -> dict | None:
+                      steps_each: int, tries: int = 5, k: int = 3, log=print, emit=None, explore: bool = True,
+                      extra: list[dict] = (), prefer: int = 0) -> dict | None:
     """A small population, one GPU: Nemotron proposes k different step plans (Eureka-style), and the current plan runs
     as it is and with different exploration settings (Population Based Training). Every variant practises briefly from
     where the learner is now, in its own folder; the weaker half is dropped there and the rest practise as long again
     from where they got to (successive halving: losers stop early, as PBT replaces them); the best on the same
     yardstick becomes the plan, the policy and the settings. They take turns on the GPU: an 8 GB card can't hold two
     learners for a detailed hand, and taking turns uses the same compute as splitting the practice copies between
-    them. Returns what was chosen, or None if there was nothing to compare."""
+    them. Returns what was chosen, or None if there was nothing to compare. explore=False leaves out the exploring
+    variants; extra: more plans to compare, each {"idea", "set": task fields it changes} (a revision, against the
+    current plan). prefer: the plan that wins a tie (the current one, unless it's the person's own suggestion)."""
     from .introspect import profile_robot
     from .skill_steps import Step, check_steps, check_terms, robot_brief, scales
     emit = emit or (lambda **e: None)
@@ -1699,7 +1812,12 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     plans = [{"idea": "keep the current steps", "steps": task.get("steps", []), "reward_terms": task.get("reward_terms", []),
               "ppo_tweaks": base_tw}]
     plans += [{"idea": idea, "steps": task.get("steps", []), "reward_terms": task.get("reward_terms", []),
-               "ppo_tweaks": _nudge(base_tw, by)} for idea, by in EXPLORE]
+               "ppo_tweaks": _nudge(base_tw, by)} for idea, by in (EXPLORE if explore else [])]
+    for e in extra:
+        st = e.get("set", {})
+        plans.append({"idea": e["idea"], "steps": st.get("steps", task.get("steps", [])),
+                      "reward_terms": st.get("reward_terms", task.get("reward_terms", [])),
+                      "dropped_terms": st.get("dropped_terms", []), "ppo_tweaks": base_tw, "set": st})
     prop = None
     if llm is not None and getattr(llm, "available", False):
         try:
@@ -1708,10 +1826,16 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
                                           rounds, k)
         except Exception as e:  # noqa: BLE001
             log(f"  (Nemotron couldn't propose step plans: {e})")
+    from .plan_check import plan_checker, require_grip
+    check = plan_checker(task, task["conditions"], log) if prop and prop.candidates else None
     for c in (prop.candidates if prop else []):
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
         ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name)
         terms, t_err = check_terms(c.get("reward_terms"), list(pj.scene.fixtures), pj.scene.object_name)
+        found = check([s.model_dump() for s in ok]) if ok and not errors else []
+        if found:  # no second chance here: the other variants are tried instead
+            log(f"  (a proposed plan isn't tried: {found[0]})")
+            continue
         if ok and not errors:  # a reward term Morph can't measure is left out; the plan itself is still tried
             plans.append({"idea": str(c.get("idea", ""))[:200], "steps": [s.model_dump() for s in ok], "reward_terms": terms,
                           "dropped_terms": t_err, "ppo_tweaks": base_tw})
@@ -1730,8 +1854,10 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         for f in ("demo.npz", "starts.npz"):  # the same demonstration and practice starts
             if (main / f).exists():
                 shutil.copy(main / f, cdir / f)
-        t = dict(task, steps=plan["steps"], reward_terms=plan["reward_terms"], dropped_terms=plan.get("dropped_terms", []),
-                 ppo_tweaks=plan["ppo_tweaks"])
+        t = dict(task, **{k: v for k, v in plan.get("set", {}).items() if k != "_dir"})
+        t.update(steps=[dict(st) for st in plan["steps"]], reward_terms=plan["reward_terms"],
+                 dropped_terms=plan.get("dropped_terms", []), ppo_tweaks=plan["ppo_tweaks"])
+        require_grip(t)
         (cdir / "task.json").write_text(json.dumps(t, indent=1))
         log(f"  variant {i + 1}/{len(plans)}: {plan['idea']}")
         if not train(cdir / "task.json", first, main / "params.pkl"):
@@ -1744,7 +1870,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
              in_goal=fit[1])
     if not alive:
         return None
-    alive.sort(key=lambda r: r[0], reverse=True)
+    alive.sort(key=lambda r: (r[0], r[1] == prefer), reverse=True)
     keep = alive[:max(1, (len(alive) + 1) // 2)]
     if len(alive) > 1:
         log(f"  dropped {len(alive) - len(keep)} weaker variant{'s' if len(alive) - len(keep) > 1 else ''}; "
@@ -1757,7 +1883,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
             fit = _fitness(cdir, res)
             log(f"    variant {i + 1} -> {res['success']}/{res['n']} tries; {fit[1]} of the evaluation's moments in the goal state")
         results.append((fit, i, res))
-    fit, best, res = max(results, key=lambda r: r[0])
+    fit, best, res = max(results, key=lambda r: (r[0], r[1] == prefer))
     win = main / f"candidate_{best}"
     for f in ("task.json", "policy.npz", "params.pkl", "train_meta.json"):
         if (win / f).exists():

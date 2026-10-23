@@ -91,14 +91,44 @@ class Part:
 
 
 def _servo_joints(m: mujoco.MjModel) -> dict[int, tuple[int, float]]:
-    """joint -> (its position servo, gear)."""
+    """joint -> (its position servo, gear). A servo on a tendon over several joints that move together (the Stretch's
+    telescoping arm: one motor, four sliding sections) counts as one joint, its first, at the sections' mean (each
+    section's travel x their number = the tendon's length); _coupled says which joints move with it."""
     out = {}
     for a in range(m.nu):
         if m.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_JOINT and is_position(m, a):
             j = int(m.actuator_trnid[a, 0])
             if int(m.jnt_type[j]) in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)):
                 out[j] = (a, float(m.actuator_gear[a, 0]) or 1.0)
+    for a, js in _tendon_servos(m).items():
+        coef = sum(c for _, c in js)
+        out[js[0][0]] = (a, (float(m.actuator_gear[a, 0]) or 1.0) * coef)
     return out
+
+
+def _tendon_servos(m: mujoco.MjModel) -> dict[int, list[tuple[int, float]]]:
+    """Position servos on a fixed tendon of equally weighted hinge or slide joints: actuator -> [(joint, coef)]."""
+    out = {}
+    for a in range(m.nu):
+        if m.actuator_trntype[a] != mujoco.mjtTrn.mjTRN_TENDON or not is_position(m, a):
+            continue
+        t = int(m.actuator_trnid[a, 0])
+        adr, n = int(m.tendon_adr[t]), int(m.tendon_num[t])
+        wraps = [(int(m.wrap_type[adr + k]), int(m.wrap_objid[adr + k]), float(m.wrap_prm[adr + k])) for k in range(n)]
+        if not wraps or any(w != int(mujoco.mjtWrap.mjWRAP_JOINT) for w, _, _ in wraps):
+            continue
+        if any(int(m.jnt_type[j]) not in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))
+               for _, j, _ in wraps) or len({c for _, _, c in wraps}) != 1 or wraps[0][2] <= 0:
+            continue  # wheels turning in opposite senses ("turn"), or unequal shares: not one joint
+        if len({int(m.jnt_type[j]) for _, j, _ in wraps}) != 1:
+            continue
+        out[a] = [(j, c) for _, j, c in wraps]
+    return out
+
+
+def _coupled(m: mujoco.MjModel) -> dict[int, list[int]]:
+    """The joint standing for a tendon's joints -> all of them (they move together)."""
+    return {js[0][0]: [j for j, _ in js] for js in _tendon_servos(m).values()}
 
 
 def _chain_joints(m: mujoco.MjModel, body: int, servo: dict) -> list[int]:
@@ -138,12 +168,19 @@ def robot_parts(m: mujoco.MjModel, d: mujoco.MjData, ix, task: dict) -> dict[str
         d2 = mujoco.MjData(m)
         d2.qpos[:] = d.qpos
         mujoco.mj_forward(m, d2)
-        before = {int(b): _tip(m, d2, int(b), ix.tip_off[k]).copy() for k, b in enumerate(ix.tips)}
+        # measured in the frame of what the gripper is mounted on, so the arm settling a few mm as it starts (the
+        # Stretch's wrist markers) doesn't count as fingers moving
+        ref = _grip_mount(m, ix.grip_act)
+
+        def local(dd, k, b):
+            return dd.xmat[ref].reshape(3, 3).T @ (_tip(m, dd, int(b), ix.tip_off[k]) - dd.xpos[ref])
+        before = {int(b): local(d2, k, b).copy() for k, b in enumerate(ix.tips)}
         d2.ctrl[:] = d.ctrl
         d2.ctrl[ix.grip_act] = ix.grip_close
         for _ in range(int(0.6 / m.opt.timestep)):
             mujoco.mj_step(m, d2)
-        moved = [int(b) for k, b in enumerate(ix.tips) if np.linalg.norm(_tip(m, d2, int(b), ix.tip_off[k]) - before[int(b)]) > 0.004]
+        shift = {int(b): local(d2, k, b) - before[int(b)] for k, b in enumerate(ix.tips)}
+        moved = [b for b, v in shift.items() if np.linalg.norm(v) > 0.004]
         tips = {int(b): ix.tip_off[k] for k, b in enumerate(ix.tips)}
         if len(moved) == 1:  # a single jaw closing against a fixed one (the part it hangs from): that is the other finger
             jaw = int(m.body_parentid[moved[0]])
@@ -158,11 +195,24 @@ def robot_parts(m: mujoco.MjModel, d: mujoco.MjData, ix, task: dict) -> dict[str
             R, p0 = d.xmat[wrist].reshape(3, 3), d.xpos[wrist]
             mid = (pts[a] + pts[b2]) / 2
             off = R.T @ (mid - p0)
-            js = _chain_joints(m, wrist, servo)
+            js = [j for j in _chain_joints(m, wrist, servo) if servo[j][0] != ix.grip_act]  # not the fingers' own motor
             grip_bodies = _subtree(m, wrist)
+            fingers = ((a, tips[a]), (b2, tips[b2]))
+            if a in shift and b2 in shift:  # which way they close: the far corners of round fingertips (the Stretch's
+                # discs) can sit one high and one low, and the line between them then reads as closing up and down
+                close = shift[a] - shift[b2]
+                Rr = d.xmat[ref].reshape(3, 3)
+                along = lambda v: abs(float(v @ close)) / (np.linalg.norm(v) * np.linalg.norm(close) + 1e-12)  # noqa: E731
+                corners, origins = Rr.T @ (pts[b2] - pts[a]), Rr.T @ (d.xpos[b2] - d.xpos[a])
+                if along(corners) < 0.9 and along(origins) > along(corners):
+                    fingers = ((a, np.zeros(3)), (b2, np.zeros(3)))
+            tb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "robot_" + str(g.get("tcp_body", "")))
+            if g.get("tcp_pos") and tb >= 0:  # measured between the fingers' inner surfaces (auto_arm.gripper_config),
+                # not between their far corners: on the Stretch's round fingertips those sit 1.7 cm off the pads, and it
+                # pinched the parcel's edge and slid off
+                off = R.T @ (d.xpos[tb] + d.xmat[tb].reshape(3, 3) @ np.array(g["tcp_pos"]) - p0)
             parts["hand"] = Part("hand", wrist, off, js, [servo[j][0] for j in js], [servo[j][1] for j in js],
-                                 off / (np.linalg.norm(off) + 1e-9), ((a, tips[a]), (b2, tips[b2])), grip_bodies,
-                                 can_grip=True)
+                                 off / (np.linalg.norm(off) + 1e-9), fingers, grip_bodies, can_grip=True)
     for k, b in enumerate(ix.tips):
         b = int(b)
         if b in grip_bodies:
@@ -203,6 +253,16 @@ def _far_point(m, d, b: int) -> np.ndarray:
     return d.xmat[b].reshape(3, 3).T @ (best - d.xpos[b])
 
 
+def _grip_mount(m, a: int) -> int:
+    """The body the gripper motor's joint hangs from (on a tendon: its first joint's)."""
+    if m.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_TENDON:
+        t = int(m.actuator_trnid[a, 0])
+        j = int(m.wrap_objid[m.tendon_adr[t]])
+    else:
+        j = int(m.actuator_trnid[a, 0])
+    return int(m.body_parentid[m.jnt_bodyid[j]])
+
+
 def _common_ancestor(m, bodies: list[int]) -> int:
     def path(b):
         out = []
@@ -232,6 +292,25 @@ class BodyRunner:
         self.reset(0, task["start"], None)
         self.parts = robot_parts(self.m, self.d, self.ix, task)
         self.home_q = self.d.qpos.copy()
+        self.couple = _coupled(self.m)  # a telescoping arm's sections, moved as one
+
+    def _group(self, j: int) -> list[int]:
+        return self.couple.get(j, [j])
+
+    def q(self, part: Part, d=None) -> np.ndarray:
+        """The part's joint values (part.joints order); a telescoping arm's at its sections' mean."""
+        d = d if d is not None else self.d
+        return np.array([np.mean([d.qpos[self.m.jnt_qposadr[k]] for k in self._group(j)]) for j in part.joints])
+
+    def _set(self, d, part: Part, q) -> None:
+        for j, v in zip(part.joints, q):
+            for k in self._group(j):
+                d.qpos[self.m.jnt_qposadr[k]] = v
+
+    def _cols(self, J: np.ndarray, part: Part) -> np.ndarray:
+        """Jacobian columns per part joint: a telescoping arm's sections all move by the same amount."""
+        return np.column_stack([J[:, [self.m.jnt_dofadr[k] for k in self._group(j)]].sum(1) for j in part.joints]) \
+            if part.joints else J[:, :0]
 
     def reset(self, seed: int, start, params) -> None:
         from .sim import PhysicalParams
@@ -270,10 +349,8 @@ class BodyRunner:
         pointing error rad)."""
         m, d2 = self.m, self.scratch
         d2.qpos[:] = self.d.qpos
-        adr = [m.jnt_qposadr[j] for j in part.joints]
-        dof = [m.jnt_dofadr[j] for j in part.joints]
         if q_start is not None:
-            d2.qpos[adr] = q_start
+            self._set(d2, part, q_start)
         lo = np.array([m.jnt_range[j][0] if m.jnt_limited[j] else -1e9 for j in part.joints])
         hi = np.array([m.jnt_range[j][1] if m.jnt_limited[j] else 1e9 for j in part.joints])
         jp, jr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
@@ -284,26 +361,26 @@ class BodyRunner:
             mujoco.mj_comPos(m, d2)
             p = self.tip(part, d2)
             mujoco.mj_jac(m, d2, jp, jr, p, part.body)
-            rows, errs = [jp[:, dof]], [target - p]
+            rows, errs = [self._cols(jp, part)], [target - p]
             pe = float(np.linalg.norm(target - p))
             ae = 0.0
             if point is not None:
                 a = self.pointing(part, d2)
-                rows.append(0.25 * (-_skew(a) @ jr[:, dof]))
+                rows.append(0.25 * (-_skew(a) @ self._cols(jr, part)))
                 errs.append(0.25 * (point - a))
                 ae = math.acos(float(np.clip(a @ point, -1, 1)))
             if across is not None and part.fingers:
                 f = self.finger_axis(part, d2)
                 f = f if f @ across >= 0 else -f  # either finger can be on either side
-                rows.append(0.15 * (-_skew(f) @ jr[:, dof]))
+                rows.append(0.15 * (-_skew(f) @ self._cols(jr, part)))
                 errs.append(0.15 * (across - f))
             J, e = np.vstack(rows), np.concatenate(errs)
             if pe < 0.002 and ae < 0.03 and (across is None or np.linalg.norm(errs[-1]) < 0.01):
                 break
             dq = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(len(e)), e)
             dq = np.clip(dq, -0.2, 0.2)
-            d2.qpos[adr] = np.clip(d2.qpos[adr] + dq, lo, hi)
-        return d2.qpos[adr].copy(), pe, ae
+            self._set(d2, part, np.clip(self.q(part, d2) + dq, lo, hi))
+        return self.q(part, d2), pe, ae
 
     def reconfigure(self, part: Part, target, point=None, across=None, tries: int = 12, seed: int = 0):
         """Joint values for the end pose found from other starting arrangements (home, random), or None."""
@@ -311,13 +388,13 @@ class BodyRunner:
         m = self.m
         lo = np.array([m.jnt_range[j][0] if m.jnt_limited[j] else -math.pi for j in part.joints])
         hi = np.array([m.jnt_range[j][1] if m.jnt_limited[j] else math.pi for j in part.joints])
-        home = self.home_q[[m.jnt_qposadr[j] for j in part.joints]] if hasattr(self, "home_q") else (lo + hi) / 2
+        home = np.array([self.home_q[m.jnt_qposadr[j]] for j in part.joints]) if hasattr(self, "home_q") else (lo + hi) / 2
         best, key = None, None
         for k in range(tries):
             q0 = home if k == 0 else rng.uniform(lo, hi)
             q, pe, ae = self.ik(part, target, point, across, q0, iters=150)
             if pe < 0.01 and ae < 0.1:
-                cur = self.d.qpos[[m.jnt_qposadr[j] for j in part.joints]]
+                cur = self.q(part)
                 score = float(np.max(np.abs(q - cur)))  # the nearest arrangement that works
                 if key is None or score < key:
                     best, key = q, score
@@ -601,7 +678,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
         return rn.d.xmat[ix.base].reshape(3, 3)[2, 2] < 0.5
 
     report = []
-    q_part = {n: rn.d.qpos[[m.jnt_qposadr[j] for j in p.joints]].copy() for n, p in rn.parts.items()}
+    q_part = {n: rn.q(p) for n, p in rn.parts.items()}
     jumps: dict = {}
     nxt = 0
     while nxt < len(steps):
@@ -666,7 +743,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                 if pe_end > 0.01 or ae_end > 0.1:
                     best = rn.reconfigure(part, target, point, across)
                     if best is not None:
-                        q0_ = rn.d.qpos[[rn.m.jnt_qposadr[j] for j in part.joints]].copy()
+                        q0_ = rn.q(part)
                         steps_n = max(10, int(np.max(np.abs(best - q0_)) / 0.03))
                         for k in range(steps_n):
                             rn.command(part, q0_ + (best - q0_) * (k + 1) / steps_n)
@@ -761,7 +838,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                         rn.ctrl[a] = np.clip(gr * (start[j] + (v - start[j]) * f), ix.act_lo[a], ix.act_hi[a])
                 tick()
             for nm, p in rn.parts.items():
-                q_part[nm] = rn.d.qpos[[m.jnt_qposadr[j] for j in p.joints]].copy()
+                q_part[nm] = rn.q(p)
             note = "done"
         else:
             for _ in range(int(st["seconds"] / CTRL_DT)):

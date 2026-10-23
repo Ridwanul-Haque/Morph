@@ -45,6 +45,9 @@ from morph.task_model import (CTRL_DT, SIM_DT, Residual, apply_action, build_tas
                               obs_size, observe, soft)  # noqa: E402
 
 
+# a reward term's potential per unit of weight x value: about what one step of the plan is worth (0.5)
+TERM_SCALE = 0.5
+
 RANDOMIZE = {  # (low, high) multipliers; "light" halves each spread
     "floor_friction": (0.6, 1.3), "object_friction": (0.6, 1.4), "object_mass": (0.6, 1.6),
     "motor_strength": (0.8, 1.2), "obs_noise": 0.01, "delay_prob": 0.5}
@@ -159,6 +162,11 @@ class TaskLearn(mjx_env.MjxEnv):
             + (["steps"] if task.get("steps") else [])  # + "copy" once the demonstration is loaded (below)
         # extra shaping terms Nemotron wrote (Eureka-style), each logged on its own so it can see what they did
         self.terms = [(parse(t["formula"], self.fx), float(t["weight"])) for t in task.get("reward_terms", [])]
+        # ... paid as potentials (Ng, Harada & Russell 1999): gamma * phi(next) - phi(now), so a term pays for getting
+        # its value up, not for sitting there. One paid every tick taught the Stretch to hover over the parcel instead
+        # of picking it up (its term earned 7.3 a try while the success part fell from 10 to 0.2). main() sets gamma to
+        # the learner's own discount: with any other the guarantee that it can't change the best behaviour is gone
+        self.gamma = 0.97
         b = task["block"]
         self.half = (b["half_x"], b["half_y"], b["half_z"])
         self.nu = self._mj_model.nu
@@ -192,7 +200,15 @@ class TaskLearn(mjx_env.MjxEnv):
             self._start_t = jp.array(z["t"], dtype=jp.int32) if "t" in z else jp.zeros(len(z["qpos"]), jp.int32)
             self._start_share = float(st.get("share", 0.3))
             lo = int(st.get("from_t", 0))
-            self._start_ok = self._start_t >= lo if "t" in z and lo > 0 and bool(np.any(z["t"] >= lo)) else None
+            ok = np.asarray(z["t"]) >= lo if "t" in z and lo > 0 and bool(np.any(z["t"] >= lo)) else np.ones(len(z["qpos"]), bool)
+            # the moments just before Morph's own grip (open hand around the object): this share of the route's starts,
+            # every round, whichever part of the route the round practises from (scaffold._about_to_grip)
+            ready = np.asarray(z["ready"], bool) if "ready" in z.files and float(st.get("ready", 0)) > 0 else None
+            w = ok.astype(float)
+            if ready is not None and ready.any() and (ok & ~ready).any():
+                rs = float(st["ready"])
+                w = np.where(ready, rs * (ok & ~ready).sum() / ((1 - rs) * ready.sum()), w * ~ready)
+            self._start_ok = None if np.all(w == 1.0) else jp.array(np.where(w > 0, np.log(np.maximum(w, 1e-30)), -np.inf))
         self._ctrl0 = jp.array(np.clip(self.ix.q0, self.ix.act_lo, self.ix.act_hi))
         self._lo, self._hi = jp.array(self.ix.act_lo), jp.array(self.ix.act_hi)
         self.rand = ranges(randomize)
@@ -308,6 +324,15 @@ class TaskLearn(mjx_env.MjxEnv):
         phi = step.astype(jp.float32) + jp.where(step < n, 1.0 - jp.tanh(3.0 * cur), 0.0)
         return step, phi, jp.where(step < n, keep[i], 0.0), streak
 
+    def _term_phi(self, data):
+        """(each of Nemotron's terms as a potential, its clipped value), on the graded quantities."""
+        if not self.terms:
+            return jp.zeros(0), jp.zeros(0)
+        vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
+        tv = jp.stack([jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms])
+        tv = jp.where(jp.isnan(tv), 0.0, tv)
+        return TERM_SCALE * jp.array([wt for _, wt in self.terms]) * tv, tv
+
     def reset(self, rng):
         rng, k1, k2, k3 = jax.random.split(rng, 4)
         q = self._q_init
@@ -325,8 +350,8 @@ class TaskLearn(mjx_env.MjxEnv):
             rng, k4, k5 = jax.random.split(rng, 3)
             if self._start_ok is None:
                 i_start = jax.random.randint(k4, (), 0, self._starts.shape[0])
-            else:  # only the starts this round allows (late in the recipe first)
-                i_start = jax.random.categorical(k4, jp.where(self._start_ok, 0.0, -jp.inf))
+            else:  # only the starts this round allows (late in the recipe first), and the ones just before the grip
+                i_start = jax.random.categorical(k4, self._start_ok)
             pick = self._starts[i_start]
             use = jax.random.uniform(k5) < self._start_share
             q = jp.where(use, pick, q)
@@ -350,6 +375,7 @@ class TaskLearn(mjx_env.MjxEnv):
                 "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), "ease_u": u,
                 **track}
         info["phi"] = self._steps(data, info["step"], info["streak"])[1]
+        info["tphi"] = self._term_phi(data)[0]
         if self.stop_rules:
             info["armed"] = ~self._broken(data, u)
             info["broke"] = jp.zeros(len(self.stop_rules), jp.int32)
@@ -473,11 +499,16 @@ class TaskLearn(mjx_env.MjxEnv):
             left = jp.maximum(self.task["episode_s"] - (info["t"] + 1) * self.dt, 0.0)
             end_pen = ended * 3.0 * left
             done = jp.maximum(done, ended)
-        tvals = []
-        if self.terms:  # Nemotron's terms, on the graded quantities (each clipped: one term can't swamp the rest)
-            vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
-            tvals = [jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms]
-            r = r + sum(wt * tv for (_, wt), tv in zip(self.terms, tvals))
+        tvals, tpaid = [], []
+        if self.terms:  # Nemotron's terms (each clipped: one term can't swamp the rest), as potentials; a try that
+            # really ends (fell, broke a rule) ends at potential 0, one cut off by the time limit carries on (bootstrapped)
+            tphi, tv = self._term_phi(data)
+            paid = self.gamma * tphi * (1.0 - done) - info["tphi"]
+            info["tphi"] = tphi
+            tvals, tpaid = list(tv), list(paid)
+            shaped_terms = jp.sum(paid)
+        else:
+            shaped_terms = jp.zeros(())
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
@@ -486,12 +517,13 @@ class TaskLearn(mjx_env.MjxEnv):
                              steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)},
                              # what each part paid this tick (summed over a run: its total), the step bonus included
                              **{f"part_{k}": z(v * self.dt + (shaped if k == "steps" else 0.0)) for k, v in part.items()},
-                             **{f"termw_{k}": z(wt * tv * self.dt) for k, ((_, wt), tv) in enumerate(zip(self.terms, tvals))})
+                             **{f"termw_{k}": z(pd) for k, pd in enumerate(tpaid)})
         obs = self._obs(data, info)
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own
         # environments; otherwise one bad copy turns the whole batch's numbers into NaN
-        bad = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(r) | jp.isnan(shaped)
-        reward = jp.where(bad, 0.0, r * self.dt + shaped - end_pen)
+        bad = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(r) | jp.isnan(shaped) | \
+            jp.isnan(shaped_terms)
+        reward = jp.where(bad, 0.0, r * self.dt + shaped + shaped_terms - end_pen)
         done = jp.where(bad, 1.0, done)
         obs = jax.tree_util.tree_map(lambda o: jp.where(jp.isnan(o), 0.0, o), obs)
         return state.replace(data=data, obs=obs, reward=reward, done=done)
@@ -623,7 +655,15 @@ def main():
         p.learning_rate, p.entropy_cost, p.unroll_length = 1e-3, 2e-2, 10
         p.batch_size, p.num_minibatches, p.num_updates_per_batch = 512, 32, 8
     p.num_timesteps, p.num_envs, p.num_evals = a.steps, a.envs, a.evals
+    # Brax trains at least (evals - 1) x resets x one batch: with the walking-robot settings' 10 resets that's ~18M
+    # steps, so a 1M-step try ran 18M. Fewer resets for a shorter run keep it the length it was asked to be
+    per_batch = p.batch_size * p.num_minibatches * p.unroll_length
+    if p.get("num_resets_per_eval", 0) > 0:  # (Brax rounds the batches per reset up.) Each reset draws fresh starts:
+        per_eval = max(a.evals - 1, 1) * per_batch  # as many as keep it within 10% of the length that's possible
+        total = {r: -(-a.steps // (per_eval * r)) * per_eval * r for r in range(1, p.num_resets_per_eval + 1)}
+        p.num_resets_per_eval = max(r for r, n in total.items() if n <= 1.1 * min(total.values()))
     p.episode_length = int(task["episode_s"] / CTRL_DT)
+    env.gamma = eval_env.gamma = float(p.discounting)  # the reward terms' potentials discount as the learner does
     net = dict(p.network_factory)
     kw = {k: v for k, v in p.items() if k != "network_factory"}
     log, t0 = [], time.time()
@@ -646,12 +686,20 @@ def main():
         rec["parts"] = {k: round(float(metrics.get(f"eval/episode_part_{k}", 0.0)), 3) for k in env.parts}
         log.append(rec)
         print(json.dumps(rec), flush=True)
+        # the evaluation just run was of the snapshot taken a moment before (checkpoint): remember the best one, so
+        # practice that wrecks what it had learned (round 3 of the Stretch's bin task: 167 ticks in the goal at the
+        # start of the round, 6 at the end) doesn't hand the next round the wreck
+        consider()
 
     ckpts = out / "checkpoints"
     ckpts.mkdir(exist_ok=True)
 
     import pickle
-    latest = {}
+    latest, best = {}, {}
+
+    def consider():  # the snapshot and its evaluation, once both are in (Brax evaluates step 0 before snapshotting it)
+        if log and "params" in latest and latest["step"] == log[-1]["step"] and _score(log[-1]) > _score(best.get("rec")):
+            best.update(params=latest["params"], rec=log[-1])
 
     class StopRound(Exception):
         pass
@@ -660,6 +708,7 @@ def main():
         path = ckpts / f"step_{int(step):012d}.npz"
         export_numpy(params, path)
         latest["params"], latest["step"] = jax.device_get(params), int(step)
+        consider()
         print(json.dumps({"checkpoint": str(path), "step": int(step)}), flush=True)
         if (out / "stop_round").exists():  # the person watching asked to change the plan now: end this round here
             (out / "stop_round").unlink(missing_ok=True)
@@ -703,15 +752,28 @@ def main():
     except StopRound:  # ended early on request: keep what it learned up to the last snapshot
         params, stopped = latest["params"], True
         print(json.dumps({"stopped_early": latest["step"]}), flush=True)
+    if best and best["rec"] is not log[-1]:
+        params = best["params"]
+        print(json.dumps({"kept_best": best["rec"]["step"], "success": best["rec"]["success"],
+                          "last_success": log[-1]["success"]}), flush=True)
     shapes = export_numpy(params, out / "policy.npz")
     (out / "params.pkl").write_bytes(pickle.dumps(jax.device_get(params)))  # for the next round to continue from
     meta = {"task": str(task_path), "steps": a.steps, "num_envs": a.envs, "randomize": a.randomize,
             "randomize_ranges": ranges(a.randomize), "wall_s": round(time.time() - t0, 1),
             "network": shapes, "curve": log, "obs_size": n_obs, "actions": env.nu,
             "keep_copying": a.keep_copying if task.get("demo") else 0.0, "stopped_early": stopped, "ppo_tweaks": tw,
+            "kept": best["rec"] if best else (log[-1] if log else None),
             "residual": task.get("residual") if env.residual is not None else None}
     (out / "train_meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps({k: v for k, v in meta.items() if k != "curve"}), flush=True)
+
+
+def _score(rec) -> tuple:
+    """How good an evaluation was: time spent in the goal, then steps got through, then closeness."""
+    if not rec:
+        return (-1.0, -1.0, -1e9)
+    nan0 = lambda x, bad: bad if x != x else x  # noqa: E731
+    return (nan0(rec["success"], 0.0), nan0(rec.get("steps_done", 0.0), 0.0), -nan0(rec["dist"], 1e9))
 
 
 if __name__ == "__main__":

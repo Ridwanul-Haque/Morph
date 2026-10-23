@@ -59,7 +59,10 @@ def grasp_candidates(rn: BodyRunner, scene, part: str) -> list[dict]:
                                          "point": "down", "speed": "slow"},
                                         {"do": "grip", "how": "close"},
                                         {"do": "move", "part": part, "z": "obj_top + 0.05", "speed": "slow"}]})
-    # from the side: the hand comes in level from one of the four sides, fingers closing horizontally across it
+    # from the side: the hand comes in level from one of the four sides, fingers closing horizontally across it (or
+    # tilted as its wrist holds it, if it can't point level: the Stretch's gripper always points 30 degrees down)
+    pz = level_tilt(rn, rn.parts[part])
+    c = math.sqrt(max(1.0 - pz * pz, 0.0))
     for side_deg in (0, 90, 180, 270):
         ext = abs(hx * math.cos(math.radians(side_deg))) + abs(hy * math.sin(math.radians(side_deg)))
         for frac in (0.5, 0.35):
@@ -70,13 +73,25 @@ def grasp_candidates(rn: BodyRunner, scene, part: str) -> list[dict]:
                           "steps": [{"do": "grip", "how": "open"},
                                     {"do": "move", "part": part, "x": f"obj_x - {back:.4f} * cosd{d}",
                                      "y": f"obj_y - {back:.4f} * sind{d}", "z": "obj_top + 0.06",
-                                     "point": [f"cosd{d}", f"sind{d}", "0"], "turn": f"{d} + 90"},
+                                     "point": [f"{c:.4f} * cosd{d}", f"{c:.4f} * sind{d}", f"{pz:.4f}"],
+                                     "turn": f"{d} + 90"},
                                     {"do": "move", "part": part, "z": z, "speed": "slow"},
                                     {"do": "move", "part": part, "x": f"obj_x + {0.3 * ext:.4f} * cosd{d}",
                                      "y": f"obj_y + {0.3 * ext:.4f} * sind{d}", "speed": "slow"},
                                     {"do": "grip", "how": "close"},
                                     {"do": "move", "part": part, "z": "obj_top + 0.05", "speed": "slow"}]})
     return cands
+
+
+def level_tilt(rn: BodyRunner, part) -> float:
+    """How far down (the z of its pointing) a hand points when asked to point level: 0 if it can, else as its wrist
+    holds it."""
+    a = rn.pointing(part)
+    h = np.array([a[0], a[1], 0.0])
+    if np.linalg.norm(h) < 1e-6:
+        h = np.array([1.0, 0.0, 0.0])
+    _, _, ae = rn.ik(part, rn.tip(part), point=h / np.linalg.norm(h), iters=120)
+    return 0.0 if ae < 0.1 else float(np.clip(a[2], -0.95, 0.95))
 
 
 SHAKE = [{"do": "move", "part": "{part}", "x": "{part}_x + 0.03", "speed": "fast"},
