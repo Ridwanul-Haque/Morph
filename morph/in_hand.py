@@ -111,7 +111,7 @@ def _closed(m: mujoco.MjModel, a: int, now: float) -> float:
 
 def setup(task: dict, goal, log=print) -> dict:
     """Mutates task (see the module's docstring). Raises NoGrip with the reason when no grip holds it."""
-    from .goal_terms import MOTION, condition_violation, uses
+    from .goal_terms import MOTION, WINDOW_FUNCS, condition_violation, uses
     from .task_model import build_task_model, contact_held, contact_touch, indices, measure
     if not hands(mujoco.MjModel.from_xml_path(task["robot_xml"])):
         raise NoGrip(f"{task['robot']} has no hand with fingers to hold it in")
@@ -134,10 +134,25 @@ def setup(task: dict, goal, log=print) -> dict:
     lift = min(b["half_x"], b["half_y"], b["half_z"]) + 0.015
     spots = [("over the palm", 0.5 * (palm + tips)), ("over the fingers", 0.25 * palm + 0.75 * tips)]
     across = math.atan2(*(tips - palm)[:2][::-1]) + math.pi / 2  # its long side across the fingers
-    always = [c for c in task.get("conditions", []) if c.get("when") == "always"  # it's at rest when a try starts
-              and not (c.get("expr") and uses(c["expr"]) & MOTION)]
+    always = [c for c in task.get("conditions", []) if c.get("when") == "always"  # at rest as a try starts (not over time)
+              and not (c.get("expr") and uses(c["expr"]) & (MOTION | WINDOW_FUNCS))]
     labels = list(h["fingers"])
     sets = [labels] + [[x for x in labels if x != leave] for leave in labels]
+    # the fingers the request says it starts on ("starts between the index and middle fingers"): laid over them, those
+    # fingers closed (alone or with one more), and a grip only counts as that start if they all touch it
+    want = [f for f in (getattr(goal, "start_fingers", None) or []) if f in labels]
+    if not want:  # the request didn't say: where the goal first needs it ("at some point it's between the index and
+        # middle fingers"), so practice starts there instead of in a fist it has to work loose by trial and error
+        want, why = fingers_needed_first(task.get("conditions", []), labels)
+        if want:
+            log(f"  it starts on the {' and '.join(want)} fingers: the goal first needs it there ({why})")
+    on_want = []
+    if want:
+        mid = np.array([d.xpos[h["fingers"][f][-1]] for f in want]).mean(0)
+        spots = [(f"over the {' and '.join(want)} finger{'s' if len(want) > 1 else ''}", 0.25 * palm + 0.75 * mid),
+                 (f"at the {' and '.join(want)} fingertip{'s' if len(want) > 1 else ''}", 0.1 * palm + 0.9 * mid)] + spots
+        sets = [want] + [want + [x] for x in labels if x not in want] + [labels]
+        on_want = [{"kind": "expression", "expr": f"touching('{f}') == 1", "text": f"the {f} finger on it"} for f in want]
 
     def drop(p, yaw, used, c):
         """Lay it there, close those fingers that far, let it settle: the grip's commands, or None if it blew up."""
@@ -175,9 +190,14 @@ def setup(task: dict, goal, log=print) -> dict:
                     touch=touch)
         bad = [c_["text"] or c_["expr"] or c_["kind"] for c_ in always
                if not float(condition_violation(np, {**c_, "when": "end"}, v, task.get("fixtures", {}), half)) <= 1e-6]
-        score = (not bad, touch["fingers_touching"], -abs(c - 0.5), -speed)
+        missing = [c_["text"] for c_ in on_want
+                   if not float(condition_violation(np, {**c_, "when": "end"}, v, task.get("fixtures", {}), half)) <= 1e-6]
+        others = int(touch["fingers_touching"]) - (len(want) - len(missing))
+        # the fingers asked for first (and as few others as can be), else as many fingers on it as possible
+        score = (not bad, not missing, -others if want else touch["fingers_touching"], -abs(c - 0.5), -speed)
         cands.append({"score": score, "qpos": d.qpos.copy(), "ctrl": ctrl.copy(), "bad": bad, "p": p, "yaw": yaw,
-                      "used": used, "c": c, "how": f"{spot}, {', '.join(used)} closed {c:.0%}"})
+                      "used": used, "c": c, "how": f"{spot}, {', '.join(used)} closed {c:.0%}", "missing": missing,
+                      "on": want})
     if not cands:
         raise NoGrip(f"none of {tried} grips held the {goal.object} (" + ", ".join(f"{k}: {n}" for k, n in why.items()) + ")")
     cands.sort(key=lambda x: x["score"], reverse=True)
@@ -188,8 +208,13 @@ def setup(task: dict, goal, log=print) -> dict:
     fast = build_task_model({**task, "physics": task.get("physics") or {"impratio": 1.0}})
     held_for = []
     best = None
-    for cand in [x for x in cands if not x["bad"]][:MAX_CHECKED]:
-        secs = min(_holds_for(mm, task, cand["qpos"], cand["ctrl"], always) for mm in (m, fast))
+    if want and cands[0]["missing"]:
+        log(f"  (no grip Morph tried had the {' and '.join(want)} fingers all on the {goal.object}: starting from the "
+            f"closest, {cands[0]['how']}, without {'; '.join(cands[0]['missing'])})")
+    for cand in [x for x in cands if not x["bad"] and x["missing"] == cands[0]["missing"]][:MAX_CHECKED]:
+        # (the asked-for fingers have to stay on it, untouched, as the goal's whole-time conditions do)
+        secs = min(_holds_for(mm, task, cand["qpos"], cand["ctrl"], always + [c_ for c_ in on_want if c_["text"]
+                                                                             not in cand["missing"]]) for mm in (m, fast))
         held_for.append(secs)
         cand["held_s"] = secs
         if secs >= HOLD_S:
@@ -211,7 +236,8 @@ def setup(task: dict, goal, log=print) -> dict:
             if ctrl is None or not (_only_robot_touches(m, d, ix) and d.xpos[ix.block][2] > 0.05):
                 continue
             qpos = d.qpos.copy()
-            if min(_holds_for(mm, task, qpos, ctrl, always) for mm in (m, fast)) >= HOLD_S:
+            keep = always + [c_ for c_ in on_want if c_["text"] not in best.get("missing", [])]
+            if min(_holds_for(mm, task, qpos, ctrl, keep) for mm in (m, fast)) >= HOLD_S:
                 starts.append({"qpos": qpos, "ctrl": ctrl, "how": best["how"] + " (laid a little differently)"})
     _, qpos, ctrl, how = None, best["qpos"], best["ctrl"], best["how"]
     task["start_state"] = {"qpos": [float(x) for x in qpos], "ctrl": [float(x) for x in ctrl], "how": how}
@@ -229,6 +255,47 @@ def setup(task: dict, goal, log=print) -> dict:
 
 
 HOLD_S = 3.0  # how long a grip must hold the object, untouched, to be a start
+def _touches(expr: str) -> dict[str, bool]:
+    """The fingers a condition needs on the object (True) or off it (False): touching('index') == 1, ... == 0, in its
+    and-ed parts (not under "or" or "not")."""
+    import ast
+    from .goal_terms import normalize
+    try:
+        node = ast.parse(normalize(expr), mode="eval").body
+    except SyntaxError:
+        return {}
+    parts = node.values if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And) else [node]
+    out = {}
+    for n in parts:
+        if not (isinstance(n, ast.Compare) and len(n.ops) == 1 and isinstance(n.left, ast.Call)
+                and getattr(n.left.func, "id", "") == "touching" and n.left.args
+                and isinstance(n.left.args[0], ast.Constant) and isinstance(n.comparators[0], ast.Constant)):
+            continue
+        f, op, v = str(n.left.args[0].value), n.ops[0], n.comparators[0].value
+        if isinstance(op, ast.Eq):
+            out[f] = v >= 0.5
+        elif isinstance(op, ast.Gt) and 0 <= v < 1 or isinstance(op, ast.GtE) and 0 < v <= 1:
+            out[f] = True
+        elif isinstance(op, (ast.Lt, ast.LtE)) and v <= 0.5:
+            out[f] = False
+    return out
+
+
+def fingers_needed_first(conditions: list[dict], labels: list[str]) -> tuple[list[str], str]:
+    """The fingers of the first "at some point" condition that needs certain fingers on the object, less any a "the
+    whole time" condition keeps off it: ([], "") if none. Not the end's: starting there, holding still would pass it."""
+    from .goal_sources import finger_labels
+    off = set(finger_labels(f for c in conditions if c.get("when") == "always" and c.get("expr")
+                            for f, on in _touches(c["expr"]).items() if not on))
+    for c in conditions:
+        if c.get("when") != "ever" or not c.get("expr"):
+            continue
+        on = [f for f in finger_labels(f for f, v in _touches(c["expr"]).items() if v) if f in labels and f not in off]
+        if on:
+            return on, c.get("text") or c["expr"]
+    return [], ""
+
+
 MAX_CHECKED = 12  # grips held that long, best-scored first, before settling for the one that lasted longest
 VARIATIONS = 8  # the chosen grip, with the object laid slightly differently
 

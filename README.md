@@ -110,7 +110,11 @@ at a position, facing a heading, which face is up, lifted to a height, moved N c
 plus any formula over measured quantities (`x`, `y`, `z`, `tilt_deg`, `speed`, `spin_dps`, `held`, `dist_to('bin')`,
 …). Each can say *when* it must hold: `end`, `release` (throwing, dropping), `always`, `ever`, or `last` (the last N
 seconds without a break: keep it spinning, keep it balanced). "Held" is decided from real contacts: touched from two
-opposite sides and nothing else carrying it.
+opposite sides and nothing else carrying it. Formulas can also look back over time, for what one moment can't show:
+`change(yaw_deg, 4)` is how far it turned in the last 4 s (through whole turns, so shaking it back and forth adds up to
+about nothing, while a speed like `spin_z_dps > 180` is met by a fast shake too), `change(q)` since the try began, and
+`mean(q, s)` an average or, for a condition, the share of the time it held (`mean(touching('thumb'), 2)`). The judge
+and the learner follow them through each try the same way.
 
 ### Programs: building blocks for each kind of body
 
@@ -160,6 +164,12 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   through a tendon is moved as one joint, and the base is set down where the hand can reach the object from one side.
   Morph then grips it itself and practice also starts holding it. If no grip is possible it says why (a Stretch's
   fingertips get no lower than about 5 cm, too high for a pen lying flat).
+* **In the hand isn't gripped:** "never falls out of the hand" is `in_hand` (the object kept up by nothing but the
+  robot, rolling or sliding between the fingers included), not `held` (a pinch from opposite sides) the whole time,
+  which forbids every roll, pass and spin. A request can also say which fingers it starts on ("starts between the
+  index and middle fingers"): Morph's in-hand start then lays it over those fingers and keeps a grip with them on it.
+  When it doesn't, the start is where the goal first needs it: "at some point it's between the index and middle
+  fingers" starts it on those two, not in the steadiest near-fist, which practice never worked it out of.
 * **Ready to grip, not just near it:** a step that sets up a grasp has to have the open hand where Morph's own grip
   puts it (`grip_gap`, the hand's distance from that grip), not just near the object: the Stretch learned to rest its
   hand on top of the parcel, which was "within 6 cm", and closing there gripped nothing. Morph adds this to the plan

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -18,7 +19,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from .goal_terms import History, fixtures_geometry
+from .goal_terms import History, Windows, fixtures_geometry, formula_trees
 from .reward_parts import view as reward_view
 from .skill_steps import steps_with_words
 from .goals import GoalSpec, check, lets_go, placement, release_spot
@@ -132,6 +133,10 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         steps, info = plan_steps(prof, goal, pj.scene, p, llm, log, check=check)
         task["steps"] = [st.model_dump() for st in steps[:-1]]  # the last step is the goal itself
         task["steps_final"] = steps[-1].model_dump()
+        from .plan_check import in_hand_steps
+        note = in_hand_steps(task)
+        if note:
+            log(f"  {note}")
         task["steps_from"] = info["from"]
         if info.get("rationale"):
             task["steps_rationale"] = info["rationale"]
@@ -294,12 +299,39 @@ def _behind(pj: Project, start, target, centre, dist: float) -> tuple[float, flo
 
 def task_dir(robot_name: str, goal: GoalSpec) -> Path:
     """Per robot, object and goal: "put it in the bin" for a pen and for a parcel once shared a folder, and learning the
-    pen overwrote the Stretch's working parcel skill."""
-    return LEARNED / f"{robot_name}__{slug(goal.object) or 'object'}__{_goal_slug(goal)}"
+    pen overwrote the Stretch's working parcel skill. The name ends in a hash of the whole goal: cut to 40 letters, a
+    thumb spin and a finger pass that both began "the whole time: pen never falls out of the hand" shared one, and the
+    spin was answered with the pass's learned skill."""
+    words = _goal_words(goal)
+    return LEARNED / f"{robot_name}__{slug(goal.object) or 'object'}__{_goal_slug(goal)}_{hashlib.sha1(words.encode()).hexdigest()[:8]}"
+
+
+def skill_dir(robot_name: str, goal: GoalSpec) -> Path:
+    """The folder of this goal's skill: task_dir, or one named the older ways if it was learned for this same goal."""
+    d = task_dir(robot_name, goal)
+    if (d / "task.json").exists():
+        return d
+    for old in (LEARNED / f"{robot_name}__{slug(goal.object) or 'object'}__{_goal_slug(goal)}", _legacy_dir(robot_name, goal)):
+        if old is not None and (old / "task.json").exists() and _same_goal(old / "task.json", goal):
+            return old
+    return d
+
+
+def _goal_words(goal: GoalSpec) -> str:
+    return ' '.join(c.describe() for c in goal.conditions if c.kind != 'upright')
 
 
 def _goal_slug(goal: GoalSpec) -> str:
-    return slug(' '.join(c.describe() for c in goal.conditions if c.kind != 'upright')) or 'goal'
+    return slug(_goal_words(goal)) or 'goal'
+
+
+def _same_goal(task_path: Path, goal: GoalSpec) -> bool:
+    from .goals import Condition
+    try:
+        conds = [Condition(**c) for c in json.loads(task_path.read_text())["conditions"]]
+    except Exception:  # noqa: BLE001
+        return False
+    return _goal_words(GoalSpec(object=goal.object, conditions=conds)) == _goal_words(goal)
 
 
 def _legacy_dir(robot_name: str, goal: GoalSpec) -> Path | None:
@@ -339,9 +371,7 @@ def learned_for(robot_name: str, goal: GoalSpec, robot_xml: str | Path | None = 
     """task.json of a learned skill for this robot and goal that runs should use: learning finished and it worked
     (learning_status good), and (given robot_xml) it was learned on this very robot file, not another one with the same
     name (a hand re-imported with its meshes is a different body from the one without). Else None."""
-    d = task_dir(robot_name, goal)
-    if not (d / "task.json").exists():
-        d = _legacy_dir(robot_name, goal) or d
+    d = skill_dir(robot_name, goal)
     if not learning_status(d)["good"]:
         return None
     if robot_xml is not None:
@@ -395,6 +425,7 @@ def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), set
     last, ctrl = np.zeros(m.nu), ctrl0.copy()
     if residual is None and task.get("residual"):
         residual = Residual.of(task, task.get("_dir", "."))
+    over_time = Windows(formula_trees(task))  # change(...) / mean(...): every watcher sees the same values
     try:
         for t in range(int(task["episode_s"] / CTRL_DT)):
             if stop is not None and stop():
@@ -415,6 +446,7 @@ def rollout(env, m, ix, task, pol, start, params, seed, stop=None, watch=(), set
             if watch:
                 v = measure(np, d.xpos, d.xmat, d.qvel, ix, task, held=contact_held(m, d, ix), ctrl=d.ctrl, qpos=d.qpos,
                     touch=contact_touch(m, d, ix))
+                over_time.feed(v)
                 for w in watch:
                     w.update(v)
                     if hasattr(w, "see"):
@@ -1047,7 +1079,7 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
     thresholds, graded quantities); Morph checks the new steps and writes them into the task."""
     from .introspect import profile_robot
     from .skill_steps import Step, body_only, check_steps, check_terms, object_steps, robot_brief, scales
-    from .plan_check import plan_checker, require_grip
+    from .plan_check import in_hand_steps, plan_checker, require_grip
     task = load_task(task_path)
     prof = profile_robot(task["robot_xml"])
     p = placement(goal, scene)
@@ -1075,9 +1107,9 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
                 errors += found
         if new and not errors:
             task["steps"] = [s.model_dump() for s in new]
-            note = require_grip(task)
-            if note:
-                log(f"  {note}")
+            for note in (require_grip(task), in_hand_steps(task)):
+                if note:
+                    log(f"  {note}")
             task["reward_terms"] = terms
             task["dropped_terms"] = t_err if attempt else []
             if wts != (task.get("reward_weights") or {}):
@@ -1338,12 +1370,13 @@ def _remount(task_path: Path, diag: dict, log=print) -> str | None:
 
 def _grip_first(task_path: Path, log=print) -> None:
     """The plan as it trains: with Morph's grip known, the step before the grasp has the hand at it (plan_check)."""
-    from .plan_check import require_grip
+    from .plan_check import in_hand_steps, require_grip
     t = json.loads(Path(task_path).read_text())
-    note = require_grip(t)
-    if note:
+    notes = [n for n in (require_grip(t), in_hand_steps(t)) if n]
+    if notes:
         Path(task_path).write_text(json.dumps(t, indent=1))
-        log(f"  {note}")
+        for note in notes:
+            log(f"  {note}")
 
 
 def _easy_first(task_path: Path, r: int, rounds: int, log=print) -> None:
@@ -1826,7 +1859,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
                                           rounds, k)
         except Exception as e:  # noqa: BLE001
             log(f"  (Nemotron couldn't propose step plans: {e})")
-    from .plan_check import plan_checker, require_grip
+    from .plan_check import in_hand_steps, plan_checker, require_grip
     check = plan_checker(task, task["conditions"], log) if prop and prop.candidates else None
     for c in (prop.candidates if prop else []):
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
@@ -1858,6 +1891,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         t.update(steps=[dict(st) for st in plan["steps"]], reward_terms=plan["reward_terms"],
                  dropped_terms=plan.get("dropped_terms", []), ppo_tweaks=plan["ppo_tweaks"])
         require_grip(t)
+        in_hand_steps(t)
         (cdir / "task.json").write_text(json.dumps(t, indent=1))
         log(f"  variant {i + 1}/{len(plans)}: {plan['idea']}")
         if not train(cdir / "task.json", first, main / "params.pkl"):

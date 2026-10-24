@@ -113,16 +113,29 @@ class GoalProposal(BaseModel):
     warnings: list[str] = Field(default_factory=list, max_length=4)
     suggestion: str = Field(default="", max_length=400)
     start: str = "scene"  # "in_hand": every try begins with the object already in the robot's hand
+    start_fingers: list[str] = Field(default_factory=list, max_length=5)  # the fingers it starts on (in_hand)
 
 
 # what a formula may call and name (goal_terms checks the same): one text for every prompt that asks for formulas
 FUNCS_DOC = ("functions abs, min, max, sqrt, hypot, exp, log, tanh, clip(x, lo, hi), pow(x, n), cos, sin, atan2(y, x) "
-             "(radians), cosd, sind, atan2d (degrees); powers x ** n with a number n from -4 to 4; constant pi")
+             "(radians), cosd, sind, atan2d (degrees); powers x ** n with a number n from -4 to 4; constant pi; and over "
+             "time, for what one moment can't show: change(q, s) is how much q changed over the last s seconds (an angle "
+             "counted through whole turns: two full turns of yaw_deg are 720, turning back and forth adds up to about 0), "
+             "change(q) since the try began; mean(q, s) is q's average over the last s seconds (a condition counts 1 while "
+             "it holds: mean(touching('thumb'), 2) is the share of the time the thumb touched it), mean(q) over the whole "
+             "try. A rate at each moment (spin_dps > 180) is also met by shaking it fast back and forth; how far it "
+             "turned in total isn't: \"keeps turning the same way\", \"round and round\", \"a full circle\" or \"N "
+             "turns\" -> abs(change(yaw_deg, 4)) >= 720 (two turns in the last 4 s) or abs(change(yaw_deg)) >= 360 "
+             "(once round, in all), checked at the end")
 MORE_NAMES_DOC = ("; also goal_x, goal_y, goal_z (where the goal puts the object, when it has a place), each fixture's "
                   "<name>_x, <name>_y, <name>_top (its centre and top, e.g. bin_x), roll_deg and pitch_deg (the object's "
                   "tilt about its own long and short axes), grip_gap (m from the hand's point to where Morph's own "
                   "planned grip puts it on the object: near the object isn't enough to grip it, a hand resting on top "
-                  "of it is near; the step before closing the gripper should have grip_gap < 0.03)")
+                  "of it is near; the step before closing the gripper should have grip_gap < 0.03), in_hand (1 while the "
+                  "object is off the floor and anything else it could rest on, rolling or sliding between the fingers "
+                  "included; held is a pinch from opposite sides, which a roll, pass or spin loosens for a moment: when the "
+                  "object starts in the hand, a step's \"still has it\" is in_hand == 1, not held, unless the goal "
+                  "itself asks for held, and grip_gap is for picking things up, not for an object already in the hand)")
 REWARD_TERMS_DOC = (
     "You may also add up to 4 reward_terms: extra shaping on top of the steps, as Eureka does: each {\"name\", "
     "\"formula\", \"weight\", \"why\"}. formula is a NUMBER formula over the same quantities (e.g. \"closure * "
@@ -362,7 +375,10 @@ class ReasoningService:
             "also say the object starts in the robot's hand: that is right whenever the request is about handling it in the "
             "hand (spinning, twirling or rolling it in, between or around the fingers or in the palm), which only makes "
             "sense if it is already there; don't call that unasked for. Spinning or twirling means it keeps turning at a real "
-            "speed (e.g. over 90 deg/s for the last few seconds), not any rotation at some point; handling it in the hand "
+            "speed (e.g. over 90 deg/s for the last few seconds), not any rotation at some point; a speed alone is also met by "
+            "shaking it quickly back and forth, so \"in the same direction\", \"round and round\", \"a full circle\" or "
+            "\"N turns\" need how far it turned in total (change(yaw_deg, s) or change(yaw_deg)), and a checklist "
+            "without that is missing it; handling it in the hand "
             "means it stays in the hand (not dropped) while that happens. Numbers that make a vague word measurable (how fast, how "
             "long, how far) are part of reading the request, never an added demand; only complain about one that is clearly "
             "off. morph_requires lists what Morph itself insists on for this kind of request: items that do that are correct, "
@@ -400,7 +416,9 @@ class ReasoningService:
             "{\"kind\": \"expression\", \"expr\": formula, \"text\": what it means in plain words}, where the formula "
             "is a Python-like boolean over these measured quantities at the end: x, y, z (object centre, m), bottom, top "
             "(m above the floor), tilt_deg, yaw_deg (0 = east), speed, vx, vy, vz (m/s), travelled (m from its start), start_x, "
-            "start_y, held (1 if the robot still holds it), dist_to('fixture') (m, edge to edge), robot_x, robot_y "
+            "start_y, held (1 while the robot grips it, pinched from opposite sides), in_hand (1 while it's off the "
+            "floor and anything else it could rest on, so the robot is keeping it up, even rolling or sliding between "
+            "the fingers), dist_to('fixture') (m, edge to edge), robot_x, robot_y "
             "(robot base), hand_dist (m from the robot's nearest part to the object); " + FUNCS_DOC + "; operators "
             "+ - * / < <= > >= == and or not. Examples: \"balance it on its corner\" -> "
             "\"tilt_deg > 30 and speed < 0.02 and not held\"; \"put it between the bin and the wall\" -> an expression on x "
@@ -412,7 +430,10 @@ class ReasoningService:
             "it spinning, keep it balanced, keep holding it up), e.g. \"spin the ball\" -> {\"kind\": \"expression\", "
             "\"when\": \"last\", \"seconds\": 2, \"expr\": \"spin_dps > 180\", \"text\": \"spinning at over half a "
             "turn per second\"}; spin_dps is how fast the object turns (deg/s), spin_z_dps its turn about the vertical "
-            "(+ anticlockwise from above). Any condition kind can have a when; the object can end up in only one "
+            "(+ anticlockwise from above); a speed alone is met by shaking it back and forth, so a spin that must keep "
+            "going one way, or turn a full circle, also needs how far it turned: {\"when\": \"end\", \"expr\": "
+            "\"abs(change(yaw_deg, 4)) >= 720\", \"text\": \"turned at least two full turns about the vertical in the "
+            "last 4 s\"}. Any condition kind can have a when; the object can end up in only one "
             "place, so other places on the way take when \"ever\". Requests about how it gets there are part of the goal, never "
             "drop them: \"throw the parcel into the bin from 1 m north of the bin\" means inside bin (end) AND, at "
             "release, the parcel is at least 1 m north of the bin, e.g. {\"kind\": \"expression\", \"when\": "
@@ -449,7 +470,7 @@ class ReasoningService:
             "tol 0.1; in formulas z is the object's centre (half its height up when resting), so heights of where it "
             "rests use bottom. Write only what the request asks for. Reply with ONLY one "
             "JSON object with keys: conditions, rationale, ambiguities, feasible, refusal, why_not, suggestion, warnings, "
-            "start."
+            "start, start_fingers."
         )
         system += (
             " GOALS ABOUT THE ROBOT'S OWN BODY: a request can be about the robot itself rather than the object (\"close "
@@ -470,11 +491,18 @@ class ReasoningService:
             "(finger labels are thumb, index, middle, ring, little, as listed in robots_selected[].hands; with two hands "
             "left_thumb, right_index, ...), and fingers_touching counts the fingers touching it. E.g. \"without the "
             "thumb\" -> {\"kind\": \"expression\", \"when\": \"always\", \"expr\": \"touching('thumb') == 0\", \"text\": "
-            "\"the thumb never touches it\"}; \"hold it with two fingers\" -> fingers_touching == 2 (when \"last\")."
+            "\"the thumb never touches it\"}; \"hold it with two fingers\" -> fingers_touching == 2 (when \"last\"). "
+            "Keeping it in the hand is in_hand, not held: \"never falls out of the hand\", \"don't drop it\", \"keep it in "
+            "the hand\" -> {\"kind\": \"expression\", \"when\": \"always\", \"expr\": \"in_hand == 1\", \"text\": \"it never "
+            "falls out of the hand\"}. held == 1 the whole time would forbid every roll, pass and spin (they all loosen "
+            "the pinch for a moment): use held only when the request asks for a firm grip throughout."
             " WHERE IT STARTS: set \"start\": \"in_hand\" when the request is about handling the object that is already in "
             "the hand (spin / twirl / roll it in or between the fingers, juggle it in the palm, pass it from finger to "
             "finger): every try then begins with the object held in the hand, and Morph puts it there. Otherwise "
-            "\"start\": \"scene\" (it starts where it is in the scene, e.g. \"pick it up and spin it\")."
+            "\"start\": \"scene\" (it starts where it is in the scene, e.g. \"pick it up and spin it\"). If the request "
+            "says which fingers it starts on (\"starts between the index and middle fingers\"), list them in "
+            "\"start_fingers\" (finger labels, e.g. [\"index\", \"middle\"]): Morph finds a starting grip with those "
+            "fingers on it. A start is never a condition (conditions are about the end, the whole time or some moment)."
         )
         payload = {"request": description or "(none: reproduce what the demonstration achieved)",
                    "scene": scene, "demonstration": demo}

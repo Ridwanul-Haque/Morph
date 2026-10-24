@@ -15,7 +15,9 @@ while learning it (JAX, as the reward), so what is learned is exactly what is ch
 Quantities an expression can use (metres, degrees):
   x, y, z (object centre), bottom, top, tilt_deg, yaw_deg, speed, vx, vy, vz (its velocity, m/s), travelled,
   start_x, start_y,
-  held (1 if the robot is holding it), dist_to('fixture') (edge to edge), robot_x, robot_y,
+  held (1 if the robot is holding it, pinched from opposite sides), in_hand (1 while it's off the floor and anything
+  else it could rest on: kept up by the robot, even rolling or sliding between the fingers), dist_to('fixture') (edge
+  to edge), robot_x, robot_y,
   hand_dist (the robot's nearest end part to the object's centre), hand_x, hand_y, hand_z (that end
   part's position), base_z, base_tilt_deg (the robot body's height and tilt: 0 = level), grip (0..1: how close
   the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
@@ -29,6 +31,11 @@ Quantities an expression can use (metres, degrees):
 functions: abs, min, max, sqrt, hypot, exp, log, tanh, cos, sin, atan2 (radians), cosd, sind, atan2d (degrees),
   clip(x, lo, hi), pow(x, n); constant pi; operators: + - * / ** (or ^, a power with a number as the exponent)
   < <= > >= == and or not.
+over time (what one moment can't show; followed through the run by the judge and the learner alike):
+  change(q, s)   how much q changed over the last s seconds (an angle counted through whole turns: two turns of yaw_deg
+                 are 720, and turning back and forth adds up to about 0); change(q): since the try began
+  mean(q, s)     q's average over the last s seconds (a condition counts 1 while it holds: mean(touching('thumb'), 2) is
+                 the share of the time the thumb touched it); mean(q): over the whole try
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
              "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps", "roll_deg", "pitch_deg",
-             "goal_x", "goal_y", "goal_z", "fingers_touching", "grip_gap"}
+             "goal_x", "goal_y", "goal_z", "fingers_touching", "grip_gap", "in_hand"}
 GOAL_VARIABLES = {"goal_x", "goal_y", "goal_z"}  # only when the goal has a place (else not a number: the check says so)
 FIXTURE_ATTRS = ("_x", "_y", "_top")  # bin_x, bin_y, bin_top: a fixture's centre and top
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
@@ -55,14 +62,19 @@ ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_
 BODY_FUNCS = {"joint_frac", "joint_frac_min", "joint_frac_max", "part_x", "part_y", "part_z", "touching"}
 # the maths a shaping term needs (Eureka-style terms are often exp(-d / scale), tanh, a squared error, an angle)
 MATH_FUNCS = {"exp", "log", "tanh", "cos", "sin", "atan2", "cosd", "sind", "atan2d", "clip", "pow"}
-FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | MATH_FUNCS | BODY_FUNCS
+# over time (Windows): change over / average over the last s seconds, or since the try began
+WINDOW_FUNCS = {"change", "mean"}
+WINDOW_DT, MAX_WINDOW_S = 0.02, 60.0  # s per control tick; the longest window
+TURN_UNIT = 360.0  # a whole turn short counts as "1" in the reward (turning is counted in hundreds of degrees)
+FUNCS = {"abs", "min", "max", "sqrt", "hypot", "dist_to"} | MATH_FUNCS | BODY_FUNCS | WINDOW_FUNCS
 CONSTANTS = {"pi": math.pi}
 MAX_POWER = 4.0  # x ** n with a number n, |n| <= 4 (a squared or cubed error; not an overflowing x ** 100)
 GENERIC = ("orientation", "height", "away_from", "moved", "expression")
+IN_HAND_LIFT = 0.01  # m: in_hand once its bottom is this far above whatever it would rest on
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce
 ANGLE_UNIT, LENGTH_UNIT = 90.0, 0.3  # a violation of 90 degrees or 30 cm counts as "1" in the reward
 SPIN_UNIT, FLAG_UNIT = 90.0, 1.0  # ... and so does 90 deg/s, or a yes/no (touching, held) that is the wrong way round
-FLAGS = {"held", "grip", "closure", "fingers_touching"}
+FLAGS = {"held", "grip", "closure", "fingers_touching", "in_hand"}
 
 
 class ExprError(ValueError):
@@ -130,6 +142,8 @@ def _parse(expr: str, fixtures, object_name: str = "") -> ast.Expression:
                 raise ExprError(f"{n.func.id} takes {arity} value{'s' if arity > 1 else ''}")
             if n.func.id == "pow":
                 _power(n.args[1])
+            if n.func.id in WINDOW_FUNCS:
+                _window_args(n)
             if n.func.id in BODY_FUNCS:
                 a = n.args[0] if len(n.args) == 1 else None
                 if not (isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.strip()):
@@ -142,6 +156,21 @@ def _parse(expr: str, fixtures, object_name: str = "") -> ast.Expression:
         if isinstance(n, ast.Constant) and not isinstance(n.value, (int, float, str)):
             raise ExprError(f"{n.value!r} isn't a number")
     return tree
+
+
+def _window_args(n: ast.Call) -> None:
+    """change(q, s) / mean(q, s): a quantity (not itself over time) and a number of seconds, or just the quantity."""
+    f = n.func.id
+    if not 1 <= len(n.args) <= 2 or n.keywords:
+        raise ExprError(f"{f} takes a quantity and a number of seconds ({f}(yaw_deg, 4)), or just the quantity")
+    if any(isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in WINDOW_FUNCS
+           for x in ast.walk(n.args[0])):
+        raise ExprError(f"{f}(...) can't contain another change(...) or mean(...)")
+    if len(n.args) == 2:
+        s = n.args[1]
+        if not (isinstance(s, ast.Constant) and isinstance(s.value, (int, float)) and not isinstance(s.value, bool)
+                and 0 < s.value <= MAX_WINDOW_S):
+            raise ExprError(f"{f}'s seconds must be a number above 0 and at most {MAX_WINDOW_S:g}")
 
 
 def _fixture_attr(name: str, fixtures) -> bool:
@@ -169,14 +198,24 @@ def _pow(xp, a, n: float):
 
 
 def uses(expr: str) -> set[str]:
-    return {n.id for n in ast.walk(ast.parse(expr, mode="eval")) if isinstance(n, ast.Name)}
+    return {n.id for n in ast.walk(ast.parse(normalize(expr), mode="eval")) if isinstance(n, ast.Name)}
 
 
 def _unit(node) -> float:
     """What counts as 1 for a comparison: by what it compares. Spin in deg/s once shared the 30 cm unit, so missing
     60 deg/s weighed as much as being 18 m off and swamped every other part of the reward."""
-    calls = {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} - calls
+    shares = [x for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Name)
+              and x.func.id == "mean" and x.args and _is_condition(x.args[0])]
+    inner = {id(y) for x in shares for y in ast.walk(x)}
+    calls = {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and id(n) not in inner}
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and id(n) not in inner} - calls
+    if shares and not names and calls <= WINDOW_FUNCS | {"abs", "min", "max"}:  # a share of the time (0..1)
+        return FLAG_UNIT
+    turns = [x for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Name)
+             and x.func.id == "change" and x.args and _is_angle(x.args[0])]
+    if turns:  # how far it turned: 90 deg short of 720 is nearly there, not as far off as 90 deg of tilt
+        return TURN_UNIT
+    calls -= WINDOW_FUNCS
     if any(v.endswith("_dps") for v in names):
         return SPIN_UNIT
     if any(v.endswith("_deg") for v in names):
@@ -216,6 +255,10 @@ def violation(xp, tree: ast.Expression, v: dict, numeric: bool = False):
                 return v["dist"][a.value if isinstance(a, ast.Constant) else a.id]
             if f == "pow":
                 return _pow(xp, val(n.args[0]), _power(n.args[1]))
+            if f in WINDOW_FUNCS:  # followed through the run (Windows); without the run, not a number
+                w = v.get("window") or {}
+                k = ast.dump(n)
+                return w[k] if k in w else xp.asarray(float("nan") if xp.__name__ == "numpy" else 0.0)
             args = [val(a) for a in n.args]
             if f in MATH_FUNCS:
                 a = args[0]
@@ -365,6 +408,115 @@ def term_value(xp, tree: ast.Expression, v: dict):
     return violation(xp, tree, v, numeric=True)
 
 
+# ------------------------------------------------------------------ over time
+def _is_angle(node) -> bool:
+    """An angle that goes round (yaw_deg ...): its change is counted through whole turns, not wrapped at 180."""
+    return isinstance(node, ast.Name) and node.id.endswith("_deg")
+
+
+def _is_condition(node) -> bool:
+    return isinstance(node, (ast.Compare, ast.BoolOp)) or (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not))
+
+
+def window_calls(trees) -> list[tuple[str, ast.Call]]:
+    """The change(...) / mean(...) calls in these parsed formulas, once each, as (key, call)."""
+    out: dict[str, ast.Call] = {}
+    for t in trees:
+        for n in ast.walk(t):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in WINDOW_FUNCS:
+                out.setdefault(ast.dump(n), n)
+    return list(out.items())
+
+
+def formula_trees(task: dict) -> list:
+    """Every formula a task's conditions, steps and reward terms use, parsed (the ones that don't parse left out)."""
+    fx = task.get("fixtures", {})
+    src = [c.get("expr") for c in task.get("conditions", []) if c.get("kind") == "expression"]
+    src += [s.get(k) for s in task.get("steps", []) for k in ("done_when", "keep")]
+    src += [t.get("formula") for t in task.get("reward_terms", [])]
+    out = []
+    for e in src:
+        if e:
+            try:
+                out.append(parse(e, fx))
+            except ExprError:
+                pass
+    return out
+
+
+class Windows:
+    """Follows the change(...) / mean(...) calls of some formulas through a run, the same way for the judge (NumPy) and
+    the learner (JAX: the state is plain arrays it carries from tick to tick). Each tick adds the quantity's change since
+    the last tick (change; an angle's taken the short way round, so whole turns add up) or its value (mean) to a ring of
+    the last ticks; a window sums the ticks it covers."""
+
+    def __init__(self, trees):
+        import numpy as np
+        self.calls = window_calls(trees)
+        secs = [float(c.args[1].value) if len(c.args) > 1 else 0.0 for _, c in self.calls]
+        self.ticks = np.array([max(1, round(s / WINDOW_DT)) if s else 0 for s in secs], dtype=float)
+        self.n = int(max([1.0, *self.ticks]))
+        self.whole = self.ticks == 0  # since the try began
+        self.is_change = np.array([c.func.id == "change" for _, c in self.calls])
+        self.wrap = np.array([_is_angle(c.args[0]) for _, c in self.calls])
+        self._st = None  # NumPy: the state, when feed() keeps it
+
+    def __bool__(self) -> bool:
+        return bool(self.calls)
+
+    def _now(self, xp, v):
+        out = []
+        for _, c in self.calls:
+            t = ast.Expression(body=c.args[0])
+            x = xp.where(violation(xp, t, v) <= 1e-9, 1.0, 0.0) if _is_condition(c.args[0]) else violation(xp, t, v, numeric=True)
+            out.append(xp.asarray(x, dtype=float))
+        return xp.stack(out)
+
+    def start(self, xp, v) -> dict:
+        k = len(self.calls)
+        st = {"prev": self._now(xp, v), "buf": xp.zeros((k, self.n)), "acc": xp.zeros(k), "count": xp.zeros(())}
+        return self.step(xp, st, v)
+
+    def step(self, xp, st: dict, v) -> dict:
+        q = self._now(xp, v)
+        d = q - st["prev"]
+        d = xp.where(xp.asarray(self.wrap), (d + 180.0) % 360.0 - 180.0, d)
+        inc = xp.where(xp.asarray(self.is_change), d, q)
+        inc = xp.where(xp.isnan(inc), 0.0, inc)  # a moment it can't be measured adds nothing
+        slot = st["count"].astype(int) % self.n
+        if xp.__name__ == "numpy":
+            buf = st["buf"].copy()
+            buf[:, slot] = inc
+        else:
+            buf = st["buf"].at[:, slot].set(inc)
+        return {"prev": xp.where(xp.isnan(q), st["prev"], q), "buf": buf, "acc": st["acc"] + inc,
+                "count": st["count"] + 1}
+
+    def values(self, xp, st: dict) -> dict:
+        """{key: the call's value now}, for v["window"]."""
+        age = (st["count"] - 1 - xp.arange(self.n)) % self.n  # how many ticks ago each slot was written
+        ticks = xp.asarray(self.ticks)
+        mask = (age[None, :] < ticks[:, None]) & (age[None, :] < st["count"])
+        total = xp.where(xp.asarray(self.whole), st["acc"], xp.sum(xp.where(mask, st["buf"], 0.0), axis=1))
+        count = xp.where(xp.asarray(self.whole), st["count"], xp.minimum(ticks, st["count"]))
+        out = xp.where(xp.asarray(self.is_change), total, total / xp.maximum(count, 1.0))
+        return {k: out[i] for i, (k, _) in enumerate(self.calls)}
+
+    def feed(self, v: dict) -> dict:
+        """NumPy, once a tick: follow this moment and put the values in v["window"] (with any already there)."""
+        import numpy as np
+        if not self.calls:
+            return v
+        self._st = self.start(np, v) if self._st is None else self.step(np, self._st, v)
+        v["window"] = {**(v.get("window") or {}), **{k: float(x) for k, x in self.values(np, self._st).items()}}
+        return v
+
+    def covers(self, v: dict) -> bool:
+        """v already has every value this follows (whoever ran the run fed it)."""
+        w = v.get("window") or {}
+        return all(k in w for k, _ in self.calls)
+
+
 # ------------------------------------------------------------------ the condition kinds
 def box_distance(xp, p, lo, hi):
     """Point to axis-aligned box (0 inside)."""
@@ -469,6 +621,8 @@ def snapshot(v: dict) -> dict:
         else:
             out[k] = float(x)
     out["dist"] = {n: float(x) for n, x in v["dist"].items()}
+    if v.get("window"):  # change(...) / mean(...) at that moment
+        out["window"] = {k: float(x) for k, x in v["window"].items()}
     return out
 
 
@@ -501,8 +655,19 @@ class History:
         self.released = False
         self.window: dict[int, list] = {}
         self.streak: dict[int, int] = {}  # ticks in a row a contact-based condition has been broken
+        trees = []
+        for c in conditions:
+            try:
+                trees += [parse(c["expr"], fixtures)] if c.get("kind") == "expression" and c.get("expr") else []
+            except ExprError:
+                pass
+        self.over_time = Windows(trees)  # change(...) / mean(...), when the run doesn't already follow them
+        self.last_window: dict = {}  # their values at the last moment (for conditions judged at the end)
 
     def update(self, v: dict) -> None:
+        if self.over_time and not self.over_time.covers(v):
+            self.over_time.feed(v)
+        self.last_window = dict(v.get("window") or {})
         held = float(v["held"]) > 0.5
         let_go = self.was_held and not held
         self.was_held = held
@@ -558,6 +723,14 @@ def quantities(xp, *, pos, R, vel, start, half, fixtures: dict, held, robot_xy=N
          # tilt about its own x axis (roll) and y axis (pitch); tilt_deg is the total
          "roll_deg": xp.degrees(xp.arctan2(R[2, 1], R[2, 2])),
          "pitch_deg": xp.degrees(xp.arcsin(xp.clip(-R[2, 0], -1.0, 1.0)))}
+    # in the hand: off the floor and off anything else it could rest on, so only the robot can be keeping it up (it may
+    # roll and slide between the fingers; held asks for more, a pinch from opposite sides)
+    support = xp.zeros(())
+    for f in fixtures.values():
+        under = (f["lo"][0] <= x) & (x <= f["hi"][0]) & (f["lo"][1] <= y) & (y <= f["hi"][1])
+        top = f.get("top_z", f["hi"][2] if len(f["hi"]) > 2 else 0.0)
+        support = xp.maximum(support, xp.where(under, f.get("rest_z", 0.0) if f.get("kind") == "container" else top, 0.0))
+    v["in_hand"] = xp.asarray(v["bottom"] > support + IN_HAND_LIFT, dtype=float)
     for n, f in fixtures.items():  # each fixture's centre and top (bin_x, bin_y, bin_top)
         v[f"{n}_x"], v[f"{n}_y"] = (f["lo"][0] + f["hi"][0]) / 2, (f["lo"][1] + f["hi"][1]) / 2
         v[f"{n}_top"] = f.get("top_z", f["hi"][2] if len(f["hi"]) > 2 else 0.0)
@@ -603,7 +776,7 @@ WORDS = {
     "roll_deg": ("the object's roll", "deg"), "pitch_deg": ("the object's pitch", "deg"),
     "speed": ("the object's speed", "m/s"), "vx": ("its speed east", "m/s"), "vy": ("its speed north", "m/s"),
     "vz": ("its speed up", "m/s"), "travelled": ("how far it has moved", "m"),
-    "held": ("the robot holding it", "flag"), "grip": ("the grip score (0 to 1)", "frac"),
+    "held": ("the robot holding it", "flag"), "in_hand": ("it in the hand", "flag"), "grip": ("the grip score (0 to 1)", "frac"),
     "closure": ("the gripper closed", "pct"), "touch_dist": ("the nearest fingertip's gap to it", "m"),
     "lifted": ("it lifted", "m"), "hand_dist": ("the hand's distance to it", "m"),
     "grip_gap": ("the hand's distance from Morph's grip", "m"),
@@ -648,6 +821,23 @@ def describe_formula(expr: str, object_name: str = "the object") -> str:
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "touching" and n.args \
                 and isinstance(n.args[0], ast.Constant):
             return f"the {str(n.args[0].value).replace('|', ' or ')} touching {obj}", "flag"
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in WINDOW_FUNCS and n.args:
+            span = "since the start" if len(n.args) < 2 else f"over the last {ast.unparse(n.args[1])} s"
+            q = n.args[0]
+            if n.func.id == "mean":
+                if _is_condition(q) or (word(q) or ("", ""))[1] == "flag":
+                    return f"the share of the time {span} with {text(q)}", "pct"
+                w = word(q)
+                return (f"the average of {w[0]} {span}", w[1]) if w else None
+            turn = {"yaw_deg": "turned about the vertical", "roll_deg": "rolled", "pitch_deg": "pitched"}
+            if isinstance(q, ast.Name) and q.id in turn:
+                return f"how far {obj} {turn[q.id]} {span.replace('over the', 'in the')}", "deg"
+            w = word(q)
+            return (f"the change in {w[0]} {span}", w[1]) if w else None
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "abs" and len(n.args) == 1 \
+                and isinstance(n.args[0], ast.Call) and getattr(n.args[0].func, "id", "") == "change":
+            w = word(n.args[0])
+            return (w[0] + " (either way)", w[1]) if w else None
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "dist_to" and n.args:
             a = n.args[0]
             return f"{obj}'s distance to the {a.value if isinstance(a, ast.Constant) else getattr(a, 'id', '?')}", "m"

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .goal_sources import goal_from_demo, goal_from_description_rules, load_demo, merge, summarize_demo
+from .goal_sources import finger_labels, goal_from_demo, goal_from_description_rules, load_demo, merge, summarize_demo
 from .goals import Condition, GoalSpec, unsatisfiable, check, placement, to_taskspec, validate, warnings
 from .user_scene import UserScene, load_scene
 
@@ -68,9 +68,53 @@ def load_project(root: str | Path) -> Project:
 
 def _spins(c) -> bool:
     """A condition that it keeps turning at a real speed: spin_dps (or spin_z_dps) over 60 deg/s, for a stretch of
-    time (the last N seconds, or the whole time)."""
-    m = re.search(r"\bspin(?:_z)?_dps\s*>=?\s*(\d+(?:\.\d+)?)", c.expr or "")
-    return c.kind == "expression" and c.when in ("last", "always") and m is not None and float(m.group(1)) >= 60
+    time (the last N seconds, or the whole time), or how far it turned (change(yaw_deg, s)) at 60 deg/s on average."""
+    import ast
+    from .goal_terms import normalize
+    if c.kind != "expression" or c.when not in ("last", "always", "end") or not c.expr:
+        return False
+    try:
+        tree = ast.parse(normalize(c.expr), mode="eval")
+    except SyntaxError:
+        return False
+
+    def spin(n) -> bool:  # spin_dps, spin_z_dps, or abs() of one ("abs(spin_z_dps) > 180" was once turned down 3 times)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "abs" and len(n.args) == 1:
+            n = n.args[0]
+        return isinstance(n, ast.Name) and n.id in ("spin_dps", "spin_z_dps")
+
+    def turned(n) -> float | None:  # how far it turned (deg) over how long (s; whole try: None): abs(change(yaw_deg, 4))
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "abs" and len(n.args) == 1:
+            n = n.args[0]
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "change" and n.args and \
+                isinstance(n.args[0], ast.Name) and n.args[0].id in ("yaw_deg", "roll_deg", "pitch_deg"):
+            return float(n.args[1].value) if len(n.args) > 1 and isinstance(n.args[1], ast.Constant) else 1e9
+        return None
+
+    def big(n) -> bool:
+        return isinstance(n.comparators[0], ast.Constant) and isinstance(n.comparators[0].value, (int, float))
+
+    def rate(n) -> bool:  # a turn big enough for its time: 60 deg/s on average or more
+        s = turned(n.left)
+        return s is not None and float(n.comparators[0].value) >= (180.0 if s >= 1e9 else 60.0 * s)
+    compares = [n for n in ast.walk(tree) if isinstance(n, ast.Compare) and len(n.ops) == 1
+                and isinstance(n.ops[0], (ast.Gt, ast.GtE)) and big(n)]
+    if c.when in ("end", "last") and any(rate(n) for n in compares):  # turned this far: a real spin, one way
+        return True
+    if c.when not in ("last", "always"):
+        return False
+    return any(spin(n.left) and float(n.comparators[0].value) >= 60 for n in compares)
+
+
+def _turns(c) -> bool:
+    """A condition on how far it turned in total (change of an angle: back and forth adds up to nothing)."""
+    from .goal_terms import uses
+    if c.kind != "expression" or not c.expr:
+        return False
+    try:
+        return "change" in uses(c.expr) and bool(uses(c.expr) & {"yaw_deg", "roll_deg", "pitch_deg"})
+    except SyntaxError:
+        return False
 
 
 _MUST = [  # words in a request -> what its checklist has to contain (checked without the model)
@@ -83,6 +127,10 @@ _MUST = [  # words in a request -> what its checklist has to contain (checked wi
      lambda c: c.when == "always", "the request says something must hold the whole time, so it needs a 'the whole time' condition"),
     (r"\b(spin|twirl|twiddle)\w*\b", _spins,
      "the request is to spin it, so the checklist needs it turning at a real speed (spin_dps over 60) for a while"),
+    (r"\b(same (direction|way)|round and round|full (circle|turn)s?|(\d+|one|two|three) (full )?(turns?|circles?|times "
+     r"round))\b", _turns,
+     "the request is a turn one way (round and round, a full circle, N turns), and a speed alone is also met by shaking it "
+     "back and forth, so the checklist needs how far it turned in total, e.g. abs(change(yaw_deg, 4)) >= 720"),
     (r"\b(knock|tip|topple|push)\w*\s+(?:\w+\s+){0,2}over\b|\bon its side\b",
      lambda c: c.kind == "orientation" and c.up_face == "side", "the request is to knock it over, so it must end lying on its side"),
 ]
@@ -160,7 +208,8 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
                                       {"source": "description" if description else "demo"})) for c in prop.conditions]
                 cand = GoalSpec(object=pj.scene.object_name, conditions=conds,
                                 notes=[f"Nemotron: {prop.rationale}"] + [f"assumed: {a}" for a in prop.ambiguities],
-                                warnings=list(prop.warnings), start="in_hand" if prop.start == "in_hand" else "scene")
+                                warnings=list(prop.warnings), start="in_hand" if prop.start == "in_hand" else "scene",
+                                start_fingers=finger_labels(prop.start_fingers) if prop.start == "in_hand" else [])
                 errs = validate(cand, pj.scene) or (missing_intent(description, cand) if description else []) \
                     or unsatisfiable(cand, pj.scene)
                 problems = errs
@@ -198,8 +247,20 @@ def resolve_goal(pj: Project, description: str = "", demo_path: str | None = Non
             and text_goal.start == "in_hand":
         goal.start = "in_hand"  # "spin it in the fingers" can't start on the floor
         goal.notes.append("starts in the hand (from the built-in reader)")
+    if description and goal is not None and text_goal is not None and goal.start == "in_hand" \
+            and not goal.start_fingers and text_goal.start_fingers:
+        goal.start_fingers = list(text_goal.start_fingers)
+    held_always = [c for c in (goal.conditions if goal is not None and goal.start == "in_hand" else [])
+                   if c.when == "always" and c.expr and re.fullmatch(r"\s*held\s*(==\s*1(\.0)?|>=?\s*0?\.5)?\s*", c.expr)]
+    if held_always and not re.search(r"\b(tight|firm|squeez)", (description or "").lower()):
+        # handled in the hand, "never falls out" read as gripped every moment forbids every roll and pass (the
+        # LinkerHand's finger pass: the pinch broke whenever the pen moved, so the goal punished the very motion)
+        for c in held_always:
+            c.expr = "in_hand == 1"
+        goal.notes.append("held the whole time would forbid every roll and pass: Morph reads it as staying in the hand")
+        log("  (\"held the whole time\" read as \"stays in the hand\": a roll or pass loosens the grip for a moment)")
     if goal is not None and goal.start == "in_hand" and not any(
-            c.when == "always" and (c.kind == "height" or "bottom" in (c.expr or "") or "held" in (c.expr or ""))
+            c.when == "always" and (c.kind == "height" or any(n in (c.expr or "") for n in ("bottom", "held", "in_hand")))
             for c in goal.conditions):  # handled in the hand: dropping it and rolling it on the floor doesn't count
         goal.conditions.append(Condition(kind="expression", expr="bottom > 0.02", when="always", source="default",
                                          text="it never falls to the floor"))

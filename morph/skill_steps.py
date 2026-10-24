@@ -314,11 +314,15 @@ class StepTracker:
         import numpy as np
         self.np = np
         self.steps = [(s["name"], parse(s["done_when"], fixtures)) for s in steps]
+        from .goal_terms import Windows
+        self.over_time = Windows([t for _, t in self.steps])  # change(...) / mean(...), when the run doesn't follow them
         self.reached, self.on_step = 0, on_step
         self.streak = [0, 0]  # ticks the current step / the one after it have held in a row
 
     def update(self, v: dict) -> None:
         from .goal_terms import violation
+        if self.over_time and not self.over_time.covers(v):
+            self.over_time.feed(v)
         k, n = self.reached, len(self.steps)
         done = lambda i: i < n and float(violation(self.np, self.steps[i][1], v)) <= 1e-3
         d0, d1 = done(k), (not done(k)) and done(k + 1)

@@ -151,3 +151,49 @@ def test_the_step_before_the_grasp_needs_the_hand_where_it_can_grip():
     assert task["steps"][1]["done_when"] == "(hand_dist <= 0.05 and closure < 0.2) and grip_gap < 0.03"
     assert task["steps"][0]["done_when"] == steps[0]["done_when"]
     assert require_grip(task) is None and grip_first(task["steps"], task) == []  # once is enough
+
+
+def test_conditions_written_with_and_and_signs_can_be_explained():
+    """Nemotron wrote "touching('index') == 1 && touching('middle') == 1": practice ran, then judging the tries crashed
+    explaining what was measured, and the app stopped after round 1."""
+    from morph.goal_terms import uses
+    from morph.plan_check import _names
+    e = "touching('index') == 1 && touching('middle') == 1 || !held"
+    assert uses(e) == {"touching", "held"} and _names(e) == {"touching", "held"}
+
+
+def test_goals_that_begin_alike_keep_their_own_skills(tmp_path, monkeypatch):
+    """Folder names were cut to 40 letters: a thumb spin and a finger pass both began "the whole time: pen never falls
+    out of the hand", and the spin was answered "learned" with the pass's skill. Skills from before keep working."""
+    import morph.learn_task as lt
+    from morph.goals import Condition, GoalSpec
+    monkeypatch.setattr(lt, "LEARNED", tmp_path)
+    keep = Condition(kind="expression", when="always", expr="in_hand == 1", text="pen never falls out of the hand")
+    pass_ = GoalSpec(object="pen", conditions=[keep, Condition(kind="expression", when="ever", expr="touching('ring') == 1")])
+    spin = GoalSpec(object="pen", conditions=[keep, Condition(kind="expression", when="ever", expr="spin_z_dps > 360")])
+    assert lt.task_dir("hand", pass_) != lt.task_dir("hand", spin)
+    old = tmp_path / f"hand__pen__{lt._goal_slug(pass_)}"  # named the old way
+    old.mkdir()
+    (old / "task.json").write_text(json.dumps({"conditions": [c.model_dump() for c in pass_.conditions]}))
+    assert lt._goal_slug(pass_) == lt._goal_slug(spin)  # the old names were the same
+    assert lt.skill_dir("hand", pass_) == old and lt.skill_dir("hand", spin) == lt.task_dir("hand", spin)
+
+
+def test_a_plan_in_the_hand_asks_for_it_kept_up_not_pinched():
+    """The LinkerHand's pen-spin plan began "secure grip on pen: held == 1 and grip_gap < 0.03" with the pen lying
+    across the fingers, never pinched: no try got past step 1, so the steps never helped."""
+    from morph.plan_check import in_hand_steps
+    keep = {"kind": "expression", "expr": "in_hand == 1", "when": "always"}
+    task = {"start_state": {"qpos": [0.0]}, "conditions": [keep], "steps": [
+        {"name": "secure", "done_when": "held == 1 and grip_gap < 0.03", "keep": "grip_gap < 0.05"},
+        {"name": "spin", "done_when": "held && spin_z_dps > 180", "keep": "held == 1 and bottom > 0.02"},
+        {"name": "let it roll", "done_when": "held == 0 and spin_z_dps > 180", "keep": "not held"}]}
+    assert "secure" in in_hand_steps(task)
+    assert [(s["done_when"], s["keep"]) for s in task["steps"]] == [
+        ("in_hand == 1", ""), ("in_hand and spin_z_dps > 180", "in_hand == 1 and bottom > 0.02"),
+        ("held == 0 and spin_z_dps > 180", "not held")]  # not being pinched is fine in the hand
+    assert in_hand_steps(task) is None  # once is enough
+    firm = {"start_state": {"qpos": [0.0]}, "steps": [{"name": "a", "done_when": "held == 1"}],
+            "conditions": [{"kind": "expression", "expr": "held == 1", "when": "always"}]}
+    assert in_hand_steps(firm) is None  # the goal asks for the pinch: the plan keeps it
+    assert in_hand_steps({"steps": [{"name": "a", "done_when": "held == 1"}], "conditions": []}) is None  # from the floor

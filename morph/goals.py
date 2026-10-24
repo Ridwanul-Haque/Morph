@@ -105,12 +105,16 @@ class GoalSpec(BaseModel):
     notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)  # possible but unlikely: Morph still tries
     start: Literal["scene", "in_hand"] = "scene"  # where the object is when a try begins (in_hand: in_hand.py)
+    start_fingers: list[str] = Field(default_factory=list)  # in_hand: the fingers it starts on ("index", "middle")
 
     def describe(self) -> list[str]:
         return [f"{c.describe()}  [{c.source}]" for c in self.conditions]
 
     def start_text(self) -> str:
-        return "starts in the robot's hand" if self.start == "in_hand" else ""
+        if self.start != "in_hand":
+            return ""
+        f = self.start_fingers
+        return "starts in the robot's hand" + (f", on the {' and '.join(f)} finger{'s' if len(f) > 1 else ''}" if f else "")
 
 
 def warnings(goal: GoalSpec, scene: UserScene) -> list[str]:
@@ -275,8 +279,10 @@ def needs_learning(goal: GoalSpec) -> str | None:
 
 
 def lets_go(goal: GoalSpec) -> bool:
-    """Must the robot have let go at the end? Not when the goal says it may hold on."""
-    return not any((c.kind == "height" and c.hold) or (c.kind == "expression" and "held" in (c.expr or ""))
+    """Must the robot have let go at the end? Not when the goal says it may hold on, or that it stays in the hand
+    (in_hand: a pen passed between the fingers was once judged as if set down, and failed for wobbling there)."""
+    return not any((c.kind == "height" and c.hold)
+                   or (c.kind == "expression" and ("held" in (c.expr or "") or "in_hand" in (c.expr or "")))
                    for c in goal.conditions)
 
 
@@ -322,6 +328,8 @@ def check(goal: GoalSpec, scene: UserScene, model: mujoco.MjModel, data: mujoco.
         if _generic(cd):
             if gv is None:
                 gv, fx = _measure(goal, scene, model, data, pose, released)
+                if history is not None:  # change(...) / mean(...) as they stood at the end of the run
+                    gv["window"] = dict(getattr(history, "last_window", {}) or {})
             try:
                 viol = float(condition_violation(np, cd, gv, fx, (b.half_x, b.half_y, b.half_z)))
                 ok, got = viol <= 1e-6, _measured_text(c, gv)
@@ -366,7 +374,11 @@ def check(goal: GoalSpec, scene: UserScene, model: mujoco.MjModel, data: mujoco.
             ok, got = d <= 0.005, ("in contact" if d <= 0.0005 else f"{d * 1000:.0f} mm apart")
         results.append({"condition": c.describe(), "ok": bool(ok), "measured": got})
     reasons = [f"{r['condition']}: {r['measured']}" for r in results if not r["ok"]]
-    if speed > 0.02 and (released or lets_go(goal)):
+    if any(c.kind == "expression" and "in_hand" in (c.expr or "") for c in goal.conditions) and not lets_go(goal):
+        released = False  # lying across the fingers isn't a pinch, but it isn't let go: its in_hand condition judges a drop
+    from .goal_terms import needs_motion_at_rest
+    moving = any(c.when in ("end", "last") and needs_motion_at_rest(c.model_dump()) for c in goal.conditions)
+    if speed > 0.02 and (released or lets_go(goal)) and not moving:  # "still spinning at the end" can't also be at rest
         reasons.append(f"object still moving ({speed:.3f})")
     if not released and lets_go(goal):
         reasons.append("robot still holding the object")
@@ -445,13 +457,21 @@ def _measured_text(c: Condition, v: dict) -> str:
     if k == "moved":
         return f"moved {float(v['travelled']) * 100:.0f} cm"
     if k == "expression":
-        from .goal_terms import uses
-        names = sorted(uses(c.expr) & (set(v) - {"dist", "R"}))
+        import ast as _ast
+        from .goal_terms import WINDOW_FUNCS, normalize, uses
+        tree = _ast.parse(normalize(c.expr), mode="eval")
+        over = [n for n in _ast.walk(tree) if isinstance(n, _ast.Call) and getattr(n.func, "id", "") in WINDOW_FUNCS]
+        inside = {id(x) for n in over for x in _ast.walk(n)}  # read through change(...) / mean(...): shown as those
+        alone = {n.id for n in _ast.walk(tree) if isinstance(n, _ast.Name) and id(n) not in inside}
+        win = v.get("window") or {}
+        over_text = [f"{_ast.unparse(n)} = {float(win[_ast.dump(n)]):.3g}" if _ast.dump(n) in win
+                     else f"{_ast.unparse(n)}: not followed during this run" for n in over]
+        names = sorted(uses(c.expr) & alone & (set(v) - {"dist", "R"}))
         dists = [n for n in ("dist_to",) if n in uses(c.expr)]
         parts = [f"{n} = {float(v[n]):.3g}" for n in names]
         if dists:
             parts += [f"dist_to('{t}') = {float(d):.3g}" for t, d in v["dist"].items() if t in c.expr]
-        parts += _body_text(c.expr, v)
+        parts += _body_text(c.expr, v) + list(dict.fromkeys(over_text))
         return ", ".join(parts)
     return f"centre at ({float(v['x']):.2f}, {float(v['y']):.2f}), {float(v['dist'].get(c.target, 0)) * 100:.0f} cm from it"
 

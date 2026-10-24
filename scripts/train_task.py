@@ -37,8 +37,8 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.goal_terms import (BODY_FUNCS, FLICKER_TICKS, HOLD_TICKS, condition_violation, is_generic, is_temporal,  # noqa: E402
-                              normalize, parse, term_value, uses, violation)
+from morph.goal_terms import (BODY_FUNCS, FLICKER_TICKS, HOLD_TICKS, Windows, condition_violation,  # noqa: E402
+                              formula_trees, is_generic, is_temporal, normalize, parse, term_value, uses, violation)
 from morph.reward_parts import weights as reward_weights  # noqa: E402
 from morph.task_model import (CTRL_DT, SIM_DT, Residual, apply_action, build_task_model, indices, load_task, measure,  # noqa: E402
                               next_ctrl,  # noqa: E402
@@ -162,6 +162,8 @@ class TaskLearn(mjx_env.MjxEnv):
             + (["steps"] if task.get("steps") else [])  # + "copy" once the demonstration is loaded (below)
         # extra shaping terms Nemotron wrote (Eureka-style), each logged on its own so it can see what they did
         self.terms = [(parse(t["formula"], self.fx), float(t["weight"])) for t in task.get("reward_terms", [])]
+        # change(...) / mean(...) in any of the formulas: followed through each try in its state (info["win"])
+        self.over_time = Windows(formula_trees(task))
         # ... paid as potentials (Ng, Harada & Russell 1999): gamma * phi(next) - phi(now), so a term pays for getting
         # its value up, not for sitting there. One paid every tick taught the Stretch to hover over the parcel instead
         # of picking it up (its term earned 7.3 a try while the success part fell from 10 to 0.2). main() sets gamma to
@@ -231,7 +233,14 @@ class TaskLearn(mjx_env.MjxEnv):
         self._mass0 = float(self._mj_model.body_mass[self.ix.block])
         self._fric0 = float(self._mj_model.geom_friction[self._obj_geom, 0])
 
-    def _dist(self, data, info=None, u=None):
+    def _measure(self, data, win=None):
+        """measure(), with the values over time (change / mean) from this try's state."""
+        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
+        if self.over_time and win is not None:
+            v["window"] = self.over_time.values(jp, win)
+        return v
+
+    def _dist(self, data, info=None, u=None, win=None):
         """How far from done, in metres: distance to the place (if the goal has one) plus how unmet the
         other conditions are (goal_terms units, 1 ~ 30 cm). Returns (distance, updated tracking of the
         conditions about a moment during the task)."""
@@ -242,7 +251,7 @@ class TaskLearn(mjx_env.MjxEnv):
             return d, {}
         u = info["ease_u"] if u is None and info is not None and "ease_u" in info else (u if u is not None else 0.0)
         # graded "held" (grip) here: this is the learner's sense of how far it is, not the judgement of success
-        v = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
+        v = soft(self._measure(data, win if win is not None else (info or {}).get("win")))
         unmet = sum((jp.maximum(condition_violation(jp, c, v, self.fx, self.half) - u * self._slack_g[k], 0.0)
                      for k, c in enumerate(self.generic)), jp.zeros(()))
         track = {}
@@ -273,9 +282,9 @@ class TaskLearn(mjx_env.MjxEnv):
             track = {"tv": tv, "released": released, "was_held": held}
         return d + 0.3 * unmet, track
 
-    def _broken(self, data, u=0.0):
+    def _broken(self, data, u=0.0, win=None):
         """Per "the whole time" condition: is it broken now (strict, as judged; by more than its slack when eased)."""
-        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
+        v = self._measure(data, win)
         return jp.stack([condition_violation(jp, {**c, "when": "end"}, v, self.fx, self.half) > u * self._slack_s[k] + 1e-6
                          for k, c in enumerate(self.stop_rules)])
 
@@ -297,13 +306,13 @@ class TaskLearn(mjx_env.MjxEnv):
         orient = 0.5 * jp.abs(fingers @ close_w) + 0.5 * jp.maximum(pointing @ come_in, 0.0)
         return dist, (0.3 + 0.7 * orient) * jp.exp(-past / 0.01)
 
-    def _steps(self, data, step, streak):
+    def _steps(self, data, step, streak, win=None):
         """(next step index, potential, keep-rule violation, streaks). The potential grows by 1 per step reached
         and by up to 1 as the current step gets closer to done, so the reward pulls towards the next step."""
         n = len(self.steps)
         if not n:
             return step, jp.zeros(()), jp.zeros(()), streak
-        v = measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos)
+        v = self._measure(data, win)
         vs = soft(v)
         done = jp.stack([violation(jp, d, v) for d, _ in self.steps])  # strict: has it really happened
         near = jp.stack([violation(jp, d, vs) for d, _ in self.steps])  # graded: how close it is getting
@@ -324,11 +333,11 @@ class TaskLearn(mjx_env.MjxEnv):
         phi = step.astype(jp.float32) + jp.where(step < n, 1.0 - jp.tanh(3.0 * cur), 0.0)
         return step, phi, jp.where(step < n, keep[i], 0.0), streak
 
-    def _term_phi(self, data):
+    def _term_phi(self, data, win=None):
         """(each of Nemotron's terms as a potential, its clipped value), on the graded quantities."""
         if not self.terms:
             return jp.zeros(0), jp.zeros(0)
-        vs = soft(measure(jp, data.xpos, data.xmat, data.qvel, self.ix, self.task, ctrl=data.ctrl, qpos=data.qpos))
+        vs = soft(self._measure(data, win))
         tv = jp.stack([jp.clip(term_value(jp, f, vs), -3.0, 3.0) for f, _ in self.terms])
         tv = jp.where(jp.isnan(tv), 0.0, tv)
         return TERM_SCALE * jp.array([wt for _, wt in self.terms]) * tv, tv
@@ -369,15 +378,18 @@ class TaskLearn(mjx_env.MjxEnv):
         if self._eased:  # how eased this try's goal is: anywhere from the real goal (0) to the eased one (1)
             rng, ke = jax.random.split(rng)
             u = jax.random.uniform(ke)
-        d0, track = self._dist(data, u=u)
+        win = self.over_time.start(jp, self._measure(data)) if self.over_time else None
+        d0, track = self._dist(data, u=u, win=win)
         t0 = jp.where(use, self._start_t[i_start], 0) if self._starts is not None else jp.zeros((), jp.int32)
         info = {"rng": rng, "last_act": jp.zeros(self.nu), "prev_d": d0, "ctrl": ctrl0, "delay": delay,
                 "step": jp.zeros((), jp.int32), "streak": jp.zeros(2, jp.int32), "t": t0.astype(jp.int32), "ease_u": u,
                 **track}
-        info["phi"] = self._steps(data, info["step"], info["streak"])[1]
-        info["tphi"] = self._term_phi(data)[0]
+        if win is not None:
+            info["win"] = win
+        info["phi"] = self._steps(data, info["step"], info["streak"], win)[1]
+        info["tphi"] = self._term_phi(data, win)[0]
         if self.stop_rules:
-            info["armed"] = ~self._broken(data, u)
+            info["armed"] = ~self._broken(data, u, win)
             info["broke"] = jp.zeros(len(self.stop_rules), jp.int32)
         metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done",
                                              "ended_early")}
@@ -429,6 +441,9 @@ class TaskLearn(mjx_env.MjxEnv):
             ctrl = apply_action(jp, state.info["ctrl"], applied, self._ctrl0, self.ix, state.data)
         data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
         ix, info = self.ix, state.info
+        if self.over_time:  # this moment joins the ones change(...) / mean(...) look back over
+            info["win"] = self.over_time.step(jp, info["win"], self._measure(data))
+        win = info.get("win")
         d, track = self._dist(data, info)
         info.update(track)
         bp = data.xpos[ix.block]
@@ -484,7 +499,7 @@ class TaskLearn(mjx_env.MjxEnv):
             part["copy"] = 1.5 * self._demo_reward(state.obs["privileged_state"], action)
         shaped = jp.zeros(())
         if self.steps:  # the steps a person would take: reward reaching each, in order; mind the keep rules
-            step, phi, keep, info["streak"] = self._steps(data, info["step"], info["streak"])
+            step, phi, keep, info["streak"] = self._steps(data, info["step"], info["streak"], win)
             shaped = w["steps"] * 0.5 * (phi - info["phi"])  # a one-off bonus per step reached (not a rate: not scaled by dt)
             part["steps"] = 1.0 * step / len(self.steps) - 1.0 * jp.minimum(keep, 2.0)
             info["step"], info["phi"] = step, phi
@@ -492,7 +507,7 @@ class TaskLearn(mjx_env.MjxEnv):
         r = sum(part.values(), jp.zeros(()))
         ended, end_pen = jp.zeros(()), jp.zeros(())
         if self.stop_rules:  # a "the whole time" condition broken for longer than a contact flicker: the try is over
-            info["broke"] = jp.where(self._broken(data, info["ease_u"]), info["broke"] + 1, 0).astype(jp.int32)
+            info["broke"] = jp.where(self._broken(data, info["ease_u"], win), info["broke"] + 1, 0).astype(jp.int32)
             ended = jp.any(info["armed"] & (info["broke"] >= FLICKER_TICKS)).astype(jp.float32)
             # what the rest of the try could have earned is lost, so ending it never pays (otherwise a try whose
             # reward runs negative would learn to break a rule on purpose to stop early)
@@ -502,7 +517,7 @@ class TaskLearn(mjx_env.MjxEnv):
         tvals, tpaid = [], []
         if self.terms:  # Nemotron's terms (each clipped: one term can't swamp the rest), as potentials; a try that
             # really ends (fell, broke a rule) ends at potential 0, one cut off by the time limit carries on (bootstrapped)
-            tphi, tv = self._term_phi(data)
+            tphi, tv = self._term_phi(data, win)
             paid = self.gamma * tphi * (1.0 - done) - info["tphi"]
             info["tphi"] = tphi
             tvals, tpaid = list(tv), list(paid)

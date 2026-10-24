@@ -19,11 +19,12 @@ without training. Two of them:
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import numpy as np
 
-from .goal_terms import parse, violation
+from .goal_terms import normalize, parse, violation
 
 # conditions judged once things settle (the ones the last step should lead to); "ever" and "always" ones aren't
 END = ("end", "last", "release", None)
@@ -38,7 +39,7 @@ START_TICKS = 10  # the first 0.2 s with the robot holding still: a contact flic
 
 
 def _names(expr: str) -> set[str]:
-    tree = ast.parse(expr, mode="eval")
+    tree = ast.parse(normalize(expr), mode="eval")
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - calls | ({"touching"} & calls)
     return names | ({"x", "y"} if "dist_to" in calls else set())  # dist_to('wall'): where the object is
@@ -78,7 +79,7 @@ GRIP_GAP = 0.03  # m: the hand's point within this of where Morph's own grip put
 def _needs_held(expr: str) -> bool:
     """Does the formula ask for the object to be held ("held == 1", "held"), not for it not to be ("held == 0")?"""
     try:
-        tree = ast.parse(expr, mode="eval")
+        tree = ast.parse(normalize(expr), mode="eval")
     except SyntaxError:
         return False
     for n in ast.walk(tree):
@@ -128,6 +129,39 @@ def require_grip(task: dict) -> str | None:
     st["done_when"] = f"({st['done_when']}) and grip_gap < {GRIP_GAP}"
     return (f"step {g}, \"{st['name']}\", now also needs the hand where Morph grips the "
             f"{task.get('object', 'object')} (grip_gap < {GRIP_GAP}): near it isn't enough to grip it")
+
+
+HELD_ON = re.compile(r"\bheld\s*(?:==\s*1(?:\.0)?|>=?\s*0?\.5|>\s*0(?:\.0)?)(?![\d.])")
+HELD_BARE = re.compile(r"(?<!not )\bheld\b(?!\s*(?:==|!=|<|>))")
+GAP_CLAUSE = re.compile(r"\s*\band\s+grip_gap\s*<=?\s*[\d.]+|\bgrip_gap\s*<=?\s*[\d.]+\s*(?:\band\b\s*)?")
+
+
+def in_hand_steps(task: dict) -> str | None:
+    """Started in the hand, and the goal never asks for a pinch: a step's "still has it" is in_hand, not held. The
+    LinkerHand's pen plans began "secure grip: held == 1" with the pen lying across the fingers, never pinched, so no
+    try got past step 1. grip_gap goes too: with no grip of Morph's planned (in-hand skills have none) it's only the
+    hand's distance to the object's centre. Returns what it changed."""
+    if not task.get("start_state") or task.get("grasp"):
+        return None
+    if any(_uses_held(c.get("expr") or "") or (c.get("kind") == "height" and c.get("hold"))
+           for c in task.get("conditions", [])):
+        return None
+    changed = []
+    for st in task.get("steps") or []:
+        for k in ("done_when", "keep"):
+            e = st.get(k) or ""
+            if not re.search(r"\b(held|grip_gap)\b", e):
+                continue
+            new = HELD_BARE.sub("in_hand", HELD_ON.sub("in_hand == 1", normalize(e)))
+            new = re.sub(r"\s+", " ", GAP_CLAUSE.sub("", new)).strip()
+            new = re.sub(r"^\(\s*\)$", "", new)
+            if new != e.strip():
+                st[k] = new or ("1" if k == "done_when" else "")
+                changed.append(st["name"])
+    if not changed:
+        return None
+    return (f"in the hand, not gripped: {', '.join(dict.fromkeys(changed))} now ask{'s' if len(set(changed)) == 1 else ''} "
+            "for in_hand (kept up by the fingers) instead of held (a pinch, which a roll or spin loosens)")
 
 
 def _describe(c: dict) -> str:

@@ -227,9 +227,18 @@ def goal_from_description_rules(text: str, scene: UserScene) -> GoalSpec:
     if m and not any(c.kind in ("at_position", "inside", "on_top_of", "touching") and not c.negate for c in conds):
         conds.append(Condition(kind="moved", tol=float(m.group(1)) / (100 if m.group(2) == "cm" else 1),
                                side=m.group(3), source="description"))
+    if re.search(IN_HAND, t) and re.search(r"\b(never|not|n't|without)\s+(?:\w+\s+){0,2}(fall\w*|drop\w*|slip\w*)\s+(out|from)\b|"
+                                         r"\b(stay|stays|keep|keeps|remain\w*)\s+(?:\w+\s+){0,2}in the (hand|fingers)\b", t):
+        conds.append(Condition(kind="expression", expr="in_hand == 1", when="always", source="description",
+                               text="it never falls out of the hand"))
     if re.search(r"\b(spin|twirl|twiddle|rotate|roll)\w*\b", t) and re.search(IN_HAND, t):
         conds.append(Condition(kind="expression", expr="spin_dps > 180", when="last", seconds=2.0,
                                text="spinning at over half a turn per second", source="description"))
+        if re.search(r"\b(same (direction|way)|round and round|full (circle|turn)s?|(\d+|one|two|three) (full )?(turns?|"
+                     r"circles?|times round))\b", t):  # one way, not shaken back and forth: how far it turned in all
+            conds.append(Condition(kind="expression", expr="abs(change(yaw_deg, 2)) >= 360", when="end",
+                                   text="turned at least a full turn about the vertical in the last 2 s",
+                                   source="description"))
     m = re.search(r"\b(?:without|not|no|except|but not|other than)\s+(?:using\s+|with\s+|for\s+)?(?:the\s+|its\s+|a\s+)?"
                   r"(thumb|index|middle|ring|little|pinky)\b", t)
     if m:
@@ -239,7 +248,28 @@ def goal_from_description_rules(text: str, scene: UserScene) -> GoalSpec:
     if not conds:
         notes.append("no condition found in the description (try Nemotron for free-form requests)")
     start = "in_hand" if re.search(IN_HAND, t) else "scene"
-    return GoalSpec(object=scene.object_name, conditions=conds, notes=notes, start=start)
+    return GoalSpec(object=scene.object_name, conditions=conds, notes=notes, start=start,
+                    start_fingers=start_fingers(t) if start == "in_hand" else [])
+
+
+FINGER_WORDS = r"thumb|index|middle|ring|little|pinky"
+
+
+def start_fingers(t: str) -> list[str]:
+    """The fingers a request says it starts on: "starts between the index and middle fingers" -> [index, middle]."""
+    m = re.search(r"\bstart\w*\b[^.]*?\b(?:between|on|in|with|across)\s+(?:the\s+|its\s+)?((?:(?:" + FINGER_WORDS
+                  + r")(?:\s+fingers?)?(?:\s*,\s*|\s+and\s+(?:the\s+)?|\s+)?)+)", t)
+    return finger_labels(re.findall(FINGER_WORDS, m.group(1))) if m else []
+
+
+def finger_labels(names) -> list[str]:
+    """Finger names as Morph labels them (pinky -> little), each once, in order."""
+    out = []
+    for n in names:
+        n = {"pinky": "little"}.get(str(n).lower().strip(), str(n).lower().strip())
+        if n in ("thumb", "index", "middle", "ring", "little") and n not in out:
+            out.append(n)
+    return out
 
 
 # the request is about handling it in the hand, so it starts there (spinning a pen, rolling a ball in the palm)

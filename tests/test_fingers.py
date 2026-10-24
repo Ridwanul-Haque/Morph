@@ -132,3 +132,93 @@ def test_spinning_the_whole_time_is_impossible_from_rest():
     assert needs_motion_at_rest({"kind": "expression", "expr": "spin_dps > 60"})
     assert not needs_motion_at_rest({"kind": "expression", "expr": "touching('thumb') == 0"})
     assert not needs_motion_at_rest({"kind": "expression", "expr": "speed < 0.1"})
+
+
+def test_a_request_can_say_which_fingers_it_starts_on():
+    scene = load_scene(Path(__file__).resolve().parents[1] / "examples" / "pencil" / "scene.xml")
+    g = goal_from_description_rules("pass the pencil between the fingers. it starts between the index and middle "
+                                    "fingers and ends between the middle and ring fingers", scene)
+    assert g.start == "in_hand" and g.start_fingers == ["index", "middle"]
+    assert "index and middle" in g.start_text()
+    assert goal_from_description_rules("spin the pencil around the fingers", scene).start_fingers == []
+    from morph.goal_sources import start_fingers
+    assert start_fingers("start with it on the ring and pinky fingers") == ["ring", "little"]
+
+
+def test_in_the_hand_isnt_gripped():
+    """A pass or a roll loosens the pinch for a moment: "never falls out of the hand" as held == 1 the whole time
+    punished the LinkerHand for the very motion it had to learn. in_hand only asks that nothing but the robot keeps it
+    up."""
+    from morph.goal_terms import quantities
+    half = (0.07, 0.004, 0.004)
+    q = lambda z, held: quantities(np, pos=np.array([0.0, 0.0, z]), R=np.eye(3), vel=np.zeros(3), start=(0, 0),  # noqa: E731
+                                   half=half, fixtures={}, held=held)
+    up, floor = q(0.25, 0.0), q(0.004, 0.0)
+    assert up["in_hand"] == 1.0 and up["held"] == 0.0  # rolling between the fingers: in the hand, not pinched
+    assert floor["in_hand"] == 0.0  # fallen
+
+
+@pytest.mark.skipif(not (MENAGERIE / "shadow_hand").exists(), reason="scripts/fetch_assets.sh --extra")
+def test_it_starts_on_the_fingers_the_request_names(tmp_path):
+    from morph.goals import Condition, GoalSpec
+    from morph.learn_task import make_task
+    from morph.project import load_project
+    from morph.task_model import build_task_model, contact_touch, indices
+    import json
+    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "pencil")
+    goal = GoalSpec(object=pj.scene.object_name, start="in_hand", start_fingers=["index", "middle"],
+                    conditions=[Condition(kind="expression", expr="in_hand == 1", when="always")])
+    t = json.loads(make_task(pj, goal, str(MENAGERIE / "shadow_hand" / "right_hand.xml"), plan=False,
+                             folder=tmp_path / "shadow").read_text())
+    m = build_task_model(t, accurate=True)
+    ix = indices(m, t)
+    d = mujoco.MjData(m)
+    d.qpos[:] = t["start_state"]["qpos"]
+    d.ctrl[:] = t["start_state"]["ctrl"]
+    for _ in range(int(1.0 / m.opt.timestep)):
+        mujoco.mj_step(m, d)
+    touch = contact_touch(m, d, ix)
+    assert touch["index"] == 1.0 and touch["middle"] == 1.0  # (with others too, if only they hold it still)
+
+
+def test_it_starts_where_the_goal_first_needs_it():
+    """"Lying across the fingers" named none, so the LinkerHand started in a near-fist over the palm and never worked
+    the pen onto the index and middle fingers the goal asked for next."""
+    from morph.in_hand import fingers_needed_first
+    labels = ["thumb", "index", "middle", "ring", "little"]
+    conds = [{"when": "always", "expr": "in_hand == 1"}, {"when": "always", "expr": "touching('thumb') == 0"},
+             {"when": "ever", "expr": "spin_z_dps > 90"},
+             {"when": "ever", "expr": "touching('index') == 1 && touching('middle') == 1", "text": "between index and middle"},
+             {"when": "last", "expr": "touching('middle') == 1 and touching('ring') == 1"}]
+    assert fingers_needed_first(conds, labels) == (["index", "middle"], "between index and middle")
+    assert fingers_needed_first(conds[:3] + conds[4:], labels) == ([], "")  # not the end's: holding still would pass it
+    assert fingers_needed_first([conds[1], {"when": "ever", "expr": "touching('thumb') == 1 and touching('pinky') > 0.5"}],
+                                labels)[0] == ["little"]  # never a finger kept off it the whole time
+    assert fingers_needed_first([{"when": "ever", "expr": "touching('ring') == 1 or touching('index') == 1"}], labels)[0] == []
+
+
+def test_a_pen_kept_in_the_hand_isnt_judged_as_set_down():
+    """With "never falls out of the hand" as in_hand, no condition said held, so Morph took it the hand had to let go:
+    6 of 10 LinkerHand tries met every condition and failed for the pen still wobbling between the fingers."""
+    from morph.goals import Condition, GoalSpec, lets_go
+    keep = Condition(kind="expression", expr="in_hand == 1", when="always")
+    assert not lets_go(GoalSpec(object="pen", conditions=[keep], start="in_hand"))
+    assert lets_go(GoalSpec(object="pen", conditions=[Condition(kind="inside", target="bin")]))
+
+
+def test_a_spin_written_any_way_is_a_spin():
+    """Nemotron's "abs(spin_z_dps) > 180 for the last 4 s" was turned down three times as not a spin, and the built-in
+    reading that replaced it had no "stays in the hand", so the pen was also judged as set down: it had to be both
+    spinning and still at the end."""
+    from morph.goal_sources import goal_from_description_rules
+    from morph.goals import Condition, GoalSpec
+    from morph.project import load_project, missing_intent
+    req = ("Spin the pen in the hand. Every try starts with the pen already in the hand. The pen must "
+           "never fall out of the hand. For the last 4 seconds it turns faster than 180 degrees per second.")
+    for e in ("abs(spin_z_dps) > 180", "spin_z_dps > 180", "spin_dps >= 90"):
+        g = GoalSpec(object="pen", conditions=[Condition(kind="expression", when="always", expr="in_hand == 1"),
+                                               Condition(kind="expression", when="last", seconds=4, expr=e)])
+        assert missing_intent(req, g) == []
+    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "parcel")
+    rules = goal_from_description_rules(req.replace("pen", "parcel"), pj.scene)
+    assert ("always", "in_hand == 1") in [(c.when, c.expr) for c in rules.conditions]

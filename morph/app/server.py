@@ -397,8 +397,8 @@ class App:
             if prof.gripper.get("type") != "multi_finger_hand":
                 r["plan"], r["why_not"] = "unsupported", body_problem(self.goal, self.resolve(path), prof)
         if self.goal is not None and not r["learned"]:  # an earlier attempt that didn't work (or didn't finish)
-            from ..learn_task import learning_status, task_dir
-            st = learning_status(task_dir(prof.name, self.goal))
+            from ..learn_task import learning_status, skill_dir
+            st = learning_status(skill_dir(prof.name, self.goal))
             if st["state"] != "none":
                 r["attempt"] = {"state": "other_file" if st["good"] else st["state"], "success": st.get("success"),
                                 "n": st.get("n")}
