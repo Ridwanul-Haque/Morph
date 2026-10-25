@@ -535,6 +535,10 @@ def robot_label(p: Path) -> str:
     return re.sub(r"(\.urdf)?\.(xacro|urdf|xml)$", "", p.name)
 
 
+TRAINER_SILENT_S = 20 * 60  # a round prints its progress every few minutes, even with few practice copies
+STALLED = -1000  # _stream_training's exit code for a trainer that was stopped for going silent
+
+
 def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, quiet_start: bool = False):
     """Run a trainer, forward its progress; returns (exit code, ran out of GPU memory?)."""
     if not quiet_start:
@@ -544,7 +548,22 @@ def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, q
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(ROOT), env=dict(os.environ))
     app.proc = proc
     oom, in_trace = False, False
+    heard = {"at": time.monotonic(), "stalled": False}
+
+    def watch():  # Stop, or a trainer that has gone silent (a hung GPU call once froze one for 5 hours)
+        while proc.poll() is None:
+            if app.live.cancel or time.monotonic() - heard["at"] > TRAINER_SILENT_S:
+                heard["stalled"] = not app.live.cancel
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return
+            time.sleep(5)
+    threading.Thread(target=watch, daemon=True).start()
     for line in proc.stdout:
+        heard["at"] = time.monotonic()
         if app.live.cancel:
             proc.terminate()
             raise Cancelled()
@@ -571,6 +590,9 @@ def _stream_training(app: "App", cmd: list, robot: str, steps: int, kind: str, q
     app.proc = None
     if app.live.cancel:
         raise Cancelled()
+    if heard["stalled"]:
+        app.send(type="log", robot=robot, text=f"The trainer went silent for {TRAINER_SILENT_S // 60} min, so it was stopped")
+        return STALLED, oom
     return code, oom
 
 
@@ -613,12 +635,17 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
     def train(task_path, n_steps, restore) -> bool:
         """One round of practice on this GPU (fewer copies at once if it runs out of memory)."""
         app.training_task = task_path
+        retried = False
         while True:
             cmd = [str(py), str(ROOT / "scripts" / "train_task.py"), str(task_path), "--steps", str(n_steps),
                    "--envs", str(state["envs"]), "--randomize", randomize] + (["--restore", str(restore)] if restore else []) \
                 + (["--imitate-only"] if n_steps == 0 else [])
             code, oom = _stream_training(app, cmd, robot, n_steps, "task", quiet_start=not state["first"])
             state["first"], state["oom"] = False, oom
+            if code == STALLED and not retried:
+                retried = True  # once: the same practice again, from where it started
+                app.send(type="log", robot=robot, text="Starting that round again")
+                continue
             if code == 0 or not oom or state["envs"] <= 128:
                 break
             state["envs"] //= 2  # detailed collision meshes need more GPU memory per copy: practise with fewer at once

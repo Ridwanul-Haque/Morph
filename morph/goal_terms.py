@@ -509,6 +509,7 @@ def formula_trees(task: dict) -> list:
     src = [c.get("expr") for c in task.get("conditions", []) if c.get("kind") == "expression"]
     src += [s.get(k) for s in task.get("steps", []) for k in ("done_when", "keep")]
     src += [t.get("formula") for t in task.get("reward_terms", [])]
+    src += [m.get("of") for m in task.get("milestones", [])]
     out = []
     for e in src:
         if e:
@@ -517,6 +518,57 @@ def formula_trees(task: dict) -> list:
             except ExprError:
                 pass
     return out
+
+
+MILESTONE_SHARE = 12  # a moving target's step: a twelfth of the unit (30 degrees of a turn, 2.5 cm of a distance)
+MAX_MILESTONES = 2
+
+
+def milestones_for(task: dict) -> list[dict]:
+    """Moving targets for practice: for each goal condition about how far something turns or travels (change(q, s) or
+    travelled against a number), {"of": that amount since the try began, the way the goal counts it (one way, the other,
+    or either: abs), "every": the step}. The learner gets a bonus each time it reaches the next one and the target moves
+    on (as Eureka's pen spinning chased a target 30 degrees ahead), so every bit of the motion pays as it happens."""
+    out: dict[str, float] = {}
+    fx = task.get("fixtures", {})
+    for c in task.get("conditions", []):
+        if c.get("kind") != "expression" or not c.get("expr"):
+            continue
+        try:
+            tree = parse(c["expr"], fx)
+        except ExprError:
+            continue
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Compare) and len(n.ops) == 1):
+                continue
+            left, op, right = n.left, n.ops[0], n.comparators[0]
+            if isinstance(left, ast.Constant):  # 720 <= abs(change(...)): the amount on the left
+                left, right = right, left
+                op = {ast.Lt: ast.Gt(), ast.LtE: ast.GtE(), ast.Gt: ast.Lt(), ast.GtE: ast.LtE()}.get(type(op), op)
+            k = right.operand if isinstance(right, ast.UnaryOp) and isinstance(right.op, ast.USub) else right
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, (int, float))):
+                continue
+            target = -float(k.value) if k is not right else float(k.value)
+            wrapped = isinstance(left, ast.Call) and getattr(left.func, "id", "") == "abs" and len(left.args) == 1
+            amount = left.args[0] if wrapped else left
+            if isinstance(amount, ast.Call) and getattr(amount.func, "id", "") == "change" and amount.args:
+                q = amount.args[0]
+                of = f"change({ast.unparse(q)})"
+            elif isinstance(amount, ast.Name) and amount.id == "travelled":
+                q, of = amount, "travelled"
+            else:
+                continue
+            if isinstance(op, (ast.Gt, ast.GtE)) and target > 0:
+                of = f"abs({of})" if wrapped else of
+            elif isinstance(op, (ast.Lt, ast.LtE)) and target < 0 and not wrapped:
+                of = f"-{of}"
+            else:
+                continue
+            unit = TURN_UNIT if _is_angle(q) else LENGTH_UNIT if _unit(q) == LENGTH_UNIT else None
+            if unit is None:
+                continue
+            out.setdefault(of, round(min(unit / MILESTONE_SHARE, abs(target) / 2), 4))
+    return [{"of": of, "every": every} for of, every in list(out.items())[:MAX_MILESTONES]]
 
 
 class Windows:

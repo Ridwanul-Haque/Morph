@@ -141,6 +141,7 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
         if info.get("rationale"):
             task["steps_rationale"] = info["rationale"]
     task["senses"] = senses_for(task)
+    practice_aids(task, log)
     if task["senses"]:
         log("  it also senses: " + ", ".join({"spin": "how fast the object turns", "touch": "which fingers touch it"}[k]
                                             for k in task["senses"]))
@@ -156,6 +157,34 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
     if gripper:
         _calibrate_grip(out / "task.json", pj, log)
     return out / "task.json"
+
+
+def practice_aids(task: dict, log=print) -> None:
+    """How practice goes about it, from the goal (train_task reads these; the judge always checks the real goal):
+    - milestones: moving targets for a goal about how far something turns or travels (goal_terms.milestones_for);
+    - plain_practice: no varied physics, noise or delays until it first succeeds (_vary_now turns them on);
+    - adaptive_lr: for a hard goal, a learning rate that follows how much each update changes the policy."""
+    from .goal_terms import milestones_for
+    ms = milestones_for(task)
+    if ms:
+        task["milestones"] = ms
+        log("  practice chases moving targets: " + "; ".join(f"{m['of']}, every {m['every']:g}" for m in ms))
+    task["critic_milestones"] = bool(ms)
+    task["plain_practice"] = True
+    task["adaptive_lr"] = _hard(task)
+
+
+def _vary_now(task_path: Path, log=print) -> bool:
+    """It has succeeded in a plain world: from now on practice varies friction, weight, motor strength, sensor noise
+    and delays, so the skill holds up outside the one world it learned in. True if this turned it on."""
+    t = load_task(task_path)
+    if not t.get("plain_practice"):
+        return False
+    t["plain_practice"] = False
+    task_path.write_text(json.dumps(t, indent=1))
+    log("  it can do it now: from here on it practises with varied friction, weight, motor strength, sensor noise "
+        "and delays, so it holds up outside the one plain world it learned in")
+    return True
 
 
 def senses_for(task: dict) -> list[str]:
@@ -1149,6 +1178,9 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
 
 EXTRA_ROUNDS = 4  # rounds past the planned ones while each still does better than the last
 WARM_UP_ROUNDS = 2  # practice rounds for a warm-up skill before the real one
+# what breaking a "the whole time" rule costs a warm-up, per second of the try left (3 for the real task): with the
+# full cost a robot can learn to do nothing rather than risk breaking it (a hand once held a pen perfectly still)
+WARM_UP_END_COST = 0.5
 
 
 def _hard(task: dict) -> bool:
@@ -1160,6 +1192,12 @@ def _hard(task: dict) -> bool:
         if c.get("when") == "last" or "change(" in e or "spin_" in e:
             return True
     return False
+
+
+def since_start(expr: str) -> str:
+    """change(q, s) -> change(q): how far q has changed since the try began. A warm-up's progress that only counts
+    over the last s seconds is taken back after a pause, so a little progress and a stop earns nothing in the end."""
+    return re.sub(r"\bchange\(\s*([A-Za-z_]\w*)\s*,\s*[\d.]+\s*\)", r"change(\1)", expr)
 
 
 def warm_up(pj: Project, goal: GoalSpec, task_path: Path, train, llm, log=print, emit=None, steps: int = 30_000_000,
@@ -1189,6 +1227,8 @@ def warm_up(pj: Project, goal: GoalSpec, task_path: Path, train, llm, log=print,
     for d in prop.conditions:
         if isinstance(d, dict) and d.get("expr") and not d.get("kind"):  # a formula: an expression, said or not
             d = d | {"kind": "expression"}
+        if isinstance(d, dict) and d.get("expr"):
+            d = d | {"expr": since_start(d["expr"])}
         try:
             conds.append(Condition(**{k: v for k, v in d.items() if k in Condition.model_fields} | {"source": "description"}))
         except Exception:  # noqa: BLE001  (a malformed item is left out)
@@ -1212,8 +1252,10 @@ def warm_up(pj: Project, goal: GoalSpec, task_path: Path, train, llm, log=print,
     task = load_task(task_path)
     senses = sorted(set(task.get("senses") or []) | set(wt.get("senses") or []))
     windows = bool(_goal_windows(task) or _goal_windows(wt))
+    wt["end_cost"] = WARM_UP_END_COST
+    milestones = bool(task.get("critic_milestones") or wt.get("critic_milestones"))
     for path, t in ((wpath, wt), (task_path, task)):
-        t["senses"], t["critic_windows"] = senses, windows
+        t["senses"], t["critic_windows"], t["critic_milestones"] = senses, windows, milestones
         path.write_text(json.dumps(t, indent=1))
     res = _learn_rounds(pj, wg, wpath, train, llm, log=lambda m: log(f"  [warm-up] {m.strip()}"),
                         emit=lambda **e: emit(**e, warm_up=True),
@@ -1338,7 +1380,9 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             _snapshot(task_path, 0, "Plans compared", res, note=f"best of {chosen['tried']}: {chosen['idea']}")
             emit(type="learn_round", round=0, rounds=rounds, stage="tried", success=res["success"], n=res["n"],
                  note=f"best of {chosen['tried']} plans: {chosen['idea']}")
-            if res["success"] >= math.ceil(0.6 * tries):
+            if res["success"] > 0 and _vary_now(task_path, log):
+                pass  # done in a plain world: the rounds below practise it with variation
+            elif res["success"] >= math.ceil(0.6 * tries):
                 res["rounds"] = history
                 return res
     planned, r = rounds, 0
@@ -1355,11 +1399,15 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         _snapshot(task_path, r, f"Round {r} of {rounds}", res, note=f"{per * r / 1e6:.0f}M steps")
         emit(type="learn_round", round=r, rounds=rounds, stage="tried", success=res["success"], n=res["n"])
         best = _keep_best(task_path, res, best, f"round {r}")
-        if res["success"] >= math.ceil(0.6 * tries):
+        if res["success"] > 0 and _vary_now(task_path, log):
+            if res["success"] >= math.ceil(0.6 * tries):  # one more round, with the variation, before it's done
+                rounds = max(rounds, r + 1)
+                continue
+        elif res["success"] >= math.ceil(0.6 * tries):
             break
         if r == rounds:  # the last planned round: carry on while it's still getting better, up to EXTRA_ROUNDS more
             fit = _fitness(task_path.parent, res)
-            if rounds < planned + extra and (fit > last_fit if last_fit is not None else fit[1] > 0):
+            if rounds < planned + extra and (fit > last_fit if last_fit is not None else fit[1] > 0 or fit[2] > 0):
                 rounds += 1
                 log(f"  round {r}: {res['success']}/{res['n']} and still getting better: one more round "
                     f"({rounds - planned} past the {planned} planned)")
@@ -1372,7 +1420,8 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
             last_fit = _fitness(task_path.parent, res)
             continue
         fit = _fitness(task_path.parent, res)
-        improving = fit > last_fit if last_fit is not None else fit[1] > 0  # first round: any time in the goal state
+        # first round: any progress (a moving target reached, or any time in the goal state)
+        improving = fit > last_fit if last_fit is not None else fit[1] > 0 or fit[2] > 0
         if improving:  # still getting better: keep practising the same plan
             log(f"  round {r}: {res['success']}/{res['n']}, better than the round before: same plan, more practice")
             history.append({"round": r, "practice_steps": per * r, "tries_succeeded": f"{res['success']}/{res['n']}",
@@ -1933,28 +1982,44 @@ def _keep_best(task_path: Path, res: dict, best, label: str):
 
 # ------------------------------------------------------------------ several step plans at once (Eureka-style)
 def _fitness(folder: Path, res: dict) -> tuple:
-    """One yardstick for every candidate, whatever its steps: real successes in the tries, then how much of the
-    time the training evaluation spent in the goal state, then how close it got."""
+    """One yardstick for every candidate, whatever its steps: real successes in the tries, then how many moving
+    targets the training evaluation reached a try (progress that shows even when no try succeeds: Eureka ranks its
+    pen spinning by the targets reached in a row), then how much of the time it spent in the goal state, then how
+    close it got."""
     meta = json.loads((folder / "train_meta.json").read_text()) if (folder / "train_meta.json").exists() else {}
     last = meta.get("kept") or (meta.get("curve") or [{}])[-1]  # the snapshot the learner kept, not just its last
     in_goal = last.get("success", 0.0)
     in_goal = 0.0 if in_goal != in_goal else in_goal  # NaN
     dist = last.get("dist", 1e9)
     dist = 1e9 if dist != dist else dist
-    return (res.get("success", 0), round(in_goal, 2), -round(dist, 2))
+    ms = last.get("milestones", 0.0)
+    ms = 0.0 if ms != ms else ms
+    return (res.get("success", 0), round(ms, 1), round(in_goal, 2), -round(dist, 2))
+
+
+def _fit_words(fit: tuple) -> str:
+    return (f"{fit[1]:g} moving targets reached a try; " if fit[1] else "") + \
+        f"{fit[2]} of the evaluation's moments in the goal state"
+
+
+# how far each setting may move from the trainer's own: "exploring more" won every comparison in one session while
+# nothing worked, and as a factor on the winner it compounded to 9x, so practice was mostly noise. Eureka's pen
+# spinning trained with no exploration bonus at all: being stuck is the plan's or the reward's fault far more often
+NUDGE_LIMITS = {"entropy": (0.3, 2.0), "lr": (0.25, 2.0)}
 
 
 def _nudge(base: dict, by: dict) -> dict:
     """PBT's "explore": the winner's settings times a factor each, kept within reason."""
     out = dict(base)
     for k, f in by.items():
-        out[k] = round(min(max(float(base.get(k, 1.0)) * f, 0.1), 10.0), 3)
+        lo, hi = NUDGE_LIMITS.get(k, (0.1, 10.0))
+        out[k] = round(min(max(float(base.get(k, 1.0)) * f, lo), hi), 3)
     return out
 
 
 # variants of the current plan that only explore differently (Population Based Training, DexPBT): more random
 # tries (a policy stuck in one habit), or calmer, slower updates (one that learns something and then wrecks it)
-EXPLORE = [("the current steps, exploring more", {"entropy": 3.0}),
+EXPLORE = [("the current steps, exploring more", {"entropy": 2.0}),
            ("the current steps, with calmer updates", {"entropy": 0.5, "lr": 0.5})]
 
 
@@ -1979,23 +2044,35 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     plans = [{"idea": "keep the current steps", "steps": task.get("steps", []), "reward_terms": task.get("reward_terms", []),
               "ppo_tweaks": base_tw}]
     plans += [{"idea": idea, "steps": task.get("steps", []), "reward_terms": task.get("reward_terms", []),
-               "ppo_tweaks": _nudge(base_tw, by)} for idea, by in (EXPLORE if explore else [])]
+               "ppo_tweaks": _nudge(base_tw, by)} for idea, by in (EXPLORE if explore else [])
+              if _nudge(base_tw, by) != base_tw]  # already at the limit: the same as keeping it
     for e in extra:
         st = e.get("set", {})
         plans.append({"idea": e["idea"], "steps": st.get("steps", task.get("steps", [])),
                       "reward_terms": st.get("reward_terms", task.get("reward_terms", [])),
                       "dropped_terms": st.get("dropped_terms", []), "ppo_tweaks": base_tw, "set": st})
-    prop = None
+    cands, why = [], []
     if llm is not None and getattr(llm, "available", False):
-        try:
-            prop, _ = llm.step_candidates(robot_brief(prof), [c.describe() for c in goal.conditions],
-                                          task.get("steps", []), diagnosis, scales(pj.scene, placement(goal, pj.scene)),
-                                          rounds, k)
-        except Exception as e:  # noqa: BLE001
-            log(f"  (Nemotron couldn't propose step plans: {e})")
+        sc = scales(pj.scene, placement(goal, pj.scene))
+        for _ in range(k):  # one at a time, each told the ideas already proposed: one reply asked for 3 tends to give
+            # 3 variations of one idea (Eureka samples each reward on its own)
+            seen = [str(c.get("idea", "")) for c in cands]
+            try:
+                prop, _ = llm.step_candidates(robot_brief(prof), [c.describe() for c in goal.conditions],
+                                              task.get("steps", []), diagnosis, sc, rounds, 1, others=seen)
+            except Exception as e:  # noqa: BLE001
+                log(f"  (Nemotron couldn't propose a step plan: {e})")
+                break
+            new = [c for c in prop.candidates if isinstance(c, dict) and str(c.get("idea", "")) not in seen]
+            if not new:
+                break
+            cands += new[:k - len(cands)]
+            why.append(prop.rationale)
+            if len(cands) >= k:
+                break
     from .plan_check import in_hand_steps, plan_checker, require_grip
-    check = plan_checker(task, task["conditions"], log) if prop and prop.candidates else None
-    for c in (prop.candidates if prop else []):
+    check = plan_checker(task, task["conditions"], log) if cands else None
+    for c in cands:
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
         ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name, prof)
         terms, t_err = check_terms(c.get("reward_terms"), list(pj.scene.fixtures), pj.scene.object_name)
@@ -2033,9 +2110,9 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         res = try_policy(pj, goal, cdir / "task.json", n=tries, log=lambda s: None)
         fit = _fitness(cdir, res)
         alive.append((fit, i, res))
-        log(f"    -> {res['success']}/{res['n']} tries; {fit[1]} of the evaluation's moments in the goal state")
+        log(f"    -> {res['success']}/{res['n']} tries; {_fit_words(fit)}")
         emit(type="learn_round", stage="candidate", index=i, idea=plan["idea"], success=res["success"], n=res["n"],
-             in_goal=fit[1])
+             in_goal=fit[2], milestones=fit[1])
     if not alive:
         return None
     alive.sort(key=lambda r: (r[0], r[1] == prefer), reverse=True)
@@ -2049,7 +2126,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         if len(keep) > 1 and train(cdir / "task.json", first, cdir / "params.pkl"):
             res = try_policy(pj, goal, cdir / "task.json", n=tries, log=lambda s: None)
             fit = _fitness(cdir, res)
-            log(f"    variant {i + 1} -> {res['success']}/{res['n']} tries; {fit[1]} of the evaluation's moments in the goal state")
+            log(f"    variant {i + 1} -> {res['success']}/{res['n']} tries; {_fit_words(fit)}")
         results.append((fit, i, res))
     fit, best, res = max(results, key=lambda r: (r[0], r[1] == prefer))
     win = main / f"candidate_{best}"
@@ -2061,8 +2138,8 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     task_path.write_text(json.dumps(t, indent=1))
     for i in range(len(plans)):
         shutil.rmtree(main / f"candidate_{i}", ignore_errors=True)
-    chosen = {"index": best, "idea": plans[best]["idea"], "tries": f"{res['success']}/{res['n']}", "in_goal": fit[1],
-              "tried": len(plans), "rationale": prop.rationale if prop else "", "reward_terms": plans[best]["reward_terms"],
+    chosen = {"index": best, "idea": plans[best]["idea"], "tries": f"{res['success']}/{res['n']}", "in_goal": fit[2],
+              "tried": len(plans), "rationale": " / ".join(w for w in why if w)[:1500], "reward_terms": plans[best]["reward_terms"],
               "ppo_tweaks": plans[best]["ppo_tweaks"]}
     log(f"  kept variant {best + 1}: {plans[best]['idea']} ({res['success']}/{res['n']})")
     emit(type="learn_round", stage="chosen", **chosen)

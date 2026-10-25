@@ -143,7 +143,10 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **A warm-up skill first** (as Eureka's pen spinning first learned to turn the pen to any angle): for a hard goal (the
   object starts in the hand, or the goal is about a stretch of time or a turn) Nemotron may propose an easier version
   of the same motion ("turn it a quarter turn without dropping it"). Morph learns that in `warmup/` and starts the real
-  goal from its learned network; if the warm-up isn't learned, the real goal starts from scratch.
+  goal from its learned network; if the warm-up isn't learned, the real goal starts from scratch. In a warm-up, how far
+  something turned or moved counts from the start of the try (a little progress is never taken back after a pause),
+  and breaking a "the whole time" rule (never drop it, never touch X, never tip over) still ends the try but costs
+  less than in the real task, so the robot doesn't learn to do nothing for fear of breaking it.
 * **Plans compared from the start:** before the first round, Nemotron's alternative plans and the current one practise
   briefly side by side and the best goes on, instead of comparing only once progress stalls. Learning also carries on
   past the planned rounds (up to 4 more) while each round still does better than the last.
@@ -189,7 +192,19 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   the goal falls by over half, Nemotron is told which part it is.
 * **A small population when progress stalls** (Population Based Training, DexPBT): Nemotron's different plans, plus the
   current plan exploring more and with calmer updates, each practise briefly; the weaker half is dropped and the rest
-  practise again; the best plan, policy and settings are kept. They take turns on the GPU.
+  practise again; the best plan, policy and settings are kept. They take turns on the GPU. Exploring more is capped
+  at 2x the trainer's own setting, however many times it wins. Nemotron is asked for each plan on its own, told the
+  ideas already being tried, and reads its measurements by Eureka's rules (no progress: a new idea, not a tweak; a part
+  that never changes can't be learned as written; one much bigger than the rest drowns them out).
+* **Moving targets** (as Eureka's pen spinning chased a target 30 degrees ahead): for a goal about how far something
+  turns or travels, practice pays a bonus each time it reaches the next target (30 degrees, 2.5 cm), and the target
+  moves on, so every bit of the motion pays as it happens and holding still never does. Plans and rounds are ranked
+  by the targets reached, so progress shows before any try succeeds.
+* **Plain practice first:** no varied friction, weight, motor strength, noise or delays until the skill first
+  succeeds; then they are turned on, and a skill that is done gets one more round with them before it's finished.
+  A hard goal's learning rate follows how much each update changes the policy (rl_games' adaptive schedule).
+* **A trainer that goes silent** for 20 minutes is stopped and its round started again once (a hung GPU call once froze
+  one for hours); Stop now ends a silent trainer too.
 * **An easier version of the goal first** (automatic curriculum): a goal condition it keeps missing may be missed by
   about as much as it misses it now (spin 180 deg/s may first be 100), practice spreads between that and the real goal,
   and the slack shrinks as it improves and is gone after a real success. Rules (no thumb, keep holding it) are never

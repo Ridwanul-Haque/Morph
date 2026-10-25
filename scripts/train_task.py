@@ -95,6 +95,10 @@ def domain_randomize(env: "TaskLearn", level: str):
 
 
 CRITIC_WINDOW_SLOTS = 4  # the goal's change(...) / mean(...) values the critic sees
+DESIRED_KL = 0.01  # how much one update may change the policy, with task["adaptive_lr"]
+MILESTONE_SLOTS = 2  # ... and how far it is towards the next moving target, and how many it has reached
+MILESTONE_BONUS = 1.0  # paid once for each moving target reached (task["milestones"])
+MILESTONE_PULL = 1.0  # paid as it gets there: in all, this much per target's worth of progress (taken back if it goes back)
 
 
 def task_v2(task: dict) -> bool:
@@ -248,6 +252,12 @@ class TaskLearn(mjx_env.MjxEnv):
         self._windows_seen = bool(self._goal_keys) or bool(task.get("critic_windows"))  # (a warm-up shares the slots)
         if self.n_extra and self._windows_seen:
             self.n_extra += CRITIC_WINDOW_SLOTS
+        # moving targets (learn_task, goal_terms.milestones_for; as Eureka's pen spinning chased a target 30 degrees
+        # ahead): a bonus each time the amount reaches the next one, the target moves on, and a pull towards it
+        self.milestones = [(parse(m["of"], self.fx), float(m["every"])) for m in task.get("milestones", [])]
+        self._ms_every = jp.array([e for _, e in self.milestones]) if self.milestones else None
+        self._ms_slots = MILESTONE_SLOTS if self.n_extra and task.get("critic_milestones") else 0
+        self.n_extra += self._ms_slots
         self._obj_geom = int(np.flatnonzero(np.asarray(self._mj_model.geom_bodyid) == self.ix.block)[0])
         self._mass0 = float(self._mj_model.body_mass[self.ix.block])
         self._fric0 = float(self._mj_model.geom_friction[self._obj_geom, 0])
@@ -361,6 +371,15 @@ class TaskLearn(mjx_env.MjxEnv):
         tv = jp.where(jp.isnan(tv), 0.0, tv)
         return TERM_SCALE * jp.array([wt for _, wt in self.terms]) * tv, tv
 
+    def _milestones(self, data, win, reached):
+        """(moving targets reached, progress towards each: reached + the share of the way to the next). At most one
+        target a tick per amount, so a measure that jumps (an angle read near where it is undefined) can't pay out many."""
+        v = self._measure(data, win)
+        q = jp.stack([term_value(jp, t, v) for t, _ in self.milestones]) / self._ms_every
+        q = jp.where(jp.isnan(q), 0.0, q)
+        reached = reached + (q >= reached + 1.0).astype(jp.float32)
+        return reached, reached + jp.clip(q - reached, 0.0, 1.0)
+
     def reset(self, rng):
         rng, k1, k2, k3 = jax.random.split(rng, 4)
         q = self._q_init
@@ -407,11 +426,13 @@ class TaskLearn(mjx_env.MjxEnv):
             info["win"] = win
         info["phi"] = self._steps(data, info["step"], info["streak"], win)[1]
         info["tphi"] = self._term_phi(data, win)[0]
+        if self.milestones:
+            info["ms"], info["ms_phi"] = self._milestones(data, win, jp.zeros(len(self.milestones)))
         if self.stop_rules:
             info["armed"] = ~self._broken(data, u, win)
             info["broke"] = jp.zeros(len(self.stop_rules), jp.int32)
         metrics = {k: jp.zeros(()) for k in ("progress", "close", "reach", "grasp_aim", "success", "dist", "steps_done",
-                                             "ended_early")}
+                                             "ended_early", "milestones")}
         metrics |= {f"term_{k}": jp.zeros(()) for k in range(len(self.terms))}
         metrics |= {f"termw_{k}": jp.zeros(()) for k in range(len(self.terms))}
         metrics |= {f"part_{k}": jp.zeros(()) for k in self.parts}
@@ -437,7 +458,18 @@ class TaskLearn(mjx_env.MjxEnv):
                          v["closure"], jp.asarray(v["held"], jp.float32), info["step"].astype(jp.float32) / n,
                          info["t"].astype(jp.float32) * CTRL_DT / self.task["episode_s"],
                          m.body_mass[self.ix.block] / self._mass0, m.geom_friction[self._obj_geom, 0] / self._fric0]
-                        + ([info["ease_u"]] if task_v2(self.task) else []) + self._window_extras(info))
+                        + ([info["ease_u"]] if task_v2(self.task) else []) + self._window_extras(info)
+                        + self._milestone_extras(info))
+
+    def _milestone_extras(self, info) -> list:
+        """Per moving target (padded to MILESTONE_SLOTS): the share of the way to the next, and how many reached (/10)."""
+        if not self._ms_slots:
+            return []
+        out = []
+        if self.milestones:
+            for k in range(min(len(self.milestones), self._ms_slots // 2)):
+                out += [info["ms_phi"][k] - info["ms"][k], info["ms"][k] / 10.0]
+        return out + [jp.zeros(())] * (self._ms_slots - len(out))
 
     def _window_extras(self, info) -> list:
         """The goal's values over time so far (turns in whole turns), padded to CRITIC_WINDOW_SLOTS."""
@@ -537,9 +569,10 @@ class TaskLearn(mjx_env.MjxEnv):
             info["broke"] = jp.where(self._broken(data, info["ease_u"], win), info["broke"] + 1, 0).astype(jp.int32)
             ended = jp.any(info["armed"] & (info["broke"] >= FLICKER_TICKS)).astype(jp.float32)
             # what the rest of the try could have earned is lost, so ending it never pays (otherwise a try whose
-            # reward runs negative would learn to break a rule on purpose to stop early)
+            # reward runs negative would learn to break a rule on purpose to stop early). A warm-up asks for less
+            # (end_cost): a robot that fears breaking a rule can learn to do nothing at all
             left = jp.maximum(self.task["episode_s"] - (info["t"] + 1) * self.dt, 0.0)
-            end_pen = ended * 3.0 * left
+            end_pen = ended * self.task.get("end_cost", 3.0) * left
             done = jp.maximum(done, ended)
         tvals, tpaid = [], []
         if self.terms:  # Nemotron's terms (each clipped: one term can't swamp the rest), as potentials; a try that
@@ -551,10 +584,18 @@ class TaskLearn(mjx_env.MjxEnv):
             shaped_terms = jp.sum(paid)
         else:
             shaped_terms = jp.zeros(())
+        ms_hits, ms_paid = jp.zeros(()), jp.zeros(())
+        if self.milestones:  # a plain difference, not discounted: progress kept is never drained, and the try ending
+            # takes nothing back (a hand that fears losing all it earned learns to keep still)
+            reached, phi = self._milestones(data, win, info["ms"])
+            ms_hits = jp.sum(reached - info["ms"])
+            ms_paid = MILESTONE_BONUS * ms_hits + MILESTONE_PULL * jp.sum(phi - info["ms_phi"])
+            info["ms"], info["ms_phi"] = reached, phi
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
         state.metrics.update(progress=z(progress), close=z(close), reach=z(reach), grasp_aim=z(aim_ok), ended_early=ended,
+                             milestones=z(ms_hits),
                              success=ok.astype(jp.float32), dist=z(d),
                              steps_done=info["step"].astype(jp.float32), **{f"term_{k}": z(tv) for k, tv in enumerate(tvals)},
                              # what each part paid this tick (summed over a run: its total), the step bonus included
@@ -564,8 +605,8 @@ class TaskLearn(mjx_env.MjxEnv):
         # a copy whose physics blew up (NaN) ends now and counts for nothing, as in MuJoCo Playground's own
         # environments; otherwise one bad copy turns the whole batch's numbers into NaN
         bad = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(r) | jp.isnan(shaped) | \
-            jp.isnan(shaped_terms)
-        reward = jp.where(bad, 0.0, r * self.dt + shaped + shaped_terms - end_pen)
+            jp.isnan(shaped_terms) | jp.isnan(ms_paid)
+        reward = jp.where(bad, 0.0, r * self.dt + shaped + shaped_terms + ms_paid - end_pen)
         done = jp.where(bad, 1.0, done)
         obs = jax.tree_util.tree_map(lambda o: jp.where(jp.isnan(o), 0.0, o), obs)
         return state.replace(data=data, obs=obs, reward=reward, done=done)
@@ -683,6 +724,10 @@ def main():
     task = load_task(task_path)
     task["_dir"] = str(task_path.parent)
     out = task_path.parent
+    if task.get("plain_practice") and a.randomize != "off":  # learn it first in one plain world, then make it robust
+        # (learn_task turns the variation on once it succeeds; Eureka's pen spinning practised with none at all)
+        print(json.dumps({"randomize": "off", "asked": a.randomize, "why": "plain practice until it succeeds"}), flush=True)
+        a.randomize = "off"
     # the evaluation always starts from the scene's start: the numbers are the real task, not the practice starts
     env, eval_env = TaskLearn(task, a.envs, a.randomize), TaskLearn(task, 128, a.randomize, practice_starts=False,
                                                                         eased=False)
@@ -719,7 +764,9 @@ def main():
                # summed over the episode, so the running count's mean is a lower bound)
                "steps_done": float(metrics.get("eval/episode_steps_done", 0.0)) / p.episode_length,
                # the share of evaluation tries that ended early because a "the whole time" condition broke
-               "ended_early": float(metrics.get("eval/episode_ended_early", 0.0))}
+               "ended_early": float(metrics.get("eval/episode_ended_early", 0.0)),
+               # moving targets reached in a try (task["milestones"]): progress even when it never gets all the way
+               "milestones": float(metrics.get("eval/episode_milestones", 0.0))}
         if env.terms:  # each of Nemotron's reward terms: its average value per control step in the evaluation
             rec["terms"] = [round(float(metrics.get(f"eval/episode_term_{k}", 0.0)) / p.episode_length, 4)
                             for k in range(len(env.terms))]
@@ -780,6 +827,13 @@ def main():
         kw["learning_rate"] = kw.get("learning_rate", 3e-4) * float(tw.get("lr", 1.0))
         print(json.dumps({"ppo_tweaks": tw, "entropy_cost": kw["entropy_cost"], "learning_rate": kw["learning_rate"]}),
               flush=True)
+    if task.get("adaptive_lr") and not task.get("demo"):  # (copying a demonstration has its own loss and settings)
+        # the learning rate follows how much each update changes the policy (rl_games' adaptive schedule, which
+        # Eureka's pen spinning trained with): slower when an update changes it a lot, faster when it barely moves.
+        # Calmer updates (ppo_tweaks lr < 1) also ask for smaller changes
+        lr = kw.get("learning_rate", 3e-4)
+        kw.update(learning_rate_schedule="ADAPTIVE_KL", desired_kl=DESIRED_KL * min(float(tw.get("lr", 1.0)), 1.0),
+                  learning_rate_schedule_min_lr=lr / 30, learning_rate_schedule_max_lr=lr * 3)
     if a.restore and Path(a.restore).exists():  # a later round: continue from where the last one got to
         restore = pickle.loads(Path(a.restore).read_bytes())
         print(json.dumps({"restored": a.restore}), flush=True)
@@ -811,11 +865,13 @@ def main():
 
 
 def _score(rec) -> tuple:
-    """How good an evaluation was: time spent in the goal, then steps got through, then closeness."""
+    """How good an evaluation was: time spent in the goal, then moving targets reached, then steps got through, then
+    closeness."""
     if not rec:
-        return (-1.0, -1.0, -1e9)
+        return (-1.0, -1.0, -1.0, -1e9)
     nan0 = lambda x, bad: bad if x != x else x  # noqa: E731
-    return (nan0(rec["success"], 0.0), nan0(rec.get("steps_done", 0.0), 0.0), -nan0(rec["dist"], 1e9))
+    return (nan0(rec["success"], 0.0), round(nan0(rec.get("milestones", 0.0), 0.0), 1),
+            nan0(rec.get("steps_done", 0.0), 0.0), -nan0(rec["dist"], 1e9))
 
 
 if __name__ == "__main__":

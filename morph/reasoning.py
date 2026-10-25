@@ -152,6 +152,15 @@ REWARD_TERMS_DOC = (
 )
 
 
+# Eureka's reward reflection (its code_feedback prompt), for the measured reward parts and terms
+REFLECT_DOC = (
+    "Read the measurements of each reward part and term first, by these rules: (1) if it never succeeds and its "
+    "progress is near zero, don't tweak the plan: rewrite it around a different idea; (2) a part or term whose value "
+    "barely changes through practice is one the learner can't improve as written: change its size, rewrite it, or "
+    "drop it; (3) a part much bigger than the rest drowns them out: scale it down. "
+)
+
+
 class SkillStepsProposal(BaseModel):
     steps: list[dict] = Field(default_factory=list, max_length=8)
     reward_terms: list[dict] = Field(default_factory=list, max_length=6)  # Eureka-style shaping (revisions only)
@@ -588,7 +597,7 @@ class ReasoningService:
             "speed, vx, vy, vz, travelled, start_x, start_y, held, grip, closure, touch_dist, lifted, dist_to('fixture'), "
             "robot_x, robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z" + MORE_NAMES_DOC + "; "
             + FUNCS_DOC + "; Python syntax (and, or, not). 2 to 6 steps; the goal checklist is checked after them. "
-            + REWARD_TERMS_DOC + reward_parts_doc() +
+            + REWARD_TERMS_DOC + reward_parts_doc() + REFLECT_DOC +
             "Reply with ONLY one JSON object: {\"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", "
             "\"done_when\", \"keep\"}], \"reward_terms\": [...] (optional), \"reward_weights\": {...} (optional), "
             "\"rationale\": what you changed and why, from the measurements}."
@@ -623,11 +632,14 @@ class ReasoningService:
         return self._chat("revise_steps", system, user, SkillStepsProposal)
 
     def step_candidates(self, robot: dict, goal: list[str], steps: list[dict], diagnosis: dict, scales: dict,
-                        rounds: list[dict], k: int = 3, fix: dict | None = None) -> tuple[StepCandidates, InferenceRecord]:
-        """Several different revisions at once (Eureka-style search): Morph trains each briefly and keeps the best."""
+                        rounds: list[dict], k: int = 3, fix: dict | None = None,
+                        others: list[str] = ()) -> tuple[StepCandidates, InferenceRecord]:
+        """Different revisions (Eureka-style search): Morph trains each briefly and keeps the best. others: the ideas
+        already proposed in earlier calls (Morph asks for one at a time, as Eureka samples each reward on its own)."""
         system = (
-            f"You coach a robot that is learning a task by trial and error in simulation. Propose {k} DIFFERENT revised "
-            "step plans, each built on a different idea about why it is stuck (e.g. a smaller first step, a different "
+            f"You coach a robot that is learning a task by trial and error in simulation. Propose {k} revised step "
+            f"plan{'s' if k > 1 else ''}, each built on a different idea about why it is stuck, and on none of the "
+            "ideas_already_being_tried (if given) (e.g. a smaller first step, a different "
             "approach direction, a graded intermediate condition, loosening a threshold it never reaches, a different "
             "body part). Morph will train each briefly and keep whichever works best, so make them genuinely "
             "different rather than small variations. Rules for every plan are the same as for a single revision: "
@@ -636,7 +648,7 @@ class ReasoningService:
             "robot_y, base_z, base_tilt_deg, hand_dist, hand_x, hand_y, hand_z" + MORE_NAMES_DOC + "; " + FUNCS_DOC
             + "; Python syntax." + GOAL_CONDITIONS_DOC + "grip is about 0.25 with the open hand around it, 0.6 closed on it, 1 held and lifted; closure is "
             "how far the gripper is commanded shut. " + REWARD_TERMS_DOC + "A candidate can differ in its steps, its "
-            "reward_terms, or both. Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
+            "reward_terms, or both. " + REFLECT_DOC + "Reply with ONLY one JSON object: {\"candidates\": [{\"idea\": one "
             "sentence, \"steps\": [{\"name\", \"how\", \"why\", \"body_parts\", \"done_when\", \"keep\"}], "
             "\"reward_terms\": [...] (optional)}], \"rationale\": what the measurements suggest}."
         )
@@ -645,6 +657,8 @@ class ReasoningService:
                                                                   for r in rounds[:-1]]}
         if fix:
             payload["fix_these"] = fix
+        if others:
+            payload["ideas_already_being_tried"] = list(others)
         return self._chat("step_candidates", system, json.dumps(payload, separators=(",", ":"), default=str), StepCandidates)
 
     def warm_up_goal(self, robot: dict, goal: list[dict], start: str) -> tuple[WarmUpProposal, InferenceRecord]:
@@ -659,7 +673,13 @@ class ReasoningService:
             "it fast, moving it a little before moving it far), keeps every 'the whole time' rule of the goal that "
             "can still hold (never drop it, never touch with the thumb), and is something the robot's body (robot."
             "finger_joints, robot.has_no) can plausibly do. It must not be a different skill whose learned motion "
-            "would have to be unlearned. needed=false when the goal is already one short, simple movement. "
+            "would have to be unlearned. The learner earns points for every bit closer a condition gets, the moment "
+            "it happens; holding still earns nothing but loses nothing. So the warm-up must pay for each small bit of "
+            "the right motion and never take it back: count a turn or a distance as a running total since the try "
+            "began (change(yaw_deg), with no seconds, when 'end'), not over the last few seconds (a short turn then "
+            "a pause would lose what it earned), and leave out speed thresholds (spin_dps > 30 pays nothing until it "
+            "is reached, and rewards a jerk). E.g. for spinning: in_hand == 1 'always' and abs(change(yaw_deg)) >= 90 "
+            "'end'. needed=false when the goal is already one short, simple movement. "
             "Each condition is {\"kind\": \"expression\", \"expr\": formula, \"when\": \"end\"|\"always\"|\"ever\"|"
             "\"last\", \"seconds\": N (for last), \"text\": plain words}; formulas are over: x, y, z, bottom, top, "
             "tilt_deg, yaw_deg, speed, vx, vy, vz, travelled, held, in_hand, spin_dps, spin_z_dps, fingers_touching, "

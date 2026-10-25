@@ -51,3 +51,42 @@ def test_which_goals_get_a_warm_up():
     assert _hard({"start_state": {"qpos": [0]}, "conditions": []})
     assert _hard({"conditions": [{"expr": "abs(change(yaw_deg, 4)) >= 720", "when": "end"}]})
     assert not _hard({"conditions": [{"kind": "inside", "when": "end"}]})
+
+
+def test_a_warm_up_turn_counts_since_the_try_began():
+    from morph.learn_task import since_start
+    assert since_start("abs(change(yaw_deg, 2)) >= 180 and spin_z_dps * change(yaw_deg, 2) > 0") == \
+        "abs(change(yaw_deg)) >= 180 and spin_z_dps * change(yaw_deg) > 0"
+    assert since_start("mean(in_hand, 2) > 0.9") == "mean(in_hand, 2) > 0.9"
+
+
+def test_exploring_more_stops_at_a_limit():
+    from morph.learn_task import EXPLORE, _nudge
+    more = dict(EXPLORE)["the current steps, exploring more"]
+    assert _nudge({}, more) == {"entropy": 2.0}
+    assert _nudge({"entropy": 2.0}, more) == {"entropy": 2.0}  # it compounded to 9 once
+    assert _nudge({"entropy": 9.0}, {"entropy": 0.5}) == {"entropy": 2.0}
+
+
+def test_moving_targets_follow_how_the_goal_counts_it():
+    from morph.goal_terms import milestones_for
+
+    def ms(expr):
+        return milestones_for({"conditions": [{"kind": "expression", "expr": expr}]})
+    assert ms("abs(spin_z_dps) > 180 and abs(change(yaw_deg, 4)) >= 720") == [{"of": "abs(change(yaw_deg))", "every": 30.0}]
+    assert ms("change(x, 2) < -0.2") == [{"of": "-change(x)", "every": 0.025}]  # one way only: backwards
+    assert ms("travelled >= 1.0") == [{"of": "travelled", "every": 0.025}]
+    assert ms("abs(change(yaw_deg)) >= 40") == [{"of": "abs(change(yaw_deg))", "every": 20.0}]  # at least two
+    assert ms("in_hand == 1") == [] and ms("change(spin_dps) > 9") == [] and ms("change(x) < 0.3") == []
+
+
+def test_practice_is_plain_until_it_succeeds(tmp_path):
+    import json
+    from morph.learn_task import _vary_now, practice_aids
+    task = {"conditions": [{"kind": "expression", "expr": "abs(change(yaw_deg, 4)) >= 720", "when": "last", "seconds": 4}]}
+    practice_aids(task, log=lambda s: None)
+    assert task["plain_practice"] and task["adaptive_lr"] and task["critic_milestones"] and task["milestones"]
+    p = tmp_path / "task.json"
+    p.write_text(json.dumps(task))
+    assert _vary_now(p, log=lambda s: None) and not json.loads(p.read_text())["plain_practice"]
+    assert not _vary_now(p, log=lambda s: None)  # only once
