@@ -172,6 +172,9 @@ def validate(goal: GoalSpec, scene: UserScene) -> list[str]:
                 parse(c.expr or "", list(scene.fixtures))
             except ExprError as e:
                 errs.append(f"the goal formula {c.expr!r}: {e}")
+            else:
+                from .goal_terms import never_holds
+                errs += [f"the goal formula {c.expr!r}: {m}" for m in never_holds(c.expr or "", list(scene.fixtures))]
     ends_at = {c.target for c in goal.conditions if c.kind in ("on_top_of", "inside", "touching", "near", "beside")
                and not c.negate and c.when == "end"}
     for c in goal.conditions:

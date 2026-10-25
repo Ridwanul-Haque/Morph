@@ -140,6 +140,16 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **Easy-first practice** (reverse curriculum): early rounds start from moments late in the program (already holding
   it, nearly there) and each round moves the starts back. If it's stuck at the same step twice, most practice starts
   where it got closest on that step.
+* **A warm-up skill first** (as Eureka's pen spinning first learned to turn the pen to any angle): for a hard goal (the
+  object starts in the hand, or the goal is about a stretch of time or a turn) Nemotron may propose an easier version
+  of the same motion ("turn it a quarter turn without dropping it"). Morph learns that in `warmup/` and starts the real
+  goal from its learned network; if the warm-up isn't learned, the real goal starts from scratch.
+* **Plans compared from the start:** before the first round, Nemotron's alternative plans and the current one practise
+  briefly side by side and the best goes on, instead of comparing only once progress stalls. Learning also carries on
+  past the planned rounds (up to 4 more) while each round still does better than the last.
+* **Plans that fit the body:** Nemotron is told what each finger's joints do and which parts the robot doesn't have; a
+  step that relies on a missing part ("rotate the wrist" on a hand fixed in place), or a rule that can never hold
+  ("heading at least 360°"), is sent back. A hand holding the object from the start also feels which fingers touch it.
 * **The steps a person would take** (Nemotron, per body: which parts, in what order) are the reward: progress
   towards the current step, and a step only counts after it has held for 0.2 s.
 * **Eureka-style revision:** after each round Morph replays the policy, measures where it gets stuck and what it

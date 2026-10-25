@@ -70,11 +70,80 @@ def robot_brief(prof) -> dict:
         parts.append(f"{prof.n_legs} legs (feet can push)")
     if prof.base in ("planar_mobile", "wheeled"):
         parts.append("a driving base")
+    fingers = finger_joints(prof)
+    if fingers:
+        parts.append(f"{len(fingers)} fingers ({', '.join(fingers)})")
+    if prof.base == "fixed" and not prof.n_arms and not prof.n_legs:
+        parts.append("fixed in place, with no arm or wrist: it can't move or turn as a whole, only the joints listed move")
     reach = max((v["max_horizontal"] for v in prof.reach_m.values()), default=0.0)
-    return {"name": prof.name, "kind": prof.kind.replace("_", " "), "base": prof.base, "body_parts": parts,
-            "degrees_of_freedom": prof.dof, "height_m": round(prof.size_m.get("height", 0), 2),
-            "arm_reach_m": round(reach, 2), "mass_kg": round(prof.mass_kg, 1),
-            "stands_on_the_floor": prof.base == "floating" and prof.n_legs > 0}
+    out = {"name": prof.name, "kind": prof.kind.replace("_", " "), "base": prof.base, "body_parts": parts,
+           "degrees_of_freedom": prof.dof, "height_m": round(prof.size_m.get("height", 0), 2),
+           "arm_reach_m": round(reach, 2), "mass_kg": round(prof.mass_kg, 1),
+           "stands_on_the_floor": prof.base == "floating" and prof.n_legs > 0}
+    if fingers:  # what each finger can do: a plan for a hand is all in these
+        out["finger_joints"] = fingers
+    lacks = sorted(w for w in PART_WORDS if not has_part(prof, w))
+    if lacks:
+        out["has_no"] = lacks
+    return out
+
+
+# body parts a plan may name, and whether a robot has one (its profile, or a part of that name in its model)
+PART_WORDS = ("wrist", "elbow", "shoulder", "arm", "leg", "foot", "wheel", "thumb", "index", "middle", "ring", "little",
+              "palm")
+
+
+def finger_joints(prof) -> dict[str, list[str]]:
+    """Per finger, its motors and what each does, in plain words: {"index": ["index_mcp_roll: swings sideways 0-15°",
+    ...]}."""
+    from .goal_sources import finger_labels
+    out: dict[str, list[str]] = {}
+    tips = [c.get("leaf", "") for c in prof.chains if c.get("role") == "finger"]
+    for tip in tips:
+        lab = finger_labels([w for w in ("thumb", "index", "middle", "ring", "pinky", "little") if w in tip.lower()])
+        if lab:
+            out.setdefault(lab[0], [])
+    for a in prof.actuators:
+        name = str(a.get("target") or a.get("name") or "")
+        lab = finger_labels([w for w in ("thumb", "index", "middle", "ring", "pinky", "little") if w in name.lower()])
+        if not lab or lab[0] not in out:
+            continue
+        lo, hi = (a.get("ctrlrange") or [0.0, 0.0])[:2]
+        side = any(w in name.lower() for w in ("roll", "abd", "yaw", "spread", "side"))
+        out[lab[0]].append(f"{name}: {'swings sideways' if side else 'bends'} {math.degrees(lo):.0f} to "
+                           f"{math.degrees(hi):.0f}°")
+    return out
+
+
+def has_part(prof, word: str) -> bool:
+    names = " ".join([*(a.get("target") or a.get("name") or "" for a in prof.actuators),
+                      *(b for c in prof.chains for b in c.get("bodies", []))]).lower()
+    fingers = finger_joints(prof)
+    if word in ("thumb", "index", "middle", "ring", "little"):
+        return word in fingers or (word == "little" and "pinky" in names) or word in names
+    if word == "palm":
+        return len(fingers) >= 2 or "palm" in names or prof.n_arms > 0
+    if word in ("wrist", "elbow", "shoulder", "arm"):
+        return prof.n_arms > 0 or word in names
+    if word in ("leg", "foot"):
+        return prof.n_legs > 0 or word in names
+    if word == "wheel":
+        return prof.base in ("planar_mobile", "wheeled") or "wheel" in names
+    return True
+
+
+def parts_it_lacks(step: "Step", prof) -> list[str]:
+    """Body parts a step relies on that this robot doesn't have ("rotate the wrist" for a hand fixed in place)."""
+    import re
+    text = " ".join([step.name, step.how, *step.body_parts]).lower()
+    out = []
+    for w in PART_WORDS:
+        pat = {"foot": r"foot|feet", "little": r"little finger|pinky", "arm": r"arm(?!\w)", "index": r"index finger",
+               "middle": r"middle finger", "ring": r"ring finger"}.get(w, w)
+        if re.search(rf"(?<!no )(?<!without )(?<!not )(?<!without the )(?<!without its )\b(?:{pat})s?\b", text) \
+                and not has_part(prof, w):
+            out.append(w)
+    return out
 
 
 MAX_TERMS = 4
@@ -102,9 +171,9 @@ def check_terms(raw, fixtures, object_name: str = "") -> tuple[list[dict], list[
     return out, errors
 
 
-def check_steps(steps: list[Step], fixtures, object_name: str = "") -> tuple[list[Step], list[str]]:
-    """The steps with their formulas in Morph's form, and the problems with any it can't measure."""
-    from .goal_terms import normalize
+def check_steps(steps: list[Step], fixtures, object_name: str = "", prof=None) -> tuple[list[Step], list[str]]:
+    """The steps with their formulas in Morph's form, and the problems with any it can't measure or never be done."""
+    from .goal_terms import never_holds, normalize
     ok, errors = [], []
     for s in steps:
         if s.done_when.strip().lower() == GOAL:
@@ -115,6 +184,17 @@ def check_steps(steps: list[Step], fixtures, object_name: str = "") -> tuple[lis
                 parse(s.keep, fixtures, object_name)
         except ExprError as e:
             errors.append(f"step '{s.name}': {e}")
+            continue
+        never = never_holds(normalize(s.done_when, object_name), fixtures) + \
+            (never_holds(normalize(s.keep, object_name), fixtures) if s.keep else [])
+        if never:  # a step that can't be done stalls every try there
+            errors.append(f"step '{s.name}': " + "; ".join(never))
+            continue
+        lacks = parts_it_lacks(s, prof) if prof is not None else []
+        if lacks:  # a plan for a body it doesn't have ("rotate the wrist" on a hand fixed in place)
+            has = [w for w in PART_WORDS if has_part(prof, w)]
+            errors.append(f"step '{s.name}' uses the {' and '.join(lacks)}, which this robot doesn't have (it has: "
+                          f"{', '.join(has) or 'none of the usual parts'}; see finger_joints for what each finger can do)")
             continue
         ok.append(s.model_copy(update={"done_when": normalize(s.done_when, object_name).strip(),
                                        "keep": normalize(s.keep, object_name).strip() if s.keep else ""}))
@@ -276,7 +356,7 @@ def plan_steps(prof, goal, scene, p: dict, llm=None, log=print, check=None) -> t
                                                + ([goal.start_text()] if goal.start_text() else []), scene.geometry(),
                                             scales(scene, p), fix, body=_body_facts(prof) if body else None)
                 raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
-                cand, errors = check_steps(raw, fixtures, obj)
+                cand, errors = check_steps(raw, fixtures, obj, prof)
                 if body:
                     errors += object_steps(cand)
                 found = check([c.model_dump() for c in cand]) if check and cand and not errors else []
@@ -297,7 +377,7 @@ def plan_steps(prof, goal, scene, p: dict, llm=None, log=print, check=None) -> t
             info["notes"].append(f"Nemotron couldn't plan the steps ({e}); using Morph's own")
     if steps is None:
         # Morph's own: for a goal about the robot's body, no object steps (the goal itself is the one step)
-        steps, errors = check_steps([] if body else rule_steps(prof, goal, scene, p), fixtures, obj)
+        steps, errors = check_steps([] if body else rule_steps(prof, goal, scene, p), fixtures, obj, prof)
         info["notes"] += errors
     for n in info["notes"]:
         log(f"  ({n})")

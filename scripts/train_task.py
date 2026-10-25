@@ -37,8 +37,9 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.goal_terms import (BODY_FUNCS, FLICKER_TICKS, HOLD_TICKS, Windows, condition_violation,  # noqa: E402
-                              formula_trees, is_generic, is_temporal, normalize, parse, term_value, uses, violation)
+from morph.goal_terms import (BODY_FUNCS, FLICKER_TICKS, HOLD_TICKS, TURN_UNIT, Windows, _is_angle,  # noqa: E402
+                              condition_violation, formula_trees, is_generic, is_temporal, normalize, parse, term_value,
+                              uses, violation)
 from morph.reward_parts import weights as reward_weights  # noqa: E402
 from morph.task_model import (CTRL_DT, SIM_DT, Residual, apply_action, build_task_model, indices, load_task, measure,  # noqa: E402
                               next_ctrl,  # noqa: E402
@@ -91,6 +92,13 @@ def domain_randomize(env: "TaskLearn", level: str):
         return model.tree_replace(dict(zip(names, (fr, mass, inertia, gain, bias, force)))), in_axes
 
     return fn
+
+
+CRITIC_WINDOW_SLOTS = 4  # the goal's change(...) / mean(...) values the critic sees
+
+
+def task_v2(task: dict) -> bool:
+    return task.get("critic_extras") == 2
 
 
 class TaskLearn(mjx_env.MjxEnv):
@@ -229,6 +237,17 @@ class TaskLearn(mjx_env.MjxEnv):
         # grips, how far through the steps it is, this copy's true parcel weight and friction); the policy is unchanged
         # (version 2 also tells the critic how eased this try's goal is)
         self.n_extra = {True: 9, 1: 9, 2: 10}.get(task.get("critic_extras"), 0)
+        # ... and how the goal's change(...) / mean(...) stand so far: a reward about the last 4 s can't be foreseen from
+        # this moment alone. A fixed number of slots, from the goal only (it doesn't change between rounds, the plan
+        # does), so a round can continue from the last one's critic
+        goal_trees = [parse(c["expr"], self.fx) for c in task["conditions"] if c.get("kind") == "expression" and c.get("expr")]
+        self.goal_windows = Windows(goal_trees)
+        self._goal_keys = [k for k, _ in self.goal_windows.calls][:CRITIC_WINDOW_SLOTS]
+        self._goal_scale = [1.0 / TURN_UNIT if c.func.id == "change" and _is_angle(c.args[0]) else 1.0
+                            for _, c in self.goal_windows.calls][:CRITIC_WINDOW_SLOTS]
+        self._windows_seen = bool(self._goal_keys) or bool(task.get("critic_windows"))  # (a warm-up shares the slots)
+        if self.n_extra and self._windows_seen:
+            self.n_extra += CRITIC_WINDOW_SLOTS
         self._obj_geom = int(np.flatnonzero(np.asarray(self._mj_model.geom_bodyid) == self.ix.block)[0])
         self._mass0 = float(self._mj_model.body_mass[self.ix.block])
         self._fric0 = float(self._mj_model.geom_friction[self._obj_geom, 0])
@@ -418,7 +437,15 @@ class TaskLearn(mjx_env.MjxEnv):
                          v["closure"], jp.asarray(v["held"], jp.float32), info["step"].astype(jp.float32) / n,
                          info["t"].astype(jp.float32) * CTRL_DT / self.task["episode_s"],
                          m.body_mass[self.ix.block] / self._mass0, m.geom_friction[self._obj_geom, 0] / self._fric0]
-                        + ([info["ease_u"]] if self.n_extra > 9 else []))
+                        + ([info["ease_u"]] if task_v2(self.task) else []) + self._window_extras(info))
+
+    def _window_extras(self, info) -> list:
+        """The goal's values over time so far (turns in whole turns), padded to CRITIC_WINDOW_SLOTS."""
+        if not (self.n_extra and self._windows_seen):
+            return []
+        vals = self.over_time.values(jp, info["win"]) if self._goal_keys else {}
+        out = [jp.clip(vals[k] * sc, -10.0, 10.0) for k, sc in zip(self._goal_keys, self._goal_scale)]
+        return out + [jp.zeros(())] * (CRITIC_WINDOW_SLOTS - len(out))
 
     def _demo_reward(self, obs, action):
         """How much this action looks like the demonstration's, in the most similar situation it went through

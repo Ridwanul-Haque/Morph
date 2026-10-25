@@ -161,7 +161,8 @@ def make_task(pj: Project, goal: GoalSpec, robot_path: str, llm=None, log=print,
 def senses_for(task: dict) -> list[str]:
     """What the policy needs to sense beyond its joints, the object's pose and its end parts, from what the goal and the
     plan read: how fast the object turns, if they're about spin; which fingers touch it, if they're about touch and
-    the robot has fingers. The judge measures these; a policy that can't sense them can only guess at them."""
+    the robot has fingers, or the object starts in the hand. The judge measures these; a policy that can't sense them
+    can only guess at them."""
     from .goal_terms import uses
     from .fingers import hands
     exprs = [c.get("expr") or "" for c in task.get("conditions", [])]
@@ -172,10 +173,13 @@ def senses_for(task: dict) -> list[str]:
             names |= uses(e)
         except SyntaxError:
             pass
-    if names & {"spin_dps", "spin_z_dps"}:
+    turns = any(re.search(r"\bchange\(\s*(yaw|roll|pitch)_deg", e) for e in exprs)  # how far it turns: made of spin
+    if names & {"spin_dps", "spin_z_dps"} or turns:
         out.append("spin")
-    if (names & {"fingers_touching"} or any("touching(" in e for e in exprs)) and \
-            hands(mujoco.MjModel.from_xml_path(task["robot_xml"])):
+    # in the hand, which finger is on it is most of the skill (rolling a pen is which finger pushes when), so a hand
+    # feels it whenever the object starts there, not only when the goal names a finger
+    if (names & {"fingers_touching", "in_hand"} or any("touching(" in e for e in exprs) or task.get("start_state")) \
+            and hands(mujoco.MjModel.from_xml_path(task["robot_xml"])):
         out.append("touch")
     return out
 
@@ -1089,7 +1093,7 @@ def revise_task_steps(task_path: Path, llm, diagnosis: dict, goal: GoalSpec, sce
         prop, rec = llm.revise_steps(robot_brief(prof), [c.describe() for c in goal.conditions], task.get("steps", []),
                                      diagnosis, scales(scene, p), rounds, fix, advice=advice, ratings=ratings)
         raw = [Step(**s) for s in prop.steps if isinstance(s, dict) and s.get("done_when")]
-        new, errors = check_steps(raw, list(scene.fixtures), scene.object_name)
+        new, errors = check_steps(raw, list(scene.fixtures), scene.object_name, prof)
         terms, t_err = check_terms(prop.reward_terms, list(scene.fixtures), scene.object_name)
         if attempt == 0:  # asked once to fix them; after that the plan is kept without the terms Morph can't measure
             errors += t_err
@@ -1143,9 +1147,101 @@ def learn_in_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=Non
     return res
 
 
+EXTRA_ROUNDS = 4  # rounds past the planned ones while each still does better than the last
+WARM_UP_ROUNDS = 2  # practice rounds for a warm-up skill before the real one
+
+
+def _hard(task: dict) -> bool:
+    """A goal worth a warm-up: the object starts in the hand, or a condition is about a stretch of time or a turn."""
+    if task.get("start_state"):
+        return True
+    for c in task.get("conditions", []):
+        e = c.get("expr") or ""
+        if c.get("when") == "last" or "change(" in e or "spin_" in e:
+            return True
+    return False
+
+
+def warm_up(pj: Project, goal: GoalSpec, task_path: Path, train, llm, log=print, emit=None, steps: int = 30_000_000,
+            tries: int = 10) -> dict | None:
+    """Learn an easier skill first and start the real one from it (a curriculum, as Eureka's pen spinning first
+    learned to turn the pen to any angle). Nemotron decides whether the goal needs one and writes its checklist; it is
+    learned like any skill, in warmup/, with the real task's senses and critic so the learned network fits the real
+    task. Returns {"idea", "success", "n"} when the real task starts from it (its params.pkl copied over), else None."""
+    from .goals import Condition, validate
+    from .introspect import profile_robot
+    from .skill_steps import robot_brief
+    emit = emit or (lambda **e: None)
+    task = load_task(task_path)
+    if not _hard(task) or llm is None or not getattr(llm, "available", False) or task.get("demo"):
+        return None
+    try:
+        prop, _ = llm.warm_up_goal(robot_brief(profile_robot(task["robot_xml"])),
+                                   [{"kind": c.kind, "expr": c.expr, "when": c.when, "seconds": c.seconds,
+                                     "text": c.describe()} for c in goal.conditions], goal.start_text() or "where the scene puts it")
+    except Exception as e:  # noqa: BLE001
+        log(f"  (no warm-up: Nemotron couldn't propose one: {e})")
+        return None
+    if not prop.needed or not prop.conditions:
+        log(f"  no warm-up needed: {prop.rationale[:200]}")
+        return None
+    conds = []
+    for d in prop.conditions:
+        if isinstance(d, dict) and d.get("expr") and not d.get("kind"):  # a formula: an expression, said or not
+            d = d | {"kind": "expression"}
+        try:
+            conds.append(Condition(**{k: v for k, v in d.items() if k in Condition.model_fields} | {"source": "description"}))
+        except Exception:  # noqa: BLE001  (a malformed item is left out)
+            continue
+    wg = GoalSpec(object=goal.object, conditions=conds, start=goal.start, start_fingers=goal.start_fingers)
+    errs = validate(wg, pj.scene) if conds else ["no condition Morph could read"]
+    if errs:
+        log(f"  (no warm-up: its checklist can't be used: {errs[0]})")
+        return None
+    wdir = task_path.parent / "warmup"
+    shutil.rmtree(wdir, ignore_errors=True)
+    log(f"  warm-up first: {prop.idea} ({'; '.join(c.describe() for c in conds)})")
+    emit(type="learn_round", round=0, stage="warmup", text=prop.idea, rationale=prop.rationale)
+    try:
+        wpath = make_task(pj, wg, task["robot_xml"], llm=llm, log=log, folder=wdir)
+    except Exception as e:  # noqa: BLE001  (e.g. no grip for its start)
+        log(f"  (no warm-up: it couldn't be set up: {e})")
+        return None
+    # the same network for both: what the policy senses and what the critic sees must match exactly
+    wt = load_task(wpath)
+    task = load_task(task_path)
+    senses = sorted(set(task.get("senses") or []) | set(wt.get("senses") or []))
+    windows = bool(_goal_windows(task) or _goal_windows(wt))
+    for path, t in ((wpath, wt), (task_path, task)):
+        t["senses"], t["critic_windows"] = senses, windows
+        path.write_text(json.dumps(t, indent=1))
+    res = _learn_rounds(pj, wg, wpath, train, llm, log=lambda m: log(f"  [warm-up] {m.strip()}"),
+                        emit=lambda **e: emit(**e, warm_up=True),
+                        total_steps=steps, rounds=WARM_UP_ROUNDS, tries=tries, candidates=0, extra=0, warm=False)
+    log(f"  warm-up learned: {res['success']}/{res['n']} tries")
+    if not res.get("success") or not (wdir / "params.pkl").exists():
+        log("  the warm-up wasn't learned, so the real task starts from scratch")
+        return None
+    shutil.copy(wdir / "params.pkl", task_path.parent / "params.pkl")
+    log("  the real task starts from the warm-up's learned hand")
+    return {"idea": prop.idea, "success": res["success"], "n": res["n"]}
+
+
+def _goal_windows(task: dict) -> bool:
+    from .goal_terms import Windows, parse
+    trees = []
+    for c in task.get("conditions", []):
+        if c.get("kind") == "expression" and c.get("expr"):
+            try:
+                trees.append(parse(c["expr"], task.get("fixtures", {})))
+            except Exception:  # noqa: BLE001
+                pass
+    return bool(Windows(trees))
+
+
 def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None, log=print, emit=None,
                   total_steps: int = 60_000_000, rounds: int = 4, tries: int = 10, candidates: int = 3,
-                  advice=None) -> dict:
+                  advice=None, extra: int = EXTRA_ROUNDS, warm: bool = True) -> dict:
     """Practise in short rounds. After each: try it; if it isn't there yet, measure what it actually does and
     (with Nemotron) revise the steps, then keep practising from where it got to. candidates > 0: instead of one
     revision, Nemotron proposes that many different plans and the best after brief practice is kept (Eureka-style).
@@ -1217,8 +1313,38 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
                 log(f"  the copy only worked {res['success']}/{res['n']}: practice is free to move well away from the program")
             take_advice(0, history)
     stuck_before = None
-    for r in range(1, rounds + 1):
-        restore = task_path.parent / "params.pkl" if (r > 1 or task.get("demo")) else None
+    warmed = warm_up(pj, goal, task_path, train, llm, log, emit, per * WARM_UP_ROUNDS, tries) if warm else None
+    if warmed:
+        history.append({"round": 0, "warm_up": warmed["idea"], "tries_succeeded": f"{warmed['success']}/{warmed['n']}"})
+    # compare plans from the start, as Eureka does every round, instead of only once one stalls: a plan that starts
+    # out rewarding the wrong thing (a fast shake for a spin) can keep "improving" and never be questioned
+    compared = False
+    if candidates > 0 and not task.get("demo") and llm is not None and getattr(llm, "available", False):
+        log("  comparing plans before practising one: each practises briefly from scratch, the best goes on")
+        emit(type="learn_round", round=0, rounds=rounds, stage="practice", steps=per)
+        chosen = search_step_plans(pj, goal, task_path, train, llm, {"note": "no practice yet: these plans are compared "
+                                                                     "from scratch"}, history, each, tries, candidates,
+                                   log, lambda **e: emit(**e, round=0, rounds=rounds))
+        if chosen:
+            compared = True
+            res = chosen["result"]
+            history.append({"round": 0, "tries_succeeded": f"{res['success']}/{res['n']}",
+                            "revision": f"best of {chosen['tried']} plans compared from scratch: {chosen['idea']}"})
+            t = load_task(task_path)
+            emit(type="skill_steps", **reward_view(t), robot=t["robot"],
+                 steps=steps_with_words(t["steps"] + [t["steps_final"]], pj.scene.object_name),
+                 **{"from": t["steps_from"]}, rationale=chosen["idea"])
+            best = _keep_best(task_path, res, best, "the plan comparison")
+            _snapshot(task_path, 0, "Plans compared", res, note=f"best of {chosen['tried']}: {chosen['idea']}")
+            emit(type="learn_round", round=0, rounds=rounds, stage="tried", success=res["success"], n=res["n"],
+                 note=f"best of {chosen['tried']} plans: {chosen['idea']}")
+            if res["success"] >= math.ceil(0.6 * tries):
+                res["rounds"] = history
+                return res
+    planned, r = rounds, 0
+    while r < rounds:
+        r += 1
+        restore = task_path.parent / "params.pkl" if (r > 1 or task.get("demo") or compared or warmed) else None
         _easy_first(task_path, r, rounds, log)
         _grip_first(task_path, log)
         emit(type="learn_round", round=r, rounds=rounds, stage="practice", steps=per)
@@ -1229,8 +1355,16 @@ def _learn_rounds(pj: Project, goal: GoalSpec, task_path: Path, train, llm=None,
         _snapshot(task_path, r, f"Round {r} of {rounds}", res, note=f"{per * r / 1e6:.0f}M steps")
         emit(type="learn_round", round=r, rounds=rounds, stage="tried", success=res["success"], n=res["n"])
         best = _keep_best(task_path, res, best, f"round {r}")
-        if res["success"] >= math.ceil(0.6 * tries) or r == rounds:
+        if res["success"] >= math.ceil(0.6 * tries):
             break
+        if r == rounds:  # the last planned round: carry on while it's still getting better, up to EXTRA_ROUNDS more
+            fit = _fitness(task_path.parent, res)
+            if rounds < planned + extra and (fit > last_fit if last_fit is not None else fit[1] > 0):
+                rounds += 1
+                log(f"  round {r}: {res['success']}/{res['n']} and still getting better: one more round "
+                    f"({rounds - planned} past the {planned} planned)")
+            else:
+                break
         if take_advice(r, history):  # the person watching said what's wrong: that revision is this round's
             t = load_task(task_path)  # and loosen the pull towards the program, so the change can show
             t["copy_trust"] = round(min(float(t.get("copy_trust", 1.0)), 0.5), 2)
@@ -1863,7 +1997,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     check = plan_checker(task, task["conditions"], log) if prop and prop.candidates else None
     for c in (prop.candidates if prop else []):
         raw = [Step(**s) for s in c.get("steps", []) if isinstance(s, dict) and s.get("done_when")]
-        ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name)
+        ok, errors = check_steps(raw, list(pj.scene.fixtures), pj.scene.object_name, prof)
         terms, t_err = check_terms(c.get("reward_terms"), list(pj.scene.fixtures), pj.scene.object_name)
         found = check([s.model_dump() for s in ok]) if ok and not errors else []
         if found:  # no second chance here: the other variants are tried instead

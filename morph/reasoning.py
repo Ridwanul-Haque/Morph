@@ -164,6 +164,13 @@ class StepCandidates(BaseModel):
     rationale: str = Field(default="", max_length=1500)
 
 
+class WarmUpProposal(BaseModel):
+    needed: bool = False
+    idea: str = Field(default="", max_length=300)  # the warm-up in one sentence
+    conditions: list[dict] = Field(default_factory=list, max_length=6)  # its checklist, as in goal_from_request
+    rationale: str = Field(default="", max_length=1200)
+
+
 class ProgramProposal(BaseModel):
     steps: list[dict] = Field(default_factory=list, max_length=20)
     rationale: str = Field(default="", max_length=1500)
@@ -639,6 +646,29 @@ class ReasoningService:
         if fix:
             payload["fix_these"] = fix
         return self._chat("step_candidates", system, json.dumps(payload, separators=(",", ":"), default=str), StepCandidates)
+
+    def warm_up_goal(self, robot: dict, goal: list[dict], start: str) -> tuple[WarmUpProposal, InferenceRecord]:
+        """An easier skill to learn first, whose learned body makes the real goal easier to learn (a curriculum)."""
+        system = (
+            "You plan the learning of a robot skill in Morph. The robot learns by trial and error in simulation, judged "
+            "only by a goal checklist. Hard dexterous goals are rarely found from scratch: Eureka learned pen spinning "
+            "on a Shadow Hand only by first learning to turn the pen to any angle it was asked, then continuing from "
+            "that skill. Decide whether THIS goal needs such a warm-up on the same robot and object, starting the same "
+            "way, and if so write the warm-up's own checklist. A good warm-up is the same kind of motion asked for in a "
+            "smaller, slower or shorter amount (a quarter turn instead of two turns, turning it at all before turning "
+            "it fast, moving it a little before moving it far), keeps every 'the whole time' rule of the goal that "
+            "can still hold (never drop it, never touch with the thumb), and is something the robot's body (robot."
+            "finger_joints, robot.has_no) can plausibly do. It must not be a different skill whose learned motion "
+            "would have to be unlearned. needed=false when the goal is already one short, simple movement. "
+            "Each condition is {\"kind\": \"expression\", \"expr\": formula, \"when\": \"end\"|\"always\"|\"ever\"|"
+            "\"last\", \"seconds\": N (for last), \"text\": plain words}; formulas are over: x, y, z, bottom, top, "
+            "tilt_deg, yaw_deg, speed, vx, vy, vz, travelled, held, in_hand, spin_dps, spin_z_dps, fingers_touching, "
+            "touching('finger')" + MORE_NAMES_DOC + "; " + FUNCS_DOC + "; Python syntax. The goal's own conditions "
+            "show the right style. Reply with ONLY one JSON object: {\"needed\": bool, \"idea\": the warm-up in one "
+            "sentence, \"conditions\": [...], \"rationale\": why it helps the real goal}."
+        )
+        user = json.dumps({"robot": robot, "goal_checklist": goal, "start": start}, separators=(",", ":"), default=str)
+        return self._chat("warm_up_goal", system, user, WarmUpProposal)
 
     def write_program(self, robot: dict, goal: list[str], scene: dict, facts: dict, blocks: str,
                       attempts: list[dict], body: str = "arm") -> tuple[ProgramProposal, InferenceRecord]:

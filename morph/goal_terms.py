@@ -408,6 +408,81 @@ def term_value(xp, tree: ast.Expression, v: dict):
     return violation(xp, tree, v, numeric=True)
 
 
+# ------------------------------------------------------------------ rules that can never hold
+INF = float("inf")
+RANGES = {"yaw_deg": (-180.0, 180.0), "roll_deg": (-180.0, 180.0), "pitch_deg": (-90.0, 90.0), "tilt_deg": (0.0, 180.0),
+          "base_tilt_deg": (0.0, 180.0), "held": (0.0, 1.0), "in_hand": (0.0, 1.0), "grip": (0.0, 1.0),
+          "closure": (0.0, 1.0), "speed": (0.0, INF), "spin_dps": (0.0, INF), "travelled": (0.0, INF),
+          "hand_dist": (0.0, INF), "touch_dist": (0.0, INF), "lifted": (0.0, INF), "grip_gap": (0.0, INF),
+          "fingers_touching": (0.0, INF)}
+UNIT_FUNCS = {"touching", "joint_frac", "joint_frac_min", "joint_frac_max"}  # 0..1
+
+
+def value_range(node) -> tuple[float, float]:
+    """The values a formula can take at all (-inf..inf when it can't be told)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value), float(node.value)
+    if isinstance(node, ast.Name):
+        return RANGES.get(node.id, (-INF, INF))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        lo, hi = value_range(node.operand)
+        return -hi, -lo
+    if _is_condition(node):
+        return 0.0, 1.0
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.args:
+        f = node.func.id
+        if f in UNIT_FUNCS:
+            return 0.0, 1.0
+        if f == "dist_to":
+            return 0.0, INF
+        if f == "abs":
+            lo, hi = value_range(node.args[0])
+            return (0.0 if lo <= 0 <= hi else min(abs(lo), abs(hi))), max(abs(lo), abs(hi))
+        if f == "mean":
+            return value_range(node.args[0])
+        if f == "change" and not _is_angle(node.args[0]):  # an angle goes round: its change has no limit
+            lo, hi = value_range(node.args[0])
+            return lo - hi, hi - lo
+    return -INF, INF
+
+
+def never_holds(expr: str, fixtures=()) -> list[str]:
+    """Parts of a formula that can never be true, whatever the robot does ("abs(yaw_deg) >= 360": a heading only goes
+    to 180). An "or" counts only when every side of it can't."""
+    try:
+        tree = parse(expr, fixtures)
+    except ExprError:
+        return []
+
+    def bad(n) -> list[str]:
+        if isinstance(n, ast.BoolOp):
+            parts = [bad(x) for x in n.values]
+            if isinstance(n.op, ast.And):
+                return [m for p in parts for m in p]
+            return [m for p in parts for m in p] if all(parts) else []
+        if not (isinstance(n, ast.Compare) and len(n.ops) == 1):
+            return []
+        left, right, op = n.left, n.comparators[0], n.ops[0]
+        flip = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE, ast.Eq: ast.Eq, ast.NotEq: ast.NotEq}
+        if isinstance(left, ast.Constant) and not isinstance(right, ast.Constant):
+            left, right, op = right, left, flip[type(op)]()
+        if not (isinstance(right, ast.Constant) and isinstance(right.value, (int, float))):
+            return []
+        c = float(right.value)
+        lo, hi = value_range(left)
+        never = {ast.Gt: hi <= c, ast.GtE: hi < c, ast.Lt: lo >= c, ast.LtE: lo > c,
+                 ast.Eq: not (lo - 1e-6 <= c <= hi + 1e-6), ast.NotEq: lo == hi == c}[type(op)]
+        if not never:
+            return []
+        span = f"from {lo:g} up" if hi == INF else f"down to {hi:g}" if lo == -INF else f"from {lo:g} to {hi:g}"
+        why = f"{ast.unparse(n)} can never hold: {ast.unparse(left)} only goes {span}"
+        if c > hi and any(isinstance(x, ast.Name) and x.id in ("yaw_deg", "roll_deg", "pitch_deg") for x in ast.walk(left)) \
+                and not any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "change" for x in ast.walk(left)):
+            why += " (for how far it turned in total, use change(yaw_deg, s) or change(yaw_deg))"
+        return [why]
+    return bad(tree.body)
+
+
 # ------------------------------------------------------------------ over time
 def _is_angle(node) -> bool:
     """An angle that goes round (yaw_deg ...): its change is counted through whole turns, not wrapped at 180."""
