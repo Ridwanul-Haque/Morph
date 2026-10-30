@@ -2,28 +2,54 @@
 
 **Describe a task once, in plain words. Any robot does it in MuJoCo, with NVIDIA Nemotron reasoning at every step.**
 
-You give Morph a scene (any MuJoCo file with one object to move: a parcel, a ball, …), pick robots (MuJoCo
-Menagerie models or your own MJCF, URDF or xacro), and type what should happen: *"throw the parcel into the bin from
-1 m north of it"*, *"knock the parcel over"*, *"lift it 10 cm and hold it there"*. Morph then:
+![One sentence, five robots: a Franka Panda, an xArm7, a UR5e, a Unitree Go1 and a Go2 each push the parcel 20 cm east](docs/media/one_sentence_five_robots.gif)
 
-1. **Understands the goal.** Nemotron turns the sentence into a checklist of measurable conditions (where the object
-   must end up, which way up, when: at the end, at the moment the robot lets go, the whole time, the last N seconds).
-   A second Nemotron pass reviews it for wrong meanings, and Morph checks that it is consistent and physically possible
-   in this scene.
-2. **Understands the robot.** It reads the robot file itself: base (bolted down, legged, wheeled, flying), arms, legs,
-   gripper and how far it opens, each part a program can move, reach, and joint limits. Torque motors become servos;
-   floating models are stood on the floor.
-3. **Does the task with a program Nemotron writes.** Nemotron writes a short recipe from building blocks for that
-   body. Morph runs it in physics, measures what happened at every step (*"the fingers closed on nothing: the parcel
-   is 3 cm from the point between them"*), and Nemotron fixes it, up to 5 times.
-4. **Learns a robust skill from it, when that's wanted or needed.** Reinforcement learning on the GPU (MuJoCo
-   Warp + Brax PPO, thousands of copies at once, varied physics). It starts from the working program and learns
-   corrections on top of it; between rounds Nemotron reads what the robot actually did and rewrites the plan and
-   reward terms, Eureka-style.
-5. **Exports it.** The learned policy as NumPy weights plus a standalone runner, a **ROS 2 package** (a node for the
-   real robot plus a simulated stand-in), and for scripted arm runs a **MoveIt** (moveit_py) script.
+*One sentence, "push the parcel 20 cm east", and five robots with very different bodies each work out how to do it:
+two arms with grippers, an arm with no gripper that pushes with its wrist, and two four-legged robots that walk over
+and push with a foot. Nobody wrote any of these programs by hand.*
 
-The simulator, not the language model, decides whether anything worked: every result is measured on the physics.
+## Why
+
+Getting a robot to do a new task usually means an engineer writing code for that exact robot and that exact task.
+Change the arm, swap the gripper, or put it on wheels or legs, and you start again.
+
+Morph turns that around. You describe **what** should happen, in a sentence. Morph works out **how**, for whatever
+robot you give it:
+
+* It reads the robot's own model file to find out what its body can do. Nobody describes the robot to it.
+* It turns your sentence into a checklist the physics can measure.
+* It gets the robot there with a short program, and practises on the GPU when a program isn't enough.
+* **The simulator decides whether it worked, never the language model.** Every result is measured on the physics,
+  misses included.
+
+## What happens when you type a sentence
+
+```mermaid
+flowchart LR
+    S["'pick the parcel up and<br/>put it in the bin'"] --> G["Goal checklist<br/>(Nemotron, then reviewed)"]
+    R["Any robot file<br/>MJCF · URDF · xacro"] --> B["What the body can do<br/>(read by Morph)"]
+    G --> P["Program for this body<br/>(Nemotron writes, Morph runs)"]
+    B --> P
+    P -->|"works"| D["Done: measured<br/>in physics"]
+    P -->|"not enough"| L["Practice on the GPU<br/>(Nemotron coaches)"]
+    L --> D
+    D --> E["Export: ROS 2 package,<br/>weights, MoveIt script"]
+```
+
+1. **It understands the goal.** Nemotron turns the sentence into a checklist of measurable conditions: where the object
+   must end up, which way up or which way it faces, and when each counts (at the end, when the robot lets go, the whole
+   time, the last few seconds). A second Nemotron pass reviews it for wrong meanings, and Morph checks it's consistent
+   and physically possible in this scene.
+2. **It understands the robot.** It reads the robot file itself: its base (bolted down, legged, wheeled, flying), arms,
+   legs, gripper and how far it opens, each part it can move, how far it reaches, and its joint limits.
+3. **It tries a program first.** Nemotron writes a short recipe from building blocks that suit that body. Morph runs it
+   in physics, says what went wrong in concrete terms (*"the fingers closed on nothing: the parcel is 3 cm from the
+   point between them"*), and Nemotron fixes it, up to 5 times. Often that's enough.
+4. **It learns when a program isn't enough.** Reinforcement learning on the GPU, with thousands of copies practising at
+   once. It starts from the working program where there is one; between rounds, Nemotron reads what the robot
+   actually did and revises the plan. You can coach it while it learns.
+5. **It exports the skill** as NumPy weights with a standalone runner, a **ROS 2 package** (a node for the real robot
+   plus a simulated stand-in), and, for scripted arm runs, a **MoveIt** script.
 
 ## Results
 
@@ -78,18 +104,33 @@ python3 -m venv .venv
 .venv/bin/pip install --no-deps -e .
 ./scripts/fetch_assets.sh --extra      # MuJoCo Menagerie robots at a pinned commit (licenses in each folder)
 cp .env.example .env                   # then put your Nebius Token Factory key in .env (git-ignored)
+.venv/bin/morph check-llm              # checks the key, and that Nemotron is served
 .venv/bin/morph app                    # opens http://localhost:8765
 ```
 
 For learning, a second environment with JAX on CUDA:
-`python3 -m venv .venv-rl && .venv-rl/bin/pip install "jax[cuda12]==0.11.2" && .venv-rl/bin/pip install -r requirements-rl.lock`.
+
+```bash
+python3 -m venv .venv-rl && .venv-rl/bin/pip install "jax[cuda12]==0.11.2" && .venv-rl/bin/pip install -r requirements-rl.lock
+```
+
 If your shell sets `PYTHONPATH` (e.g. ROS), run commands with `env -u PYTHONPATH`.
 
-In the app: pick a scene (or upload your own), tick robots, type a goal, and press Run. The Robot tab shows what
-Morph found in each robot, where it stands (move it by typing or clicking on the view), the plan, and *Learn this
-task* / *Make it robust*. The view orbits, pans and zooms (⟲ resets it).
+### Your first five minutes
 
-From the command line:
+1. Run `morph app` and open http://localhost:8765.
+2. Pick the **parcel** scene, tick **Franka Panda** and **Unitree Go2**, and type `push the parcel 20 cm east`.
+3. Press **Run.** Watch the checklist appear, then each robot try. Every try lands as a square: green worked, red didn't.
+   Click any square to replay it.
+4. Open the **Robot** tab to see what Morph found in each robot, where it stands (move it by typing or clicking the
+   view), and the plan it followed.
+5. Try something harder: `pick the parcel up and put it in the bin`, then **Learn this task** on a robot that
+   struggles. The **Learning** tab shows each round, what it's practising, and a box to type advice ("it closes the
+   gripper too early").
+
+The view orbits, pans and zooms (⟲ resets it), and a compass in the corner shows which way is north as you turn it.
+
+### From the command line
 
 ```bash
 .venv/bin/morph do examples/parcel "put the parcel into the bin" --robot third_party/mujoco_menagerie/universal_robots_ur5e/ur5e.xml
@@ -102,9 +143,35 @@ From the command line:
 .venv/bin/morph goal-bench                                             # does it understand varied requests?
 ```
 
+Add `--run 5` to try a task 5 times from slightly different starts, and `--video` to save each try as an mp4.
+
+## Things you can ask for
+
+Directions are compass directions on the floor: east is +x, north is +y.
+
+| You type | Morph checks |
+|---|---|
+| `push the parcel 20 cm east` | its centre ends 20 cm east of where it started (±2 cm) |
+| `pick the parcel up and place it into the bin` | it ends inside the bin, and it was held at some point (not shoved in) |
+| `put the parcel on the shelf facing north` | on the shelf, turned to face north |
+| `lift the parcel 10 cm and hold it there` | lifted 10 cm, and kept there |
+| `throw the parcel into the bin from 1 m north of it` | let go from that spot, and lands in the bin |
+| `knock the parcel over` | lying on its side at the end |
+| `spin the pen around the fingers without using the thumb` | it turns, never falls out of the hand, and the thumb never touches it |
+
+## Bring your own robot, scene or object
+
+* **A robot:** any MJCF, URDF or xacro file (ROS packages next to it are found). `morph inspect <file>` shows what
+  Morph sees in it: type, size, reach, gripper and motors. Torque motors become servos; floating models are stood on
+  the floor.
+* **A scene:** a folder with a MuJoCo `scene.xml` (one object to move, plus anything else: bins, shelves, walls) and a
+  `morph.toml` naming the object. See `examples/parcel/`. The app can also upload one.
+* **An object:** `morph object <model.stl|.obj>` puts a 3D model into the work cell as a new scene (`examples/pen`
+  holds a pen from an STL file).
+
 ## How it works
 
-### The goal: a checklist, not a target pose
+### 1. The goal: a checklist, not a target pose
 
 Conditions Morph can measure on the simulation: inside / on top of / touching / near / beside a fixture (or not),
 at a position, facing a heading, which face is up, lifted to a height, moved N cm in a direction, away from something,
@@ -117,7 +184,7 @@ about nothing, while a speed like `spin_z_dps > 180` is met by a fast shake too)
 `mean(q, s)` an average or, for a condition, the share of the time it held (`mean(touching('thumb'), 2)`). The judge
 and the learner follow them through each try the same way.
 
-### Programs: building blocks for each kind of body
+### 2. Programs: building blocks for each kind of body
 
 | Body | Building blocks | Runs on |
 |---|---|---|
@@ -130,146 +197,28 @@ back if something didn't work ("if `held == 0` after lifting: grasp again"). Num
 are when the step starts (`obj_x`, `obj_top + 0.05`, `bin_x`, `hand_z`, …), so a program follows the object.
 Programs are JSON data, never code. Working programs are cached, so a rerun makes no new Nemotron call.
 
-### Learning: start from the program, learn corrections
+### 3. It learns when a program isn't enough
 
-* **Corrections on top of the program** (residual learning): the learner's action is the program's action at that
-  moment plus a learned correction, so a policy that outputs nothing *is* the program. The correction network starts
-  at exactly zero and is first fitted to the corrections the program needed from other starts, on slightly noisy inputs
-  so it stays steady near the recorded path.
-* **Keep copying while practising** (DAPG, Rajeswaran et al. 2018): an extra term in PPO's loss keeps a pull towards
-  the program's actions, so practice refines the skill instead of slowly forgetting it.
-* **Easy-first practice** (reverse curriculum): early rounds start from moments late in the program (already holding
-  it, nearly there) and each round moves the starts back. If it's stuck at the same step twice, most practice starts
-  where it got closest on that step.
-* **A warm-up skill first** (as Eureka's pen spinning first learned to turn the pen to any angle): for a hard goal (the
-  object starts in the hand, or the goal is about a stretch of time or a turn) Nemotron may propose an easier version
-  of the same motion ("turn it a quarter turn without dropping it"). Morph learns that in `warmup/` and starts the real
-  goal from its learned network; if the warm-up isn't learned, the real goal starts from scratch. In a warm-up, how far
-  something turned or moved counts from the start of the try (a little progress is never taken back after a pause),
-  and breaking a "the whole time" rule (never drop it, never touch X, never tip over) still ends the try but costs
-  less than in the real task, so the robot doesn't learn to do nothing for fear of breaking it.
-* **Plans compared from the start:** before the first round, Nemotron's alternative plans and the current one practise
-  briefly side by side and the best goes on, instead of comparing only once progress stalls. Learning also carries on
-  past the planned rounds (up to 4 more) while each round still does better than the last.
-* **Plans that fit the body:** Nemotron is told what each finger's joints do and which parts the robot doesn't have; a
-  step that relies on a missing part ("rotate the wrist" on a hand fixed in place), or a rule that can never hold
-  ("heading at least 360°"), is sent back. A hand holding the object from the start also feels which fingers touch it.
-* **The steps a person would take** (Nemotron, per body: which parts, in what order) are the reward: progress
-  towards the current step, and a step only counts after it has held for 0.2 s.
-* **Eureka-style revision:** after each round Morph replays the policy, measures where it gets stuck and what it
-  actually does, and sends that to Nemotron: per goal condition, how often it was met, how close it came, and for
-  "the whole time" ones when it first broke and what things looked like then; which fingers touched the object and
-  for how long; and, per step, whether the next step got anywhere from where it ended (a step that ends somewhere the
-  next can't continue from is flagged, as in Sequential Dexterity). Nemotron rewrites the steps and can add weighted
-  **reward terms** (checked formulas such as `closure * (touch_dist < 0.03)`), and sees how each term behaved in
-  training. A term is paid as a potential (Ng, Harada & Russell 1999): for raising its value, never for keeping it
-  high, so it can guide the robot but can't make stopping halfway pay (a term for keeping the hand over the parcel once
-  taught the Stretch to hover there instead of picking it up). A revision is only kept if it practises better than the
-  plan it replaces, from the same point (a suggestion of yours also wins a tie).
-* **Plans are checked before any practice** (LLM-Modulo, Kambhampati et al. 2024): Morph sends a plan back to
-  Nemotron, with the reason, if its last step never gets the object where the goal wants it, or if a step's keep rule
-  is already broken where that step starts (the robot's start, or saved states where the step before is done), so
-  the step would be penalised from its first moment, or if the steps are out of order: an object that has to be
-  carried mustn't be asked to be at the goal before it's picked up, and along Morph's own route to the goal the steps
-  must come true in their order.
-* **A place it has to be carried into isn't eased** (missed by 29 cm, "in the bin" was met by nudging a pen along the
-  floor, and practice learned to push it). Practice starts with it already held help there instead.
-* **Wheeled robots grip too:** a gripper is recognised on a mobile base as well, a telescoping arm driven by one motor
-  through a tendon is moved as one joint, and the base is set down where the hand can reach the object from one side.
-  Morph then grips it itself and practice also starts holding it. If no grip is possible it says why (a Stretch's
-  fingertips get no lower than about 5 cm, too high for a pen lying flat).
-* **Robots on legs grip too, and from above:** where to stand is also worked out for reaching down onto the object
-  (Spot can't get its hand level at a pen on the floor, but reaches down onto it from about 50 cm back). A gripper's
-  fingers are only what hangs from its own mount (Spot's feet shifted as it settled and were taken for its fingers, so
-  its "hand" was its body). A gripper opens only a little wider than the object (`{"do": "grip", "how": "open",
-  "width": 0.04}`), as a hand does: Spot's jaw swings through 90° to open fully and dug into the floor. Where one jaw
-  closes against a fixed one, the hand's point follows the middle of the gap as it opens, and "pointing down" levels
-  the two jaws' ends; on long jaws (Spot's reach 12 cm past the point measured between them) the point is between
-  their ends. When the arm is asked to reach a far point and point a certain way, it also tries getting there first
-  and turning after (from Spot's folded arm, doing both at once stalled 58 cm short), and a straight-line move that
-  stalls on the way moves the joints straight to the end pose instead.
-  Still open: Spot's jaws close onto a pen on the floor but don't hold it. Their tips are rounded underneath (the
-  drawn model's too), and the pen, 1.25 cm across, is pushed under them; Morph's pick test finds no grip that holds
-  and stops before practice. The Panda's flat finger pads pick up the same pen.
-* **Legs and an arm, as a person uses them:** a robot on legs with an arm walks to a spot where its hand reaches the
-  object and where it has to go, stands there and works with its arm. Learning a task practises the arm and gripper
-  at that spot, the legs holding it standing (practising every leg and arm motor at once from nothing never got
-  Spot's hand nearer the pen than it started, 1.3 m off); runs walk there first on its walking skill. "Learn this
-  task" teaches it to walk first if it can't yet, in the same job, so it is one button. Standing still there, it
-  gets what a bolted-down arm gets: Nemotron's program to learn from and the up-front check that it can pick the
-  object up at all.
-* **In the hand isn't gripped:** "never falls out of the hand" is `in_hand` (the object kept up by nothing but the
-  robot, rolling or sliding between the fingers included), not `held` (a pinch from opposite sides) the whole time,
-  which forbids every roll, pass and spin. A request can also say which fingers it starts on ("starts between the
-  index and middle fingers"): Morph's in-hand start then lays it over those fingers and keeps a grip with them on it.
-  When it doesn't, the start is where the goal first needs it: "at some point it's between the index and middle
-  fingers" starts it on those two, not in the steadiest near-fist, which practice never worked it out of.
-* **Ready to grip, not just near it:** a step that sets up a grasp has to have the open hand where Morph's own grip
-  puts it (`grip_gap`, the hand's distance from that grip), not just near the object: the Stretch learned to rest its
-  hand on top of the parcel, which was "within 6 cm", and closing there gripped nothing. Morph adds this to the plan
-  itself if Nemotron leaves it out, and the reach reward aims for that grip. A share of practice runs also starts at
-  the moment just before Morph's own grip, the gripper still open, so closing on the object is practised every round.
-  Without a grip of Morph's own, the step before closing needs the object between the fingers (`between`: the line
-  from one fingertip to the other passes through it, in the middle of the gap and not beside one tip), for any robot
-  with a gripper or fingers: the Stretch's fingers came within 2.5 cm of a pen round after round and closed beside
-  it. (A looser first version let a shut gripper, one tip on the floor next to the pen and the other above it, pass.)
-* **The best round is the one that got furthest:** after real successes, moving targets and time in the goal, rounds
-  and plans are ranked by the share of the plan's steps they get through, before how close the object ended up (once
-  a skill that never touched the pen was kept over ones that reached the grasp, because nudging the pen while trying
-  to grip it had left it a little further from the bin). A round only counts as getting better if something clearly
-  moved: a success, a moving target, more time in the goal, a twentieth more of the plan, or ending 5% closer. A
-  wobble no longer keeps one plan practising round after round without anyone asking where it's stuck.
-* **A part it earns instead of the task is flagged:** if one part of the reward pays more and more while the time in
-  the goal falls by over half, Nemotron is told which part it is.
-* **A small population when progress stalls** (Population Based Training, DexPBT): Nemotron's different plans, plus the
-  current plan exploring more and with calmer updates, each practise briefly; the weaker half is dropped and the rest
-  practise again; the best plan, policy and settings are kept. They take turns on the GPU. Exploring more is capped
-  at 2x the trainer's own setting, however many times it wins. Nemotron is asked for each plan on its own, told the
-  ideas already being tried, and reads its measurements by Eureka's rules (no progress: a new idea, not a tweak; a part
-  that never changes can't be learned as written; one much bigger than the rest drowns them out).
-* **Moving targets** (as Eureka's pen spinning chased a target 30 degrees ahead): for a goal about how far something
-  turns or travels, practice pays a bonus each time it reaches the next target (30 degrees, 2.5 cm), and the target
-  moves on, so every bit of the motion pays as it happens and holding still never does. Plans and rounds are ranked
-  by the targets reached, so progress shows before any try succeeds. Progress only counts once the goal's "the whole
-  time" rules have kept holding after it: what was made in the couple of seconds before one breaks is taken back, so
-  progress that comes from breaking a rule (the object slipping away, a box shoved until it tips, a lunge that ends in
-  a fall) doesn't pay. Breaking such a rule costs the same late in a try as early, so it's never worth it near the
-  end, and practice looks about 2 s ahead instead of 0.7 s, far enough to see it coming.
-* **Plain practice first:** no varied friction, weight, motor strength, noise or delays until the skill first
-  succeeds; then they are turned on, and a skill that is done gets one more round with them before it's finished.
-  A hard goal's learning rate follows how much each update changes the policy (rl_games' adaptive schedule).
-* **A trainer that goes silent** for 20 minutes is stopped and its round started again once (a hung GPU call once froze
-  one for hours); Stop now ends a silent trainer too.
-* **An easier version of the goal first** (automatic curriculum): a goal condition it keeps missing may be missed by
-  about as much as it misses it now (spin 180 deg/s may first be 100), practice spreads between that and the real goal,
-  and the slack shrinks as it improves and is gone after a real success. Rules (no thumb, keep holding it) are never
-  eased, and every judgement is on the real goal.
-* **Tries end when they can no longer succeed** (early termination, DeepMimic): once a "the whole time" condition has
-  broken (the thumb on the pen, the pen on the floor), the practice try stops there and loses what the rest of it
-  could have earned.
-* **It senses what the goal is about:** if the goal is about spin, the policy also sees how fast the object turns; if
-  it's about which fingers touch, it feels each finger's distance to the object (whole fingers, not only the tips:
-  the judge counts a thumb's base on the pen too).
-* **You can coach it too:** while it practises, type what you see it doing wrong in the Learning tab ("it grabs the
-  top edge and it slips; grab it lower"), or rate the practice try you just watched 👍 / 👎. At the end of the round
-  (or right away, keeping what it learned so far) Nemotron reads your words, and compares what the tries you liked
-  did with the ones you didn't (preference feedback, Christiano et al. 2017), together with Morph's measurements, and
-  changes the steps and reward terms. Your input is advice: the measurements still decide what is kept. When you give
-  it, or when the copied program doesn't work, practice is allowed to move further away from the program.
-* **A critic that sees more** (asymmetric actor-critic, Pinto et al. 2018): during training, the part that judges its
-  moves also sees how well it really grips, how far through the steps it is, and each practice copy's true object
-  weight and friction. The exported policy only uses what a robot can sense.
-* **Fair judging and no lost progress:** 10 tries per round, and the best policy so far is always kept, both across
-  rounds and within one (practice that wrecks what it learned hands the next round its best snapshot, not the wreck). Contacts come and
-  go for a tick or two even in a steady grip, so a "held" or "touching" that flickers for under 0.1 s isn't a break.
-* **Out of reach:** a bolted-down robot that never gets near the object because it stands too far away is moved
-  closer, once (not if you placed it yourself).
-* Varied physics per practice copy (friction, object mass, motor strength, a one-step delay, sensor noise).
+The robot practises in thousands of copies of the simulation at once (MuJoCo Warp + Brax PPO). The main ideas:
 
-Arm programs and general programs are recorded on the learner's own model, or translated joint by joint, so the copy
-matches. Learning from legged programs isn't supported yet: legged robots learn from scratch or use their program.
+* **Start from the program:** the learner adds corrections on top of the program's moves, so doing nothing *is* the
+  program, and practice refines it instead of starting from zero.
+* **The plan is the reward:** Nemotron writes the steps a person would take with this body ("line the fingers up
+  around it, close, lift, carry, lower it in"), and the robot is rewarded for reaching each in order. Morph checks
+  every plan before practice and sends a flawed one back with the reason (a step that can never be done, steps out of
+  order, closing before the object is between the fingers).
+* **Nemotron coaches between rounds** (Eureka-style): Morph replays the robot, measures where it gets stuck and what it
+  actually did, and Nemotron revises the plan. A revision is only kept if it practises better than the plan it
+  replaces.
+* **You can coach it too:** type what you see it doing wrong, or rate a practice try 👍 / 👎. Nemotron turns your
+  words into a revised plan, and Morph races it against the current one before keeping it.
+* **Easy first, then harder:** early practice starts close to success (already holding it, nearly there) and moves
+  back each round; varied friction, weight, motor strength, noise and delays come in once it first succeeds.
+* **Nothing learned is lost:** the best version so far is always kept, across rounds and within one.
 
-### Exports
+The full list, with the failure behind each method, is in **[docs/learning.md](docs/learning.md)**.
+
+### 4. Exports
 
 * **Standalone:** `policy.npz` (NumPy weights), `policy.json` (exactly what it reads and outputs, joint order, rates,
   the program it corrects), `model.xml` with its meshes, and `run_policy.py`.
@@ -279,7 +228,7 @@ matches. Learning from legged programs isn't supported yet: legged robots learn 
   exactly, and the closed loop reaches the goal through ROS topics.
 * **MoveIt:** for scripted arm runs, a `moveit_py` script with the grasp and place waypoints in the robot's base frame.
 
-### Videos
+### 5. Videos
 
 Tries are recorded as simulation state (not frames) and rendered to mp4 on demand, since rendering is slow under WSL
 (~30 s per try). Videos are 1280x720, real time, with captions and the result at the end.
@@ -288,35 +237,16 @@ Tries are recorded as simulation state (not frames) and rendered to mp4 on deman
 * `morph learn` saves each round's policy in `rounds/` and renders `round_N.mp4`, `final.mp4`, `compare.mp4` (program
   vs learned policy with the object knocked mid-task) and `learning_progress.mp4` into
   `runs/learned/<robot>__<goal>/videos/`. `morph video <folder>` does the same for an existing skill
-  (`--list`, `--clip round_2`). Skills learned before this fall back to the trainer's checkpoints.
+  (`--list`, `--clip round_2`).
 * In the app, any result square can be replayed and downloaded, and the **Videos** button lets you pick several and
   download them as one mp4 or a zip.
 
-### Hands
+### 6. Hands
 
-Morph finds hands in any model (on an arm or on their own) and labels the fingers from their names, or from the
-hand's shape when the names don't say (the thumb is the finger set apart from the others). Goals can say which part
-touches the object: `touching('thumb') == 0` the whole time, `fingers_touching >= 2`. Tries are judged on the real
-contacts; the GPU learner counts a finger as touching when any part of it is within 6 mm of the surface. A robot
-without the named part is refused before anything runs.
-
-A request about handling the object in the hand ("spin the pen around the fingers") starts with it there: Morph
-turns the hand palm up, drops the object onto the palm or fingers, and tries grips (which fingers close, how far)
-until one holds it, already meets the goal's "the whole time" conditions, and keeps doing so untouched for 3 s in both
-the accurate and the learner's physics. Holding still isn't enough: early practice twitches the fingers at random, so
-each grip is also tried with the object laid a few slightly different ways, every pose is shaken like that through
-whole tries, and only the sturdiest poses are kept. That grip is what the policy holds when it does nothing; tries start
-from those poses, so practice can't depend on one lucky resting pose, and isn't cut short by drops before anything is
-learned. In-hand goals
-are learned, not programmed (`examples/pen` with the Shadow Hand).
-
-## Compute and cost
-
-| Item | Measured | Cost |
-|---|---|---|
-| Nemotron (Token Factory, $0.30 / $0.90 per 1M input / output tokens, read live from `/v1/models`) | goal + review: 2 calls; a program: 1 call per attempt; a learning revision: 1 call | about $0.002–0.01 per call; a full `morph do` with programs: a few cents |
-| Learning one skill (60M practice steps, 4 rounds) | local RTX 5070 Laptop, 512–1024 copies at once | about 30–40 min, no bill (about $0.05 of electricity) |
-| Same on **Nebius AI Cloud** (option) | H100 / H200 / B200; prices change on 2026-10-01, Morph shows the right one by date | about $1–3 per skill; Morph prepares the job, you start it |
+Morph finds hands in any model (on an arm or on their own) and labels the fingers from their names, or from the hand's
+shape when the names don't say. Goals can say which part touches the object (`touching('thumb') == 0` the whole time,
+`fingers_touching >= 2`), and in-hand requests ("spin the pen around the fingers") start with the object already in
+the hand, in a grip Morph has tested to hold. Details in [docs/learning.md](docs/learning.md#hands).
 
 ## How NVIDIA and Nebius are used
 
@@ -327,38 +257,45 @@ are learned, not programmed (`examples/pen` with the Shadow Hand).
   2. plans the steps a person would take with this body;
   3. writes programs from building blocks and fixes them from Morph's step-by-step report;
   4. coaches learning: reads what the robot actually did, rewrites the steps and reward terms, proposes alternative
-     plans when progress stalls.
+     plans when progress stalls, and turns a person's advice into a revised plan.
 * Every reply is schema-validated (pydantic), every formula is parsed by Morph's own safe evaluator (no `eval`), and
   invented names, unknown building blocks or impossible numbers are sent back with the reason. A wrong answer costs a
   retry, never a crash. Every call is logged with model, latency and tokens (`runs/app_inference.jsonl`), never the key.
 * **GPU:** learning runs on NVIDIA GPUs through JAX and MuJoCo Warp (local, or a prepared Nebius AI Cloud job).
 
-## Related work
+## Compute and cost
 
-* **Eureka** (Ma et al., NVIDIA 2023): an LLM writes reward code and improves it from training statistics; it reached
-  expert-level rewards for dexterous skills such as pen spinning, with expert-prepared environments and large GPU
-  budgets. Morph's revision loop is Eureka-like, but Nemotron writes checked formulas rather than code, and Morph aims at
-  everyday tasks from a sentence, for any robot file, on one GPU.
-* **Code as Policies** (Liang et al. 2022), **RoboGen** (Wang et al. 2023), **GenSim** (Wang et al. 2023): language
-  models writing robot programs, and using them to make training data. Morph's programs follow this idea.
-* **Deep RL from human preferences** (Christiano et al. 2017), **asymmetric actor-critic** (Pinto et al. 2018),
-  **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
-  **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017), **DeepMimic** (Peng et al. 2018),
-  **DexPBT** (Petrenko et al. 2023), **Sequential Dexterity** (Chen et al. 2023), **Prioritized Level Replay** (Jiang et
-  al. 2021) and **automatic domain randomization** (OpenAI 2019): the learning methods above.
+| Item | Measured | Cost |
+|---|---|---|
+| Nemotron (Token Factory, $0.30 / $0.90 per 1M input / output tokens, read live from `/v1/models`) | goal + review: 2 calls; a program: 1 call per attempt; a learning revision: 1 call | about $0.002–0.01 per call; a full `morph do` with programs: a few cents |
+| Learning one skill (60M practice steps, 4 rounds) | local RTX 5070 Laptop, 512–1024 copies at once | about 30–40 min, no bill (about $0.05 of electricity) |
+| Same on **Nebius AI Cloud** (option) | H100 / H200 / B200; prices change on 2026-10-01, Morph shows the right one by date | about $1–3 per skill; Morph prepares the job, you start it |
 
 ## Robots and assets
 
-Any MJCF, URDF or xacro (ROS packages next to it are found). Tested with these MuJoCo Menagerie models
-(`scripts/fetch_assets.sh --extra`, pinned commit `c96a32d`): Franka Panda, UFactory xArm7 and Lite6, AgileX Piper,
-Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1 and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch,
-Shadow Hand and Allegro Hand.
-Walking policies are included for the Go1 (`artifacts/go1_walk/`) and the Go2 (`artifacts/walk/go2/`); `morph app`
-can train one for another legged robot (learning a task trains one first when the robot needs to walk to where it
-works). Walking
-practice moves only the legs (an arm or head holds its resting pose), and its effort, speed and foot penalties are
-measured for the robot's own size and motors, as its commands already were: Spot's were 3-8 times the Go2's, every try
-scored 0, and it never learned to stay up; now it stands the full 20 s within 45M steps.
+Any MJCF, URDF or xacro. Tested with these MuJoCo Menagerie models (`scripts/fetch_assets.sh --extra`, pinned commit
+`c96a32d`): Franka Panda, UFactory xArm7 and Lite6, AgileX Piper, Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1
+and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch, Shadow Hand and Allegro Hand.
+
+Walking policies are included for the Go1 (`artifacts/go1_walk/`), the Go2 (`artifacts/walk/go2/`) and Spot
+(`artifacts/walk/spot_arm/`); `morph app` can train one for another legged robot (learning a task trains one first
+when the robot needs to walk to where it works). Walking practice moves only the legs, and its effort, speed and foot
+penalties are measured for the robot's own size and motors.
+
+## Project layout
+
+| Path | What's there |
+|---|---|
+| `morph/cli.py` | the `morph` command |
+| `morph/app/` | the browser app (server and single-page interface) |
+| `morph/goals.py`, `goal_terms.py`, `goal_sources.py` | reading a request into a checklist, and measuring it |
+| `morph/introspect.py`, `robot_import.py`, `fingers.py` | reading a robot file: body, gripper, hands |
+| `morph/programs.py`, `body_programs.py`, `legged_programs.py` | the building blocks and running programs |
+| `morph/learn_task.py`, `plan_check.py`, `skill_steps.py` | learning in rounds, plan checks, Nemotron's steps |
+| `scripts/train_task.py`, `train_walk.py` | the GPU trainers |
+| `morph/ros_export.py`, `moveit_export.py` | exports |
+| `examples/` | ready scenes: `parcel`, `ball`, `pen` |
+| `tests/` | the test suite |
 
 ## What this is not, and known limits
 
@@ -368,6 +305,11 @@ scored 0, and it never learned to stay up; now it stands the full 20 s within 45
   learning from scratch, which is much less reliable and needs far more compute. In-hand goals do start in the hand
   and are judged per finger (see Hands), but a 20 min test run on the Shadow Hand only got as far as keeping the
   pencil and turning it at 163°/s, with the thumb still touching it.
+* Learning hard tasks from scratch on a mobile robot is slow: a Stretch practising "put the parcel in the bin facing
+  west" with no working program learned the pick-up and drop from one of its ten starts in about 2½ hours, but not
+  the turn.
+* Robots with detailed collision shapes (the Stretch) run out of memory on an 8 GB GPU at 1024 copies; Morph drops to
+  512, which is slower.
 * Humanoids and robots without a walking policy get no programs yet; learning from legged programs isn't supported.
 * Objects are boxes, spheres, upright cylinders or capsules (other shapes are treated as their bounding box).
 * A program's accuracy is limited by its open-loop moves (pushing to within 2 cm is hard); that's what learning
@@ -376,12 +318,29 @@ scored 0, and it never learned to stay up; now it stands the full 20 s within 45
 ## Reproduce
 
 ```bash
-.venv/bin/python -m pytest -q                       # 163 tests, ~2 min (CPU)
+.venv/bin/python -m pytest -q                       # 223 tests (CPU); the xacro test needs xacro installed
 .venv/bin/morph goal-bench                          # request understanding: Nemotron vs rules (~$0.07)
 .venv/bin/morph do examples/parcel "<task>" --robot <model> --run 5 --yes   # each cell of the programs table
 ```
 
 The learning tables use `morph learn` (or the app) on the xArm7, and the knock test is `learn_task.robustness`.
+
+## Related work
+
+* **Eureka** (Ma et al., NVIDIA 2023): an LLM writes reward code and improves it from training statistics; it reached
+  expert-level rewards for dexterous skills such as pen spinning, with expert-prepared environments and large GPU
+  budgets. Morph's revision loop is Eureka-like, but Nemotron writes checked formulas rather than code, and Morph aims at
+  everyday tasks from a sentence, for any robot file, on one GPU.
+* **Code as Policies** (Liang et al. 2022), **RoboGen** (Wang et al. 2023), **GenSim** (Wang et al. 2023): language
+  models writing robot programs, and using them to make training data. Morph's programs follow this idea.
+* **LLM-Modulo** (Kambhampati et al. 2024): a language model's plans checked by outside verifiers, as Morph checks
+  Nemotron's plans before any practice.
+* **Deep RL from human preferences** (Christiano et al. 2017), **asymmetric actor-critic** (Pinto et al. 2018),
+  **DAPG** (Rajeswaran et al. 2018), **residual policy learning** (Silver et al. 2018; Johannink et al. 2019),
+  **reverse curriculum** (Florensa et al. 2017), **DART** (Laskey et al. 2017), **DeepMimic** (Peng et al. 2018),
+  **DexPBT** (Petrenko et al. 2023), **Sequential Dexterity** (Chen et al. 2023), **Prioritized Level Replay** (Jiang et
+  al. 2021) and **automatic domain randomization** (OpenAI 2019): the learning methods in
+  [docs/learning.md](docs/learning.md).
 
 ## The original transfer pipeline
 
@@ -414,3 +373,4 @@ This repository is Apache-2.0 (`LICENSE`). It builds on:
 * Brax, JAX, Flax, optax (Apache-2.0); PyTorch, NumPy, httpx (BSD-3-Clause); pydantic (MIT); imageio (BSD-2-Clause);
   Pillow (MIT-CMU); xacro (BSD-3-Clause, optional).
 * NVIDIA Nemotron via Nebius Token Factory (called over the API; no model weights in this repo).
+* The five-robot animation at the top is rendered from Morph's own recorded tries (`morph do --run 3 --video`).
