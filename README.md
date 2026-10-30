@@ -177,6 +177,26 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   through a tendon is moved as one joint, and the base is set down where the hand can reach the object from one side.
   Morph then grips it itself and practice also starts holding it. If no grip is possible it says why (a Stretch's
   fingertips get no lower than about 5 cm, too high for a pen lying flat).
+* **Robots on legs grip too, and from above:** where to stand is also worked out for reaching down onto the object
+  (Spot can't get its hand level at a pen on the floor, but reaches down onto it from about 50 cm back). A gripper's
+  fingers are only what hangs from its own mount (Spot's feet shifted as it settled and were taken for its fingers, so
+  its "hand" was its body). A gripper opens only a little wider than the object (`{"do": "grip", "how": "open",
+  "width": 0.04}`), as a hand does: Spot's jaw swings through 90° to open fully and dug into the floor. Where one jaw
+  closes against a fixed one, the hand's point follows the middle of the gap as it opens, and "pointing down" levels
+  the two jaws' ends; on long jaws (Spot's reach 12 cm past the point measured between them) the point is between
+  their ends. When the arm is asked to reach a far point and point a certain way, it also tries getting there first
+  and turning after (from Spot's folded arm, doing both at once stalled 58 cm short), and a straight-line move that
+  stalls on the way moves the joints straight to the end pose instead.
+  Still open: Spot's jaws close onto a pen on the floor but don't hold it. Their tips are rounded underneath (the
+  drawn model's too), and the pen, 1.25 cm across, is pushed under them; Morph's pick test finds no grip that holds
+  and stops before practice. The Panda's flat finger pads pick up the same pen.
+* **Legs and an arm, as a person uses them:** a robot on legs with an arm walks to a spot where its hand reaches the
+  object and where it has to go, stands there and works with its arm. Learning a task practises the arm and gripper
+  at that spot, the legs holding it standing (practising every leg and arm motor at once from nothing never got
+  Spot's hand nearer the pen than it started, 1.3 m off); runs walk there first on its walking skill. "Learn this
+  task" teaches it to walk first if it can't yet, in the same job, so it is one button. Standing still there, it
+  gets what a bolted-down arm gets: Nemotron's program to learn from and the up-front check that it can pick the
+  object up at all.
 * **In the hand isn't gripped:** "never falls out of the hand" is `in_hand` (the object kept up by nothing but the
   robot, rolling or sliding between the fingers included), not `held` (a pinch from opposite sides) the whole time,
   which forbids every roll, pass and spin. A request can also say which fingers it starts on ("starts between the
@@ -188,6 +208,16 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
   hand on top of the parcel, which was "within 6 cm", and closing there gripped nothing. Morph adds this to the plan
   itself if Nemotron leaves it out, and the reach reward aims for that grip. A share of practice runs also starts at
   the moment just before Morph's own grip, the gripper still open, so closing on the object is practised every round.
+  Without a grip of Morph's own, the step before closing needs the object between the fingers (`between`: the line
+  from one fingertip to the other passes through it, in the middle of the gap and not beside one tip), for any robot
+  with a gripper or fingers: the Stretch's fingers came within 2.5 cm of a pen round after round and closed beside
+  it. (A looser first version let a shut gripper, one tip on the floor next to the pen and the other above it, pass.)
+* **The best round is the one that got furthest:** after real successes, moving targets and time in the goal, rounds
+  and plans are ranked by the share of the plan's steps they get through, before how close the object ended up (once
+  a skill that never touched the pen was kept over ones that reached the grasp, because nudging the pen while trying
+  to grip it had left it a little further from the bin). A round only counts as getting better if something clearly
+  moved: a success, a moving target, more time in the goal, a twentieth more of the plan, or ending 5% closer. A
+  wobble no longer keeps one plan practising round after round without anyone asking where it's stuck.
 * **A part it earns instead of the task is flagged:** if one part of the reward pays more and more while the time in
   the goal falls by over half, Nemotron is told which part it is.
 * **A small population when progress stalls** (Population Based Training, DexPBT): Nemotron's different plans, plus the
@@ -199,7 +229,11 @@ Programs are JSON data, never code. Working programs are cached, so a rerun make
 * **Moving targets** (as Eureka's pen spinning chased a target 30 degrees ahead): for a goal about how far something
   turns or travels, practice pays a bonus each time it reaches the next target (30 degrees, 2.5 cm), and the target
   moves on, so every bit of the motion pays as it happens and holding still never does. Plans and rounds are ranked
-  by the targets reached, so progress shows before any try succeeds.
+  by the targets reached, so progress shows before any try succeeds. Progress only counts once the goal's "the whole
+  time" rules have kept holding after it: what was made in the couple of seconds before one breaks is taken back, so
+  progress that comes from breaking a rule (the object slipping away, a box shoved until it tips, a lunge that ends in
+  a fall) doesn't pay. Breaking such a rule costs the same late in a try as early, so it's never worth it near the
+  end, and practice looks about 2 s ahead instead of 0.7 s, far enough to see it coming.
 * **Plain practice first:** no varied friction, weight, motor strength, noise or delays until the skill first
   succeeds; then they are turned on, and a skill that is done gets one more round with them before it's finished.
   A hard goal's learning rate follows how much each update changes the policy (rl_games' adaptive schedule).
@@ -268,8 +302,11 @@ without the named part is refused before anything runs.
 A request about handling the object in the hand ("spin the pencil around the fingers") starts with it there: Morph
 turns the hand palm up, drops the object onto the palm or fingers, and tries grips (which fingers close, how far)
 until one holds it, already meets the goal's "the whole time" conditions, and keeps doing so untouched for 3 s in both
-the accurate and the learner's physics. That grip is what the policy holds when it does nothing; tries start from it
-with the object laid a few slightly different ways, so practice can't depend on one lucky resting pose. In-hand goals
+the accurate and the learner's physics. Holding still isn't enough: early practice twitches the fingers at random, so
+each grip is also tried with the object laid a few slightly different ways, every pose is shaken like that through
+whole tries, and only the sturdiest poses are kept. That grip is what the policy holds when it does nothing; tries start
+from those poses, so practice can't depend on one lucky resting pose, and isn't cut short by drops before anything is
+learned. In-hand goals
 are learned, not programmed (`examples/pencil`).
 
 ## Compute and cost
@@ -316,7 +353,11 @@ Any MJCF, URDF or xacro (ROS packages next to it are found). Tested with these M
 Kinova Gen3, UR5e, SO-ARM100, Unitree Go1, Go2, H1 and G1, ANYmal C, Spot with arm, Skydio X2, Hello Robot Stretch,
 Shadow Hand and Allegro Hand.
 Walking policies are included for the Go1 (`artifacts/go1_walk/`) and the Go2 (`artifacts/walk/go2/`); `morph app`
-can train one for another legged robot.
+can train one for another legged robot (learning a task trains one first when the robot needs to walk to where it
+works). Walking
+practice moves only the legs (an arm or head holds its resting pose), and its effort, speed and foot penalties are
+measured for the robot's own size and motors, as its commands already were: Spot's were 3-8 times the Go2's, every try
+scored 0, and it never learned to stay up; now it stands the full 20 s within 45M steps.
 
 ## What this is not, and known limits
 

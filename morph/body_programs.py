@@ -10,7 +10,8 @@ with ad=None).
 Building blocks (data, never code; Morph checks every argument):
   move(part, x, y, z, point, turn, speed, until)   the part's tip in a straight line to (x, y, z)
   push(part, direction, distance, speed)           slide the part along the floor plane, keeping its height
-  grip("close" | "open")                           the gripper, if it has one; waits until the fingers stop
+  grip("close" | "open", width)                    the gripper, if it has one (open only `width` m, if given); waits
+                                                   until the fingers stop
   joints({name: angle}, seconds)                   set joints directly (radians)
   home(seconds)                                    back to the starting pose
   wait(seconds)
@@ -46,9 +47,12 @@ BLOCKS_DOC = (
     "it moves: \"down\", \"up\", \"north\", \"south\", \"east\", \"west\", \"object\" (towards the object's centre), "
     "\"keep\" (default), or [dx, dy, dz]. point is the way the tip FACES, not the way it moves: moving up or away "
     "does not need point \"up\" (that turns the part upside down); leave point out unless the facing must change. turn (optional, parts that grip): \"object\" lines the fingers up across "
-    "the object's sides, or a number in degrees (0 = fingers close along east-west). speed: \"slow\" (0.15 m/s, for "
+    "the object's sides, a number in degrees (0 = fingers close along east-west), or [dx, dy, dz]: the way the "
+    "fingers close, for a hand tipped onto its side. speed: \"slow\" (0.15 m/s, for "
     "touching and placing), \"normal\" (0.4 m/s), \"fast\" (1.5 m/s). until (optional): \"touch\" stops the move as "
-    "soon as the part touches the object. release_at (optional, 0..1, parts that grip): open the gripper at that "
+    "soon as the part touches the object. While the part holds the object, a move goes up over anything the object would "
+    "hit on the straight line (a bin's wall, a box) and back down at the end, so a carry can go straight to where it "
+    "sets the object down. release_at (optional, 0..1, parts that grip): open the gripper at that "
     "fraction of the way, while still moving (how a throw lets go). "
     "throw(part, x, y, from_x, from_y): throws what the gripping part holds so it lands at (x, y): Morph does the "
     "backswing, the fast swing and lets go on the way, and tunes when to let go and the aim from where practice throws "
@@ -57,7 +61,8 @@ BLOCKS_DOC = (
     "push(part, direction, distance, speed): slide the part horizontally by distance (m) towards direction (degrees: "
     "0 = east, 90 = north), keeping its height and pointing; use it to push or sweep the object (put the part against "
     "the far side of the object first, low on its face). "
-    "grip(\"close\") / grip(\"open\"): only for parts listed with can_grip; close waits until the fingers stop. "
+    "grip(\"close\") / grip(\"open\"): only for parts listed with can_grip; close waits until the fingers stop; "
+    "{\"do\": \"grip\", \"how\": \"open\", \"width\": 0.04} opens the fingertips only that far apart (m), not all the way. "
     "pick(part): Morph's own grasp, the reliable way to pick the object up with a gripping part: Morph tries many "
     "ways to grip this object with this gripper in simulation (which sides, where, from above or the side, how high) "
     "and uses the one that held best, then lifts it 5 cm. Use it instead of writing the grasp yourself; then carry it "
@@ -174,12 +179,18 @@ def robot_parts(m: mujoco.MjModel, d: mujoco.MjData, ix, task: dict) -> dict[str
 
         def local(dd, k, b):
             return dd.xmat[ref].reshape(3, 3).T @ (_tip(m, dd, int(b), ix.tip_off[k]) - dd.xpos[ref])
-        before = {int(b): local(d2, k, b).copy() for k, b in enumerate(ix.tips)}
         d2.ctrl[:] = d.ctrl
+        d2.ctrl[ix.grip_act] = ix.grip_open  # from open: Spot's home pose has its gripper shut, and closing moved nothing
+        for _ in range(int(0.6 / m.opt.timestep)):
+            mujoco.mj_step(m, d2)
+        # only what hangs from the gripper's mount can be a finger: Spot's feet shifted 4 cm against its wrist as it
+        # sagged onto its legs, and two feet were taken for the fingers (the "hand" was its body, with no joints)
+        mine = _subtree(m, ref)
+        before = {int(b): local(d2, k, b).copy() for k, b in enumerate(ix.tips) if int(b) in mine}
         d2.ctrl[ix.grip_act] = ix.grip_close
         for _ in range(int(0.6 / m.opt.timestep)):
             mujoco.mj_step(m, d2)
-        shift = {int(b): local(d2, k, b) - before[int(b)] for k, b in enumerate(ix.tips)}
+        shift = {int(b): local(d2, k, b) - before[int(b)] for k, b in enumerate(ix.tips) if int(b) in before}
         moved = [b for b, v in shift.items() if np.linalg.norm(v) > 0.004]
         tips = {int(b): ix.tip_off[k] for k, b in enumerate(ix.tips)}
         if len(moved) == 1:  # a single jaw closing against a fixed one (the part it hangs from): that is the other finger
@@ -237,6 +248,58 @@ def robot_parts(m: mujoco.MjModel, d: mujoco.MjData, ix, task: dict) -> dict[str
     return parts
 
 
+def _one_jaw(part: Part) -> bool:
+    """One jaw closing against a fixed one that is part of the hand itself (Spot's), not fingers that both move."""
+    return bool(part.fingers) and part.body in {int(b) for b, _ in part.fingers}
+
+
+def _straight_stalls(rn, part: Part, p0, a0, target, point, across, q, speed: float, signed: bool = False) -> bool:
+    """Would following the straight line to target (as a move does) leave the part more than 2 cm off it somewhere?"""
+    turn = math.acos(float(np.clip(a0 @ point, -1, 1))) if point is not None else 0.0
+    n = max(1, math.ceil(max(float(np.linalg.norm(target - p0)) / speed, turn / 0.05)))
+    for k in range(n):
+        f = (k + 1) / n
+        pt = None
+        if point is not None:
+            pt = a0 + (point - a0) * f
+            pt = pt / (np.linalg.norm(pt) + 1e-9)
+        q, pe, _ = rn._ik(part, p0 + (target - p0) * f, pt, across, q, 80, signed)
+        if pe > 0.02:
+            return True
+    return False
+
+
+def _jaw_tips_middle(m, d, part: Part, length: float = 0.02):
+    """The middle of the gap between the fingers' inner faces over their last `length` m (where a small thing is
+    pinched), the way across it square to the hand, the line from one finger's end to the other's, and that middle
+    moved out level with the fingers' ends (world frame); None if the fingers have no shapes there."""
+    from .introspect import _geom_points
+    (a, _), (b, _) = part.fingers
+    w = d.xmat[part.body].reshape(3, 3) @ part.axis  # the way the hand points
+
+    def pts(body):
+        own = [g for g in range(m.ngeom) if m.geom_bodyid[g] == body and (m.geom_contype[g] or m.geom_conaffinity[g])]
+        if not own:
+            return None
+        p = np.vstack([_geom_points(m, d, g) for g in own])
+        return p[p @ w > (p @ w).max() - length]
+    pa, pb = pts(int(a)), pts(int(b))
+    if pa is None or pb is None:
+        return None
+    u = pb.mean(0) - pa.mean(0)
+    u = u - w * float(u @ w)
+    u /= np.linalg.norm(u) + 1e-9
+    ia = pa[pa @ u > (pa @ u).max() - 0.005].mean(0)  # each finger's face towards the other
+    ib = pb[pb @ u < (pb @ u).min() + 0.005].mean(0)
+    ea, eb = pa[np.argmax(pa @ w)], pb[np.argmax(pb @ w)]  # each finger's end
+    line = (eb - ea) / (np.linalg.norm(eb - ea) + 1e-9)  # (Spot's two jaws aren't mirror images: level their ends)
+    mid = (ia + ib) / 2
+    w2 = w - line * float(w @ line)  # the middle of the gap, pointing out along it
+    w2 /= np.linalg.norm(w2) + 1e-9
+    end = mid + w2 * (max(float(np.max(pa @ w2)), float(np.max(pb @ w2))) - float(mid @ w2))  # level with their ends
+    return mid, u, line, end
+
+
 def _far_point(m, d, b: int) -> np.ndarray:
     """A body's tip in its own frame: the corner of its shapes farthest from the joint it turns about."""
     pivot = d.xanchor[m.body_jntadr[b]] if m.body_jntnum[b] else d.xpos[int(m.body_parentid[b])]
@@ -291,6 +354,9 @@ class BodyRunner:
         self.scratch = mujoco.MjData(self.m)
         self.reset(0, task["start"], None)
         self.parts = robot_parts(self.m, self.d, self.ix, task)
+        if task.get("legs_still"):  # it stands where it works: its feet aren't parts to move (learn_task._legged_stance)
+            legs = {int(self.m.actuator_trnid[a, 0]) for a in task["legs_still"]}
+            self.parts = {n: p for n, p in self.parts.items() if not set(p.joints) & legs}
         self.home_q = self.d.qpos.copy()
         self.couple = _coupled(self.m)  # a telescoping arm's sections, moved as one
 
@@ -323,6 +389,8 @@ class BodyRunner:
             d.qpos[ix.base_q:ix.base_q + 7] = [mx, my, task.get("base_z", 0.4), math.cos(myaw / 2), 0, 0, math.sin(myaw / 2)]
         self.ctrl = np.clip(ix.q0, ix.act_lo, ix.act_hi).copy()
         d.ctrl[:] = self.ctrl
+        for n, off in getattr(self, "_offset0", {}).items():  # the hand's point as measured, not as a grip last aimed it
+            self.parts[n].offset, self.parts[n].axis = off.copy(), self._axis0[n].copy()
         mujoco.mj_forward(m, d)
         t = task["target"]
         self.env.set_goal_marker(t["x"], t["y"], t["yaw"])
@@ -341,12 +409,87 @@ class BodyRunner:
         d = d if d is not None else self.d
         (a, oa), (b, ob) = part.fingers
         v = _tip(self.m, d, b, ob) - _tip(self.m, d, a, oa)
+        if _one_jaw(part):  # square to the way it points (Spot's hand, tilted to level its jaws' ends, had its
+            w = self.pointing(part, d)  # fingers read 7 degrees off, and "fingers across the pen" couldn't be met)
+            v = v - w * float(v @ w)
         return v / (np.linalg.norm(v) + 1e-9)
 
-    def ik(self, part: Part, target, point=None, across=None, q_start=None, iters: int = 80):
+    def open_to(self, width: float) -> float:
+        """The gripper command that opens its fingertips `width` m wider than shut (fully open if they don't get that
+        far): just wider than the object, as a hand opens to pick something up. Spot's lower jaw swings through 90
+        degrees to open fully, and from above it dug into the floor before the hand got down to a pen."""
+        ix = self.ix
+        hand = next((p for p in self.parts.values() if p.can_grip and p.fingers), None)
+        if hand is None or ix.grip_close == ix.grip_open:
+            return ix.grip_open
+        if not hasattr(self, "_gaps"):  # measured once, on its own fingers: closed to fully open
+            m, d2 = self.m, mujoco.MjData(self.m)
+            (a, oa), (b, ob) = hand.fingers
+            self._gaps = []
+            for f in np.linspace(0.0, 1.0, 9):
+                c = ix.grip_close + (ix.grip_open - ix.grip_close) * f
+                d2.qpos[:], d2.qvel[:] = self.home_q, 0.0
+                d2.ctrl[:] = np.clip(ix.q0, ix.act_lo, ix.act_hi)
+                d2.ctrl[ix.grip_act] = c
+                for _ in range(int(0.6 / m.opt.timestep)):
+                    mujoco.mj_step(m, d2)
+                ta, tb = _tip(m, d2, a, oa), _tip(m, d2, b, ob)
+                R, p0 = d2.xmat[hand.body].reshape(3, 3), d2.xpos[hand.body]
+                mid = _jaw_tips_middle(m, d2, hand)
+                self._gaps.append((float(np.linalg.norm(tb - ta)), float(c),
+                                   None if mid is None else (R.T @ (mid[0] - p0), R.T @ mid[1], R.T @ mid[2],
+                                                             R.T @ (mid[3] - p0))))
+            self._offset0 = {n: p.offset.copy() for n, p in self.parts.items()}
+            self._axis0 = {n: p.axis.copy() for n, p in self.parts.items()}
+        shut = self._gaps[0][0]  # (the points measured are the fingers' far corners: apart even when shut)
+        return next((c for gap, c, _ in self._gaps if gap - shut >= width), ix.grip_open)
+
+    def aim_gap(self, part: Part, c: float) -> None:
+        """The hand's point to the middle of the gap between its fingers with the gripper at command c (across the gap
+        only). Where one jaw moves against a fixed one (Spot's), that middle moves as it opens: its point was measured
+        fully open, and opened just wider than a pen its fixed jaw came down on top of the pen. Fingers that both move
+        keep the same middle, so nothing changes for them."""
+        if not hasattr(self, "_gaps") or part.name not in self._offset0 or not _one_jaw(part):
+            return
+        at = min(self._gaps, key=lambda e: abs(e[1] - c))[2]
+        off0, ax0 = self._offset0[part.name], self._axis0[part.name]
+        if at is None or abs(c - self.ix.grip_open) < 1e-9:
+            part.offset, part.axis = off0.copy(), ax0.copy()
+            return
+        mid, u, line, end = at
+        # it points along the middle of the gap: square to the line between the fingers' faces, so "pointing down"
+        # puts both fingertips at the same height (Spot's moving jaw opens upwards, and with its fixed jaw on the floor
+        # it came down on top of a pen instead of beside it)
+        ax = ax0 - line * float(ax0 @ line)
+        part.axis = ax / (np.linalg.norm(ax) + 1e-9)
+        if float((end - off0) @ part.axis) > 0.03:
+            # long jaws that close like pliers reach well past the point measured between them (12 cm on Spot): the
+            # point is between their ends, or "fingertips 3 mm up" pressed them into the floor above a pen
+            part.offset = end
+        else:
+            part.offset = off0 + u * float((mid - off0) @ u)
+
+    def ik(self, part: Part, target, point=None, across=None, q_start=None, iters: int = 80, signed: bool = False,
+           stay: float = 0.0):
         """Joint values (part.joints order) that put the tip at target, pointing along `point` (unit vector) and with
         the fingers along `across` (unit, horizontal), as far as the body allows. Returns (q, position error m,
-        pointing error rad)."""
+        pointing error rad). A long way off and asked to point too, it also tries getting there first and turning the
+        hand after, and keeps whichever ends closer: from Spot's folded arm, solving both at once stalled 58 cm above
+        a pen it can reach. stay: how much it prefers joint values near q_start (following a path tick by tick)."""
+        q, pe, ae = self._ik(part, target, point, across, q_start, iters, signed, stay)
+        if (point is None and across is None) or (pe < 0.002 and ae < 0.03):
+            return q, pe, ae
+        self.scratch.qpos[:] = self.d.qpos
+        if q_start is not None:
+            self._set(self.scratch, part, q_start)
+        mujoco.mj_kinematics(self.m, self.scratch)
+        if np.linalg.norm(np.asarray(target, float) - self.tip(part, self.scratch)) < 0.05:
+            return q, pe, ae
+        q1, _, _ = self._ik(part, target, None, None, q_start, iters)
+        q2, pe2, ae2 = self._ik(part, target, point, across, q1, iters, signed, stay)
+        return (q2, pe2, ae2) if pe2 + 0.05 * ae2 < pe + 0.05 * ae else (q, pe, ae)
+
+    def _ik(self, part: Part, target, point, across, q_start, iters: int, signed: bool = False, stay: float = 0.0):
         m, d2 = self.m, self.scratch
         d2.qpos[:] = self.d.qpos
         if q_start is not None:
@@ -371,9 +514,16 @@ class BodyRunner:
                 ae = math.acos(float(np.clip(a @ point, -1, 1)))
             if across is not None and part.fingers:
                 f = self.finger_axis(part, d2)
-                f = f if f @ across >= 0 else -f  # either finger can be on either side
+                if not signed:  # either finger can be on either side (not so for a plan that says which way they close:
+                    f = f if f @ across >= 0 else -f  # one jaw that moves, against a fixed one)
                 rows.append(0.15 * (-_skew(f) @ self._cols(jr, part)))
                 errs.append(0.15 * (across - f))
+            if stay > 0 and q_start is not None:
+                # the smallest change from where the joints are: where two joints turn the hand the same way (Spot's
+                # forearm and wrist rolls, its wrist almost straight) the solution otherwise swapped from one to the
+                # other mid-carry, the hand shook and the parcel popped out of its jaw
+                rows.append(stay * np.eye(len(part.joints)))
+                errs.append(stay * (np.asarray(q_start, float) - self.q(part, d2)))
             J, e = np.vstack(rows), np.concatenate(errs)
             if pe < 0.002 and ae < 0.03 and (across is None or np.linalg.norm(errs[-1]) < 0.01):
                 break
@@ -382,7 +532,8 @@ class BodyRunner:
             self._set(d2, part, np.clip(self.q(part, d2) + dq, lo, hi))
         return self.q(part, d2), pe, ae
 
-    def reconfigure(self, part: Part, target, point=None, across=None, tries: int = 12, seed: int = 0):
+    def reconfigure(self, part: Part, target, point=None, across=None, tries: int = 12, seed: int = 0,
+                    signed: bool = False):
         """Joint values for the end pose found from other starting arrangements (home, random), or None."""
         rng = np.random.default_rng(seed)
         m = self.m
@@ -392,7 +543,7 @@ class BodyRunner:
         best, key = None, None
         for k in range(tries):
             q0 = home if k == 0 else rng.uniform(lo, hi)
-            q, pe, ae = self.ik(part, target, point, across, q0, iters=150)
+            q, pe, ae = self.ik(part, target, point, across, q0, iters=150, signed=signed)
             if pe < 0.01 and ae < 0.1:
                 cur = self.q(part)
                 score = float(np.max(np.abs(q - cur)))  # the nearest arrangement that works
@@ -509,7 +660,11 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
                 raise ProgramError(f"step {i}: point must be down, up, north, south, east, west, object, keep or [dx, dy, dz]")
             s["point"] = pt
             turn = st.get("turn", "keep")
-            if turn not in ("keep", "object"):
+            if isinstance(turn, list):  # the way the fingers close, as a direction (a hand tipped onto its side)
+                if len(turn) != 3:
+                    raise ProgramError(f"step {i}: turn as a direction needs three numbers [dx, dy, dz]")
+                turn = [_formula(v, f"step {i} turn", names) for v in turn]
+            elif turn not in ("keep", "object"):
                 turn = _formula(turn, f"step {i} turn", names)
             if turn != "keep" and not parts[s["part"]].fingers:
                 raise ProgramError(f"step {i}: turn only applies to a part that grips ({s['part']} doesn't)")
@@ -539,6 +694,11 @@ def check_body_program(steps: list, parts: dict, joints: list[str], known: set =
             if not any(p.can_grip for p in parts.values()):
                 raise ProgramError(f"step {i}: this robot has no gripper")
             s["how"] = how
+            if how == "open" and st.get("width") is not None:  # only this wide (m), not all the way
+                try:
+                    s["width"] = min(max(float(st["width"]), 0.005), 1.0)
+                except (TypeError, ValueError):
+                    raise ProgramError(f"step {i}: width is how far apart to open the fingers, in metres") from None
         elif op == "joints":
             vals = (st.get("joints") or st.get("values") or st.get("value") or st.get("targets") or st.get("positions")
                     or st.get("angles") or {k: v for k, v in st.items() if k not in ("do", "op", "seconds", "speed")})
@@ -586,7 +746,8 @@ def describe(s: dict) -> str:
         if s["point"] != "keep":
             bits.append(f"pointing {s['point']}")
         if s["turn"] != "keep":
-            bits.append("fingers across the object" if s["turn"] == "object" else f"turned {s['turn']}°")
+            bits.append("fingers across the object" if s["turn"] == "object" else
+                        f"fingers closing along {s['turn']}" if isinstance(s["turn"], list) else f"turned {s['turn']}°")
         bits.append(s["speed"])
         if s.get("until"):
             bits.append("until it touches")
@@ -647,6 +808,57 @@ def _touching(rn: BodyRunner, bodies: set) -> set:
             out.add("object" if o in blk else "floor" if ob == 0 else
                     "robot" if m.body(ob).name.startswith("robot_") else m.body(ob).name)
     return out
+
+
+CARRY_CLEAR = 0.02  # m: how far above what's in the way a carried object passes
+
+
+def _world_box(m, d, g) -> tuple[np.ndarray, np.ndarray]:
+    """A geom's axis-aligned bounds in the world (lo, hi)."""
+    R = d.geom_xmat[g].reshape(3, 3)
+    c = d.geom_xpos[g] + R @ m.geom_aabb[g, :3]
+    h = np.abs(R) @ m.geom_aabb[g, 3:]
+    return c - h, c + h
+
+
+def _carry_way(rn: BodyRunner, p0: np.ndarray, target: np.ndarray) -> tuple[list, list]:
+    """The way the tip goes from p0 to target while it holds the object: straight, unless the object (moving with the
+    tip) would pass through something in the scene on the way (not counting the end, where it may be set down);
+    then up until it clears all that, across, and down. Returns the points ([p0, ..., target]) and what it goes over."""
+    m, d, ix = rn.m, rn.d, rn.ix
+    blk = set(ix.block_geoms.tolist())
+    los, his = zip(*(_world_box(m, d, g) for g in blk))
+    o_lo, o_hi = np.min(los, axis=0) - p0, np.max(his, axis=0) - p0  # the object's bounds around the tip
+    things = []
+    for g in range(m.ngeom):
+        b = int(m.geom_bodyid[g])
+        if g in blk or b == 0 or m.body(b).name.startswith("robot_") or not (m.geom_contype[g] or m.geom_conaffinity[g]):
+            continue
+        lo, hi = _world_box(m, d, g)
+        lo, hi = lo + 0.002, hi - 0.002  # (resting against it isn't passing through it)
+        things.append((lo, hi, m.body(b).name))
+
+    def hits(p, lo, hi):
+        return bool(np.all(p + o_lo < hi) and np.all(p + o_hi > lo))
+
+    n = max(2, int(np.linalg.norm(target - p0) / 0.01))
+    path = [p0 + (target - p0) * k / n for k in range(1, n)]  # (the end is left out: setting it down there)
+    blocking = [t for t in things if not hits(p0, t[0], t[1]) and any(hits(p, t[0], t[1]) for p in path)]
+    if not blocking:
+        return [p0, target], []
+    # high enough to clear everything under the way across, from above the start to above the end
+
+    def below(p, lo, hi):
+        return bool(np.all(p[:2] + o_lo[:2] < hi[:2]) and np.all(p[:2] + o_hi[:2] > lo[:2]))
+    under = [t for t in things if not hits(p0, t[0], t[1]) and any(below(p, t[0], t[1]) for p in [*path, target])]
+    z = max(t[1][2] for t in under) + 0.002 + CARRY_CLEAR - o_lo[2]
+    way = [p0]
+    if z > p0[2] + 1e-3:
+        way.append(np.array([p0[0], p0[1], z]))
+    way.append(np.array([target[0], target[1], max(z, target[2])]))
+    if z > target[2] + 1e-3:
+        way.append(target.copy())
+    return way, sorted({t[2] for t in blocking})
 
 
 def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, settle_s: float = 1.5, on_step=None,
@@ -712,7 +924,7 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
             if st["do"] == "move":
                 target = np.array([val(st["x"]), val(st["y"]), val(st["z"])])
                 point = _direction(st["point"], rn, part, val)
-                across = None
+                across, signed = None, False
                 if st["turn"] == "object":
                     yaw = before.yaw
                     f = rn.finger_axis(part)
@@ -722,26 +934,30 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                         across = cands[0] if hx < hy else cands[1]
                     else:  # about square: whichever side needs the least turning
                         across = max(cands, key=lambda c: abs(c @ f)) if f is not None else cands[0]
+                elif isinstance(st["turn"], list):
+                    signed = True
+                    across = np.array([val(v) for v in st["turn"]], float)
+                    if point is not None:  # square to the way it points
+                        across = across - point * float(across @ point)
+                    across = across / (np.linalg.norm(across) + 1e-9)
                 elif st["turn"] != "keep":
                     a = math.radians(val(st["turn"]))
                     across = np.array([math.cos(a), math.sin(a), 0.0])
                 elif part.fingers is not None and (point is None or float(rn.pointing(part) @ point) > 0.995):
-                    # pointing the same way: keep the fingers turned as they are too (no drift on the way down)
-                    f = rn.finger_axis(part).copy()
-                    f[2] = 0.0
-                    if np.linalg.norm(f) > 0.5:
-                        across = f / np.linalg.norm(f)
+                    # pointing the same way: keep the fingers turned as they are too (no drift on the way down), tilted as
+                    # they are too (a hand tipped so its fixed jaw stands upright beside the object)
+                    across, signed = rn.finger_axis(part).copy(), True
             else:
                 a = math.radians(val(st["direction"]))
                 target = p0 + val(st["distance"]) * np.array([math.cos(a), math.sin(a), 0.0])
-                point, across = None, None
+                point, across, signed = None, None, False
             a0 = rn.pointing(part)
             if st["do"] == "move" and (point is not None or across is not None):
                 # can the straight path get there from how the limbs are now? If not, but the end pose is possible from
                 # another arrangement of the joints (elbow up instead of down), swing there joint by joint first
-                q_end, pe_end, ae_end = rn.ik(part, target, point, across, q_part[st["part"]], iters=150)
+                q_end, pe_end, ae_end = rn.ik(part, target, point, across, q_part[st["part"]], iters=150, signed=signed)
                 if pe_end > 0.01 or ae_end > 0.1:
-                    best = rn.reconfigure(part, target, point, across)
+                    best = rn.reconfigure(part, target, point, across, signed=signed)
                     if best is not None:
                         q0_ = rn.q(part)
                         steps_n = max(10, int(np.max(np.abs(best - q0_)) / 0.03))
@@ -751,23 +967,61 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                         q_part[st["part"]] = best
                         note += "turned its joints around to get there (the straight way was blocked by its joint limits); "
                         p0, a0 = rn.tip(part), rn.pointing(part)
-            dist = float(np.linalg.norm(target - p0))
+                elif _straight_stalls(rn, part, p0, a0, target, point, across, q_part[st["part"]], SPEEDS[st["speed"]],
+                                      signed):
+                    # the end pose is fine but the straight line stalls on the way, as from Spot's folded arm (it stayed
+                    # 65 cm up, then the next move swept down onto the pen): move the joints straight there instead
+                    q0_ = rn.q(part)
+                    steps_n = max(10, int(np.max(np.abs(q_end - q0_)) / 0.03))
+                    for k in range(steps_n):
+                        rn.command(part, q0_ + (q_end - q0_) * (k + 1) / steps_n)
+                        tick()
+                    q_part[st["part"]] = q_end
+                    note += "moved its joints straight there (the straight line stalled from how its limbs were); "
+                    p0, a0 = rn.tip(part), rn.pointing(part)
+            way = [p0, target]
+            carrying = st["do"] == "move" and contact_held(m, rn.d, ix) > 0.5
+            if carrying:
+                # carrying it: a straight line that would sweep the object through something on the way goes up over
+                # it and back down (Nemotron's carries went straight from the lift down to the bin, the parcel hit the
+                # bin's wall and fell out, three programs running)
+                way, over = _carry_way(rn, p0, target)
+                if over:
+                    note += f"went up over the {', '.join(over)} on the way (the straight line would have hit it with the {scene.object_name}); "
+            legs = [float(np.linalg.norm(b_ - a_)) for a_, b_ in zip(way, way[1:])]
+            dist = sum(legs)
+
+            def along(f):  # the point a fraction f of the way along the path, by distance
+                s = f * dist
+                for j, L in enumerate(legs):
+                    if s <= L or j == len(legs) - 1:
+                        return way[j] + (way[j + 1] - way[j]) * (min(1.0, s / L) if L > 0 else 1.0)
+                    s -= L
+                return way[-1]
             turn_ang = math.acos(float(np.clip(a0 @ point, -1, 1))) if point is not None else 0.0
             n = max(1, math.ceil(max(dist / SPEEDS[st["speed"]], turn_ang / 0.05)))
+            # carrying it, the move eases in and out at the same top speed (no jump from standing to full speed in one
+            # tick): Spot's 5 cm parcel crept out of its jaw on carries that started and stopped dead (not a throw,
+            # which needs the speed when it lets go)
+            smooth = carrying and "release_at" not in st
+            if smooth:
+                n = math.ceil(n * 1.875)  # (a smooth start and stop peaks at 1.875 x its average speed)
             worst, touched_at, let_go = 0.0, None, ""
             hold = point is None  # "keep": the part goes on pointing the way it points (a hand tilting on the way drops
             # what it carries: a pen slid out of the fingers when the hand tipped 60° on a throw's backswing)
             hold_dir = a0 if hold else None
             for k in range(n):
                 f = (k + 1) / n
-                p = p0 + (target - p0) * f
+                if smooth:
+                    f = f * f * f * (10 - 15 * f + 6 * f * f)
+                p = along(f)
                 pt = None
                 if point is not None:
                     pt = a0 + (point - a0) * f
                     pt = pt / (np.linalg.norm(pt) + 1e-9)
                 elif hold_dir is not None:
                     pt = hold_dir
-                q, pe, ae = rn.ik(part, p, pt, across, q_part[st["part"]])
+                q, pe, ae = rn.ik(part, p, pt, across, q_part[st["part"]], signed=signed, stay=0.05)
                 worst = max(worst, pe)
                 q_part[st["part"]] = q
                 rn.command(part, q)
@@ -799,7 +1053,17 @@ def run_body_program(rn: BodyRunner, steps: list[dict], goal: GoalSpec, scene, s
                 if miss > 10:
                     note += f"; it points {miss:.0f}° off the direction asked for"
         elif st["do"] == "grip":
-            rn.ctrl[ix.grip_act] = ix.grip_close if st["how"] == "close" else ix.grip_open
+            want = ix.grip_close if st["how"] == "close" else \
+                rn.open_to(st["width"]) if st.get("width") else ix.grip_open
+            # the command moves over the gripper's time (as the learner's does): snapped in one tick, Spot's 0.2 kg jaw
+            # swung its wrist 5 cm and flung the pen away
+            c0, ticks = float(rn.ctrl[ix.grip_act]), int(rn.task.get("gripper_ticks") or 1)
+            for k in range(ticks - 1):
+                rn.ctrl[ix.grip_act] = c0 + (want - c0) * (k + 1) / ticks
+                tick()
+            rn.ctrl[ix.grip_act] = want
+            if st["how"] == "open":  # aim at the middle of the gap as it now opens
+                rn.aim_gap(grippers[0], rn.ctrl[ix.grip_act])
             last = float(rn.d.actuator_length[ix.grip_act])
             for k in range(40):
                 tick()

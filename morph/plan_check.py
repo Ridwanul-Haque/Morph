@@ -118,17 +118,53 @@ def grip_first(steps: list[dict], task: dict) -> list[str]:
             "fingers either side of the object)"]
 
 
-def require_grip(task: dict) -> str | None:
-    """What grip_first asks for, done by Morph if the plan still leaves it out: the step before the grasp also needs
-    the hand at Morph's grip. Returns what it changed."""
-    steps = task.get("steps") or []
-    if not grip_first(steps, task):
-        return None
+def _closes_on(task: dict) -> bool:
+    """Does the robot have parts that close on an object from either side (a gripper, a hand's fingers)?"""
+    if task.get("gripper"):
+        return True
+    try:
+        import mujoco
+        from .fingers import hands
+        return bool(hands(mujoco.MjModel.from_xml_path(task["robot_xml"])))
+    except Exception:  # noqa: BLE001  (no model to look at)
+        return False
+
+
+def between_first(steps: list[dict], task: dict) -> list[str]:
+    """The step that ends just before the grasp must have the object between the fingers: near it isn't enough (the
+    Stretch's fingers came within 2.5 cm of a pen, round after round, and closed beside it). Not when the plan names
+    Morph's own grip (grip_gap), which already puts the fingers either side of it."""
     g = _grasp_step(steps)
+    if not g or task.get("start_state") or not _closes_on(task):
+        return []
     st = steps[g - 1]
-    st["done_when"] = f"({st['done_when']}) and grip_gap < {GRIP_GAP}"
-    return (f"step {g}, \"{st['name']}\", now also needs the hand where Morph grips the "
-            f"{task.get('object', 'object')} (grip_gap < {GRIP_GAP}): near it isn't enough to grip it")
+    try:
+        names = _names(st["done_when"])
+    except SyntaxError:
+        return []
+    if "between" in names or task.get("grasp") and "grip_gap" in names:
+        return []
+    return [f"step {g}, \"{st['name']}\" ({st['done_when']}), sets up the grasp in step {g + 1} without the object "
+            "being between the fingers: a gripper can only grab what is between them, and near it isn't enough. Add "
+            "between == 1"]
+
+
+def require_grip(task: dict) -> str | None:
+    """What grip_first and between_first ask for, done by Morph if the plan still leaves it out: the step before the
+    grasp also needs the hand at Morph's grip, or the object between the fingers. Returns what it changed."""
+    steps = task.get("steps") or []
+    g = _grasp_step(steps)
+    if grip_first(steps, task):
+        st = steps[g - 1]
+        st["done_when"] = f"({st['done_when']}) and grip_gap < {GRIP_GAP}"
+        return (f"step {g}, \"{st['name']}\", now also needs the hand where Morph grips the "
+                f"{task.get('object', 'object')} (grip_gap < {GRIP_GAP}): near it isn't enough to grip it")
+    if between_first(steps, task):
+        st = steps[g - 1]
+        st["done_when"] = f"({st['done_when']}) and between == 1"
+        return (f"step {g}, \"{st['name']}\", now also needs the {task.get('object', 'object')} between the fingers "
+                "(between == 1): a gripper can only grab what is between them")
+    return None
 
 
 HELD_ON = re.compile(r"\bheld\s*(?:==\s*1(?:\.0)?|>=?\s*0?\.5|>\s*0(?:\.0)?)(?![\d.])")
@@ -335,5 +371,6 @@ def plan_checker(task: dict, conditions: list[dict], log=print):
 
     def check(steps: list[dict]) -> list[str]:
         return (unfinished(steps, conditions) + before_the_grasp(steps, task) + grip_first(steps, task)
+                + between_first(steps, task)
                 + (keep(steps) if keep else []))
     return check

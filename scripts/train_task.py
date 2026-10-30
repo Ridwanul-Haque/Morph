@@ -99,6 +99,10 @@ DESIRED_KL = 0.01  # how much one update may change the policy, with task["adapt
 MILESTONE_SLOTS = 2  # ... and how far it is towards the next moving target, and how many it has reached
 MILESTONE_BONUS = 1.0  # paid once for each moving target reached (task["milestones"])
 MILESTONE_PULL = 1.0  # paid as it gets there: in all, this much per target's worth of progress (taken back if it goes back)
+MILESTONE_KEEP_S = 2.0  # progress made this shortly before a "the whole time" rule breaks is taken back (fading with
+# time): progress only counts once the rule has kept holding after it, so breaking the rule to make it doesn't pay
+LOOK_AHEAD = 0.99  # the discount with moving targets and a "the whole time" rule: about 2 s ahead instead of 0.7, so
+# what a move leads to a couple of seconds later (the rule breaking, the progress taken back) still counts
 
 
 def task_v2(task: dict) -> bool:
@@ -256,6 +260,7 @@ class TaskLearn(mjx_env.MjxEnv):
         # ahead): a bonus each time the amount reaches the next one, the target moves on, and a pull towards it
         self.milestones = [(parse(m["of"], self.fx), float(m["every"])) for m in task.get("milestones", [])]
         self._ms_every = jp.array([e for _, e in self.milestones]) if self.milestones else None
+        self._ms_fade = float(np.exp(-CTRL_DT / MILESTONE_KEEP_S))
         self._ms_slots = MILESTONE_SLOTS if self.n_extra and task.get("critic_milestones") else 0
         self.n_extra += self._ms_slots
         self._obj_geom = int(np.flatnonzero(np.asarray(self._mj_model.geom_bodyid) == self.ix.block)[0])
@@ -428,6 +433,7 @@ class TaskLearn(mjx_env.MjxEnv):
         info["tphi"] = self._term_phi(data, win)[0]
         if self.milestones:
             info["ms"], info["ms_phi"] = self._milestones(data, win, jp.zeros(len(self.milestones)))
+            info["ms_recent"], info["ms_recent_hits"] = jp.zeros(()), jp.zeros(())
         if self.stop_rules:
             info["armed"] = ~self._broken(data, u, win)
             info["broke"] = jp.zeros(len(self.stop_rules), jp.int32)
@@ -568,11 +574,12 @@ class TaskLearn(mjx_env.MjxEnv):
         if self.stop_rules:  # a "the whole time" condition broken for longer than a contact flicker: the try is over
             info["broke"] = jp.where(self._broken(data, info["ease_u"], win), info["broke"] + 1, 0).astype(jp.int32)
             ended = jp.any(info["armed"] & (info["broke"] >= FLICKER_TICKS)).astype(jp.float32)
-            # what the rest of the try could have earned is lost, so ending it never pays (otherwise a try whose
-            # reward runs negative would learn to break a rule on purpose to stop early). A warm-up asks for less
-            # (end_cost): a robot that fears breaking a rule can learn to do nothing at all
-            left = jp.maximum(self.task["episode_s"] - (info["t"] + 1) * self.dt, 0.0)
-            end_pen = ended * self.task.get("end_cost", 3.0) * left
+            # as much as the whole try could have earned, so ending it never pays (otherwise a try whose reward runs
+            # negative would learn to break a rule on purpose to stop early), and the same late as early: when it was
+            # what was left of the try, breaking the rule near the end was cheap enough to be worth it for the
+            # progress made on the way. A warm-up asks for less (end_cost): a robot that fears breaking a rule can
+            # learn to do nothing at all
+            end_pen = ended * self.task.get("end_cost", 3.0) * self.task["episode_s"]
             done = jp.maximum(done, ended)
         tvals, tpaid = [], []
         if self.terms:  # Nemotron's terms (each clipped: one term can't swamp the rest), as potentials; a try that
@@ -591,6 +598,12 @@ class TaskLearn(mjx_env.MjxEnv):
             ms_hits = jp.sum(reached - info["ms"])
             ms_paid = MILESTONE_BONUS * ms_hits + MILESTONE_PULL * jp.sum(phi - info["ms_phi"])
             info["ms"], info["ms_phi"] = reached, phi
+            # ... except what came just before a rule broke (MILESTONE_KEEP_S): in the LinkerHand's pen spinning the
+            # turns paid were first the pen's as it slipped out, then flicks that lost it a few seconds later
+            info["ms_recent"] = info["ms_recent"] * self._ms_fade + ms_paid
+            info["ms_recent_hits"] = info["ms_recent_hits"] * self._ms_fade + ms_hits
+            ms_paid = ms_paid - ended * info["ms_recent"]
+            ms_hits = ms_hits - ended * info["ms_recent_hits"]  # (rounds are ranked by the targets kept)
         info["last_act"], info["prev_d"], info["ctrl"] = action, d, ctrl
         info["t"] = info["t"] + 1
         z = lambda x: jp.where(jp.isnan(x), 0.0, x)  # a blown-up copy shouldn't turn the logged averages into NaN
@@ -628,15 +641,21 @@ class TaskLearn(mjx_env.MjxEnv):
         return self._mjx_model
 
 
-def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: bool = False):
+def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: bool = False, recipe_only: bool = False):
     """Copy a demonstration first (behaviour cloning): train the policy network to output the program's actions
     for the observations along it, so practice starts from something that already grips and lifts instead of
-    from random flailing. Returns Brax's (normalizer, policy, value) params for PPO to continue from."""
+    from random flailing. recipe_only (with residual): no corrections anywhere, the program's own commands as they were
+    recorded. Returns Brax's (normalizer, policy, value) params for PPO to continue from."""
     import optax
     from brax.training.acme import running_statistics, specs
     z = np.load(demo)
+    for k in ("obs", "act"):  # one blank number spreads to the whole network: the robot then never moves at all
+        if not np.isfinite(z[k]).all():
+            cols = sorted({int(c) for c in np.where(~np.isfinite(z[k]))[1]})
+            raise SystemExit(f"the recorded program has blank numbers in its {k} (columns {cols}): copying it "
+                             f"would leave the robot frozen, so learning stops here")
     obs = jp.array(z["obs"], dtype=jp.float32)
-    act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32)
+    act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32) * (0.0 if residual and recipe_only else 1.0)
     priv = jp.concatenate([obs, jp.zeros((obs.shape[0], env.n_extra))], axis=1) if env.n_extra else obs
     od = {"state": obs, "privileged_state": priv}
     shape = {k: (v.shape[1],) for k, v in od.items()}
@@ -682,15 +701,16 @@ def imitate(env, net: dict, demo: Path, seed: int, steps: int = 3000, residual: 
     return (norm, pol, val)
 
 
-def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512, n_extra: int = 0):
+def keep_copying(demo: Path, n_act: int, weight: float, batch: int = 512, n_extra: int = 0, recipe_only: bool = False):
     """DAPG-style: while it practises, keep a pull towards the demonstration's actions in the situations the
     demonstration went through (an extra term in PPO's loss), so practice refines a working copy instead of
     slowly forgetting it. Rajeswaran et al. 2018 ("Learning Complex Dexterous Manipulation with Deep RL and
-    Demonstrations") decay it; here it stays, small, because the demonstration is known to reach the goal."""
+    Demonstrations") decay it; here it stays, small, because the demonstration is known to reach the goal.
+    recipe_only: the pull is towards no corrections (the recipe as recorded), as imitate."""
     from brax.training.agents.ppo import losses as ppo_losses
     z = np.load(demo)
     obs = jp.array(z["obs"], dtype=jp.float32)
-    act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32)
+    act = jp.array(np.clip(z["act"], -0.95, 0.95), dtype=jp.float32) * (0.0 if recipe_only else 1.0)
     original = ppo_losses.compute_ppo_loss
 
     def loss(params, normalizer_params, data, rng, ppo_network, *a, **kw):
@@ -750,6 +770,8 @@ def main():
         total = {r: -(-a.steps // (per_eval * r)) * per_eval * r for r in range(1, p.num_resets_per_eval + 1)}
         p.num_resets_per_eval = max(r for r, n in total.items() if n <= 1.1 * min(total.values()))
     p.episode_length = int(task["episode_s"] / CTRL_DT)
+    if task.get("milestones") and any(c.get("when") == "always" for c in task.get("conditions", [])):
+        p.discounting = LOOK_AHEAD
     env.gamma = eval_env.gamma = float(p.discounting)  # the reward terms' potentials discount as the learner does
     net = dict(p.network_factory)
     kw = {k: v for k, v in p.items() if k != "network_factory"}
@@ -806,7 +828,8 @@ def main():
     rand = domain_randomize(env, a.randomize) if a.randomize != "off" else None
     restore = None
     if not a.restore and task.get("demo") and (out / task["demo"]).exists():  # first round: copy the program first
-        restore = imitate(env, net, out / task["demo"], a.seed, residual=env.residual is not None)
+        restore = imitate(env, net, out / task["demo"], a.seed, residual=env.residual is not None,
+                          recipe_only=task.get("copy_corrections") is False)
         export_numpy(restore, out / "policy.npz")  # the copy on its own: Morph tries it before any practice
         (out / "params.pkl").write_bytes(pickle.dumps(jax.device_get(restore)))
         if a.imitate_only:
@@ -820,7 +843,8 @@ def main():
         kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) / (1 + 9 * trust)
         weight = a.keep_copying * max(trust, 0.2)
         if weight > 0 and (out / task["demo"]).exists():
-            keep_copying(out / task["demo"], env.nu, weight, n_extra=env.n_extra)
+            keep_copying(out / task["demo"], env.nu, weight, n_extra=env.n_extra,
+                         recipe_only=env.residual is not None and task.get("copy_corrections") is False)
     tw = task.get("ppo_tweaks") or {}  # this variant's exploration and learning speed (learn_task's population search)
     if tw:
         kw["entropy_cost"] = kw.get("entropy_cost", 1e-2) * float(tw.get("entropy", 1.0))

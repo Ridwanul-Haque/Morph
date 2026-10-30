@@ -103,4 +103,6 @@ def test_a_wheeled_base_is_set_down_where_it_can_grip_the_object(parcel_bin, mon
     assert info["ready"] >= 5 and json.loads(tp.read_text())["grasp"]["fingers"]
     ready = z["ready"]
     gi = ix.grip_act
-    assert all((z["ctrl"][i][gi] - ix.grip_open) / (ix.grip_close - ix.grip_open) < 0.2 for i in np.flatnonzero(ready))
+    shut = [(z["ctrl"][i][gi] - ix.grip_open) / (ix.grip_close - ix.grip_open) for i in np.flatnonzero(ready)]
+    # open as far as Morph's grip opens it (a little wider than the parcel, not always all the way)
+    assert max(shut) < 0.8 and max(shut) - min(shut) < 0.2

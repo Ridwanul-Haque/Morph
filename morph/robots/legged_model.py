@@ -41,10 +41,15 @@ class LeggedSetup:
     action_scale: float = 0.5
     torque_limits: list[float] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    driven: list[int] = field(default_factory=list)  # which of `joints` the walking policy moves (the legs); [] = all
 
     @property
     def n(self) -> int:
         return len(self.joints)
+
+    @property
+    def acts(self) -> list[int]:
+        return self.driven or list(range(self.n))
 
 
 def _foot_geom(m: mujoco.MjModel, d: mujoco.MjData, body: int) -> tuple[int, float]:
@@ -93,6 +98,15 @@ def legged_setup(model_path: str | Path, name: str | None = None) -> LeggedSetup
         feet.append({"body": c["leaf"], "geom": m.geom(g).name or f"geom{g}", "geom_id": int(g),
                      "pos": [float(v) for v in m.geom_pos[g]], "radius": r})
 
+    # the walking policy moves the legs only; an arm or a head holds its resting pose (Spot's policy swung its arm from
+    # the first step and flipped over within 0.6 s, every try)
+    leg_joints = set()
+    for f in feet:
+        b = m.body(f["body"]).id
+        while b != torso and b > 0:
+            leg_joints |= {int(j) for j in range(m.body_jntadr[b], m.body_jntadr[b] + m.body_jntnum[b])}
+            b = int(m.body_parentid[b])
+    driven = [i for i, jn in enumerate(joints) if m.joint(jn).id in leg_joints]
     legs = [c for c in prof.chains if c["role"] == "leg"]
     leg_len = float(np.mean([c["length_m"] for c in legs]))
     k = prof.mass_kg * leg_len / REF_MASS_X_LEG
@@ -101,9 +115,12 @@ def legged_setup(model_path: str | Path, name: str | None = None) -> LeggedSetup
              f"servo gains scaled x{k:.2f} from the Go1's by weight x leg length "
              f"({prof.mass_kg:.1f} kg, {leg_len:.2f} m legs)",
              "standing pose from the model's keyframe" if m.nkey else "standing pose = model zero pose (no keyframe)"]
+    if len(driven) < len(joints):
+        notes.append(f"walking moves the {len(driven)} leg joints; the other {len(joints) - len(driven)} "
+                     f"({', '.join(jn for i, jn in enumerate(joints) if i not in driven)}) hold their resting pose")
     return LeggedSetup(model_path=str(model_path), name=prof.name, torso=m.body(torso).name, joints=joints,
                        feet=feet, default_pose=default, stand_height=float(q0[m.jnt_qposadr[free] + 2]),
-                       kp=REF_KP * k, kd=REF_KD * k, torque_limits=taus, notes=notes)
+                       kp=REF_KP * k, kd=REF_KD * k, torque_limits=taus, notes=notes, driven=driven)
 
 
 def build_spec(s: LeggedSetup, training: bool = True, standalone: bool = True) -> mujoco.MjSpec:
@@ -129,7 +146,8 @@ def build_spec(s: LeggedSetup, training: bool = True, standalone: bool = True) -
         act.biasprm[0], act.biasprm[1], act.biasprm[2] = 0.0, -s.kp, 0.0
         act.gear[0] = 1.0
         act.ctrllimited, act.ctrlrange = True, list(j.range)
-        act.forcelimited, act.forcerange = True, [-tau, tau]
+        if tau > 0:  # (Spot's servos give no limit: 0 here, and a [0, 0] range wouldn't compile)
+            act.forcelimited, act.forcerange = True, [-tau, tau]
     # use the robot's own IMU mount if the model has one, otherwise put one at the torso origin
     own = [st for st in spec.sites if "imu" in st.name.lower()]
     imu = own[0].name if own else "morph_imu"
@@ -178,7 +196,9 @@ def apply_joint_gains(m: mujoco.MjModel, s: LeggedSetup) -> None:
     for jn in s.joints:  # joint damping acts as the servo's D term, as in Playground's Go1
         dof = m.joint(jn).dofadr[0]
         m.dof_damping[dof] = s.kd
-        m.dof_armature[dof] = max(m.dof_armature[dof], 0.005)
+        # enough inertia for the damping to settle within a step: Spot's light wrist, given the legs' servo, ran away
+        # in 0.14 s and every reward was NaN (the Go2's legs are unchanged: 0.005 is already more)
+        m.dof_armature[dof] = max(m.dof_armature[dof], 0.005, 1.5 * s.kd * SIM_DT)
 
 
 def build_model(s: LeggedSetup, training: bool = True) -> mujoco.MjModel:

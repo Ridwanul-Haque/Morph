@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .body_programs import BodyRunner, check_body_program, run_body_program
+from .body_programs import BodyRunner, _one_jaw, check_body_program, run_body_program
 from .task_model import contact_held
 
 
@@ -38,39 +38,52 @@ def grasp_candidates(rn: BodyRunner, scene, part: str) -> list[dict]:
     b = scene.block
     hx, hy, h = b.half_x, b.half_y, 2 * b.half_z
     radius = 0.04
+    margin = 0.03  # the fingertips opened this much wider than the object, not all the way (BodyRunner.open_to)
     cands = []
     # from above: the fingers closing across the object's x or y, at its centre or off-centre along its long side, the
     # fingertips just above the floor (a flat thing), a third of the way up, or two thirds (a tall thing)
     long_ax = 0 if hx >= hy else 1
     offsets = [0.0] + ([0.4, -0.4] if max(hx, hy) > 0.03 else [])
     heights = sorted({round(v, 4) for v in (0.003, 0.35 * h, 0.6 * h) if v < h - 0.004} | {0.003})
+    one_jaw = _one_jaw(rn.parts[part])
     for close_deg in (0, 90):
+        width = 2 * (hx if close_deg == 0 else hy) + margin
+        # one jaw swinging against a fixed one: also with the object against the fixed jaw, so the swinging one only
+        # pinches it instead of sweeping it across the floor (Spot's knocked a parcel over from the middle of the gap)
+        shifts = [None] + ([_fixed_jaw_shift(rn, scene, part, width, width - margin)] if one_jaw else [])
         for off in offsets:
-            u, v = (off * hx, 0.0) if long_ax == 0 else (0.0, off * hy)
-            x, y = _xy(u, v)
-            for z in heights:
-                cands.append({"desc": f"from above, fingers closing along the object's {'x' if close_deg == 0 else 'y'}, "
-                                      f"{'at the centre' if off == 0 else f'{abs(off):.0%} towards one end'}, fingertips "
-                                      f"{z * 100:.1f} cm up",
-                              "steps": [{"do": "grip", "how": "open"},
-                                        {"do": "move", "part": part, "x": x, "y": y, "z": "obj_top + 0.06", "point": "down",
-                                         "turn": f"obj_yaw_deg + {close_deg}"},
-                                        {"do": "move", "part": part, "x": x, "y": y, "z": f"obj_bottom + {z:.4f}",
-                                         "point": "down", "speed": "slow"},
-                                        {"do": "grip", "how": "close"},
-                                        {"do": "move", "part": part, "z": "obj_top + 0.05", "speed": "slow"}]})
+            for shift in shifts:
+                c_obj = (1.0, 0.0) if close_deg == 0 else (0.0, 1.0)  # the way the fingers close, in the object's frame
+                u, v = (off * hx, 0.0) if long_ax == 0 else (0.0, off * hy)
+                if shift is not None:
+                    u, v = u + shift * c_obj[0], v + shift * c_obj[1]
+                x, y = _xy(u, v)
+                turn = f"obj_yaw_deg + {close_deg}" if shift is None else _vec((c_obj[0], c_obj[1], 0.0))
+                for z in heights:
+                    cands.append({"desc": f"from above, fingers closing along the object's {'x' if close_deg == 0 else 'y'}, "
+                                          f"{'at the centre' if off == 0 else f'{abs(off):.0%} towards one end'}, "
+                                          + ("" if shift is None else "against the fixed jaw, ") +
+                                          f"fingertips {z * 100:.1f} cm up",
+                                  "steps": [{"do": "grip", "how": "open", "width": width},
+                                            {"do": "move", "part": part, "x": x, "y": y, "z": "obj_top + 0.06", "point": "down",
+                                             "turn": turn},
+                                            {"do": "move", "part": part, "x": x, "y": y, "z": f"obj_bottom + {z:.4f}",
+                                             "point": "down", "speed": "slow"},
+                                            {"do": "grip", "how": "close"},
+                                            {"do": "move", "part": part, "z": "obj_top + 0.05", "speed": "slow"}]})
     # from the side: the hand comes in level from one of the four sides, fingers closing horizontally across it (or
     # tilted as its wrist holds it, if it can't point level: the Stretch's gripper always points 30 degrees down)
     pz = level_tilt(rn, rn.parts[part])
     c = math.sqrt(max(1.0 - pz * pz, 0.0))
     for side_deg in (0, 90, 180, 270):
         ext = abs(hx * math.cos(math.radians(side_deg))) + abs(hy * math.sin(math.radians(side_deg)))
+        across = abs(hx * math.sin(math.radians(side_deg))) + abs(hy * math.cos(math.radians(side_deg)))
         for frac in (0.5, 0.35):
             z = f"obj_bottom + {frac * h:.4f}"
             d = f"(obj_yaw_deg + {side_deg})"
             back = ext + radius + 0.04
             cands.append({"desc": f"from the side ({side_deg}° in the object's frame), {frac:.0%} of its height up",
-                          "steps": [{"do": "grip", "how": "open"},
+                          "steps": [{"do": "grip", "how": "open", "width": 2 * across + margin},
                                     {"do": "move", "part": part, "x": f"obj_x - {back:.4f} * cosd{d}",
                                      "y": f"obj_y - {back:.4f} * sind{d}", "z": "obj_top + 0.06",
                                      "point": [f"{c:.4f} * cosd{d}", f"{c:.4f} * sind{d}", f"{pz:.4f}"],
@@ -81,6 +94,36 @@ def grasp_candidates(rn: BodyRunner, scene, part: str) -> list[dict]:
                                     {"do": "grip", "how": "close"},
                                     {"do": "move", "part": part, "z": "obj_top + 0.05", "speed": "slow"}]})
     return cands
+
+
+def _vec(v) -> list[str]:
+    """A direction in the object's frame, as world-frame formulas."""
+    return [f"({v[0]:.4f}) * cosd(obj_yaw_deg) - ({v[1]:.4f}) * sind(obj_yaw_deg)",
+            f"({v[0]:.4f}) * sind(obj_yaw_deg) + ({v[1]:.4f}) * cosd(obj_yaw_deg)", f"{v[2]:.4f}"]
+
+
+def _fixed_jaw_shift(rn: BodyRunner, scene, part: str, width: float, size: float) -> float:
+    """How far to move the point between the fingers towards the moving jaw (along the way the fingers close, from the
+    first finger to the second) for an object size m across to sit 4 mm from the fixed jaw, the gripper opened to
+    width: measured between the jaws' faces over their last 3 cm."""
+    from .goals import GoalSpec
+    from .introspect import _geom_points
+    p = rn.parts[part]
+    rn.reset(0, scene.start, None)
+    run_body_program(rn, check_body_program([{"do": "grip", "how": "open", "width": width}], rn.parts, []),
+                     GoalSpec(object=scene.object_name, conditions=[]), scene, settle_s=0.0)
+    m, d = rn.m, rn.d
+    w, f = rn.pointing(p), rn.finger_axis(p)
+
+    def tip(body):
+        own = [g for g in range(m.ngeom) if m.geom_bodyid[g] == body and (m.geom_contype[g] or m.geom_conaffinity[g])]
+        pts = np.vstack([_geom_points(m, d, g) for g in own])
+        return pts[pts @ w > (pts @ w).max() - 0.03]
+    (a, _), (b, _) = p.fingers
+    gap = float((tip(int(b)) @ f).min() - (tip(int(a)) @ f).max())
+    rn.reset(0, scene.start, None)
+    shift = max(0.0, (gap - size) / 2 - 0.004)
+    return shift if int(a) == p.body else -shift  # the fixed jaw is the first finger: move towards the second
 
 
 def level_tilt(rn: BodyRunner, part) -> float:
@@ -108,7 +151,8 @@ def _grasp_key(rn: BodyRunner, scene, part: str, starts: int) -> Path:
     t = rn.task
     key = json.dumps([str(t.get("robot_xml")), [round(float(v), 3) for v in t.get("mount", ())], t.get("block"),
                       [round(float(v), 4) for v in scene.start], part, starts,
-                      (t.get("gripper") or {}).get("gain_scale")], sort_keys=True, default=str)
+                      (t.get("gripper") or {}).get("gain_scale"), t.get("gripper_ticks"), "against the fixed jaw"], sort_keys=True,
+                     default=str)
     return GRASP_CACHE / f"{t.get('robot', 'robot')}__{hashlib.sha1(key.encode()).hexdigest()[:12]}.json"
 
 

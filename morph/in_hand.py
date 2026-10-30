@@ -21,7 +21,7 @@ import numpy as np
 from .fingers import hands
 
 SETTLE_S = 1.5
-CLOSURES = (0.3, 0.5, 0.7)
+CLOSURES = (0.3, 0.5, 0.7, 0.85)
 
 
 class NoGrip(ValueError):
@@ -211,34 +211,52 @@ def setup(task: dict, goal, log=print) -> dict:
     if want and cands[0]["missing"]:
         log(f"  (no grip Morph tried had the {' and '.join(want)} fingers all on the {goal.object}: starting from the "
             f"closest, {cands[0]['how']}, without {'; '.join(cands[0]['missing'])})")
-    for cand in [x for x in cands if not x["bad"] and x["missing"] == cands[0]["missing"]][:MAX_CHECKED]:
-        # (the asked-for fingers have to stay on it, untouched, as the goal's whole-time conditions do)
-        secs = min(_holds_for(mm, task, cand["qpos"], cand["ctrl"], always + [c_ for c_ in on_want if c_["text"]
-                                                                             not in cand["missing"]]) for mm in (m, fast))
-        held_for.append(secs)
-        cand["held_s"] = secs
-        if secs >= HOLD_S:
-            best = cand
-            break
-    note = ""
-    if best is None:  # none holds the whole time: the one that holds longest (practice has to learn to keep it)
-        best = max((x for x in cands if "held_s" in x), key=lambda x: x["held_s"])
-        note = f"; untouched it slips after {best['held_s']:.1f} s, so practice has to learn to keep it"
-    # more starts like it (a grasp cache, as in-hand rotation work uses): the same fingers and closure, the object
-    # laid a little differently. Practice starts from any of them, so it can't learn one lucky resting pose
-    starts = [best]
-    if best.get("held_s", 0) >= HOLD_S:
-        rng = np.random.default_rng(0)
+    def keep_on(cand):
+        return always + [c_ for c_ in on_want if c_["text"] not in cand["missing"]]
+
+    def laid_differently(cand, seed):
+        """The same fingers and closure with the object laid a little differently, each holding it untouched."""
+        out, rng = [], np.random.default_rng(seed)
         for _ in range(VARIATIONS):
             dp = np.array([*rng.uniform(-0.005, 0.005, 2), 0.0])
-            yaw = best["yaw"] + rng.uniform(-0.3, 0.3)
-            ctrl = drop(best["p"] + dp, yaw, best["used"], best["c"])
+            ctrl = drop(cand["p"] + dp, cand["yaw"] + rng.uniform(-0.3, 0.3), cand["used"], cand["c"])
             if ctrl is None or not (_only_robot_touches(m, d, ix) and d.xpos[ix.block][2] > 0.05):
                 continue
             qpos = d.qpos.copy()
-            keep = always + [c_ for c_ in on_want if c_["text"] not in best.get("missing", [])]
-            if min(_holds_for(mm, task, qpos, ctrl, keep) for mm in (m, fast)) >= HOLD_S:
-                starts.append({"qpos": qpos, "ctrl": ctrl, "how": best["how"] + " (laid a little differently)"})
+            if min(_holds_for(mm, task, qpos, ctrl, keep_on(cand)) for mm in (m, fast)) >= HOLD_S:
+                out.append({"qpos": qpos, "ctrl": ctrl, "how": cand["how"] + " (laid a little differently)"})
+        return out
+
+    holders = []
+    for cand in [x for x in cands if not x["bad"] and x["missing"] == cands[0]["missing"]][:MAX_CHECKED]:
+        # (the asked-for fingers have to stay on it, untouched, as the goal's whole-time conditions do)
+        secs = min(_holds_for(mm, task, cand["qpos"], cand["ctrl"], keep_on(cand)) for mm in (m, fast))
+        held_for.append(secs)
+        cand["held_s"] = secs
+        if secs >= HOLD_S:
+            holders.append(cand)
+    note, starts = "", []
+    if holders:
+        # holding still isn't enough: practice starts out with the fingers twitching at random, and how well a grip
+        # survives that depends mostly on how the object happened to settle (the LinkerHand's pen grip, laid 8 ways:
+        # from never kept through a try to always), so every grip is tried laid a few ways and only the sturdy poses
+        # are kept. Before this 2 of its 5 poses lost the pen within 1.5 s, and 4 in 10 practice tries ended at once
+        for k, cand in enumerate(holders):
+            poses = [{"qpos": cand["qpos"], "ctrl": cand["ctrl"], "how": cand["how"]}] + laid_differently(cand, k)
+            for st in poses:
+                st["sturdy"] = _sturdiness(fast, task, st["qpos"], st["ctrl"], keep_on(cand))
+            poses.sort(key=lambda st: st["sturdy"], reverse=True)
+            cand["poses"] = [st for st in poses if st["sturdy"] >= poses[0]["sturdy"] - STURDY_SLACK]
+            cand["sturdy"] = poses[0]["sturdy"]
+        best = max(holders, key=lambda x: (x["sturdy"], len(x["poses"])))
+        starts = best["poses"]
+        best = {**best, **starts[0]}
+        log(f"  the sturdiest start: {best['how']} (keeps it through {best['sturdy']:.0%} of whole tries with the "
+            f"fingers twitching at random; {len(starts)} pose{'s' if len(starts) > 1 else ''} about as sturdy)")
+    else:  # none holds the whole time: the one that holds longest (practice has to learn to keep it)
+        best = max((x for x in cands if "held_s" in x), key=lambda x: x["held_s"])
+        starts = [best]
+        note = f"; untouched it slips after {best['held_s']:.1f} s, so practice has to learn to keep it"
     _, qpos, ctrl, how = None, best["qpos"], best["ctrl"], best["how"]
     task["start_state"] = {"qpos": [float(x) for x in qpos], "ctrl": [float(x) for x in ctrl], "how": how}
     task["start_states"] = [{"qpos": [float(x) for x in st["qpos"]], "ctrl": [float(x) for x in st["ctrl"]], "how": st["how"]}
@@ -297,15 +315,20 @@ def fingers_needed_first(conditions: list[dict], labels: list[str]) -> tuple[lis
 
 
 MAX_CHECKED = 12  # grips held that long, best-scored first, before settling for the one that lasted longest
+FUMBLES = 10  # tries per grip with the fingers twitching at random, as a learner's first tries do, each a whole try
+STURDY_SLACK = 0.2  # a starting pose laid a little differently may be this much less sturdy than the grip
+FUMBLE_STD = 0.7  # how hard (in actions: about what a fresh policy's random outputs are)
 VARIATIONS = 8  # the chosen grip, with the object laid slightly differently
 
 
-def _holds_for(m: mujoco.MjModel, task: dict, qpos, ctrl, always: list, seconds: float = HOLD_S) -> float:
+def _holds_for(m: mujoco.MjModel, task: dict, qpos, ctrl, always: list, seconds: float = HOLD_S, rng=None) -> float:
     """How long the hand keeps the object, doing nothing from this state: off the ground, carried by the robot alone,
-    and the goal's "the whole time" conditions kept (contact flickers under 0.1 s don't count)."""
+    and the goal's "the whole time" conditions kept (contact flickers under 0.1 s don't count). With rng, the fingers
+    twitch at random around the grip instead, the way practice starts out."""
     from .goal_terms import FLICKER_TICKS, condition_violation
-    from .task_model import contact_held, contact_touch, indices, measure
+    from .task_model import contact_held, contact_touch, indices, measure, next_ctrl
     ix = indices(m, task)
+    grip = np.array(ctrl, dtype=float)
     d = mujoco.MjData(m)
     d.qpos[:] = qpos
     d.ctrl[:] = ctrl
@@ -318,6 +341,9 @@ def _holds_for(m: mujoco.MjModel, task: dict, qpos, ctrl, always: list, seconds:
             mujoco.mj_step(m, d)
             if k % every:
                 continue
+            if rng is not None:
+                act = np.tanh(rng.normal(0.0, FUMBLE_STD, m.nu))
+                d.ctrl[:] = next_ctrl(np, d.ctrl.copy(), act, grip, ix.act_scale, ix.act_lo, ix.act_hi, ix.act_step)
             ok = d.xpos[ix.block][2] > 0.05 and _only_robot_touches(m, d, ix) and np.isfinite(d.qpos).all()
             if ok and always:
                 v = measure(np, d.xpos, d.xmat, d.qvel, ix, task, held=contact_held(m, d, ix), ctrl=d.ctrl,
@@ -330,6 +356,14 @@ def _holds_for(m: mujoco.MjModel, task: dict, qpos, ctrl, always: list, seconds:
     except Exception:  # noqa: BLE001
         return 0.0
     return seconds
+
+
+def _sturdiness(m: mujoco.MjModel, task: dict, qpos, ctrl, always: list) -> float:
+    """The share of whole tries the grip keeps the object through with the fingers twitching at random (the same
+    twitches for every grip, so they compare fairly)."""
+    rng = np.random.default_rng(0)
+    secs = float(task.get("episode_s", 8.0))
+    return float(np.mean([_holds_for(m, task, qpos, ctrl, always, secs, rng) >= secs - 1e-6 for _ in range(FUMBLES)]))
 
 
 def _only_robot_touches(m: mujoco.MjModel, d: mujoco.MjData, ix) -> bool:

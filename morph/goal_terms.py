@@ -23,7 +23,8 @@ Quantities an expression can use (metres, degrees):
   the robot's tips are to holding it from opposite sides, and lifting it), touch_dist (m from the nearest tip to
   its surface), lifted (m above whatever is under it), closure (0..1: how far the gripper is commanded shut),
   grip_gap (m from the hand's point to where Morph's own planned grip puts it on the object: near 0 means the open
-  hand is where closing it grips; hand_dist when there's no planned grip)
+  hand is where closing it grips; hand_dist when there's no planned grip), between (1 while it's between two parts
+  that close on it, a gripper's fingers or a hand's fingertips: the line from one to the other passes through it)
   fingers_touching (how many of the robot's fingers touch it; with no hand, how many of its parts),
   roll_deg, pitch_deg (the object's tilt about its own long and short axes), goal_x, goal_y, goal_z (where the goal
   puts it, when it has a place; target_x ... mean the same), <fixture>_x, <fixture>_y, <fixture>_top (a fixture's
@@ -48,11 +49,11 @@ FACES = {"top": (2, 1), "bottom": (2, -1), "+x": (0, 1), "-x": (0, -1), "+y": (1
 VARIABLES = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "start_x", "start_y",
              "held", "robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg",
              "grip", "touch_dist", "lifted", "closure", "spin_dps", "spin_z_dps", "roll_deg", "pitch_deg",
-             "goal_x", "goal_y", "goal_z", "fingers_touching", "grip_gap", "in_hand"}
+             "goal_x", "goal_y", "goal_z", "fingers_touching", "grip_gap", "in_hand", "between"}
 GOAL_VARIABLES = {"goal_x", "goal_y", "goal_z"}  # only when the goal has a place (else not a number: the check says so)
 FIXTURE_ATTRS = ("_x", "_y", "_top")  # bin_x, bin_y, bin_top: a fixture's centre and top
 ROBOT_VARIABLES = {"robot_x", "robot_y", "hand_dist", "hand_x", "hand_y", "hand_z", "base_z", "base_tilt_deg", "grip",
-                   "touch_dist", "grip_gap"}
+                   "touch_dist", "grip_gap", "between"}
 # the robot's own body (goals about the robot, not the object: "make a fist", "raise the arm", "lift a foot"): each takes
 # a name pattern ("pip", "index|middle", "foot") matched against the robot's joint / end-part names. joint_frac: how far
 # the matching joints are through their range, 0 at the lower limit, 1 at the upper (mean; _min / _max: the least / most).
@@ -74,7 +75,7 @@ IN_HAND_LIFT = 0.01  # m: in_hand once its bottom is this far above whatever it 
 HOLD_TICKS = 10  # a skill step only counts once it has held for 0.2 s (10 control ticks): no flukes from a bounce
 ANGLE_UNIT, LENGTH_UNIT = 90.0, 0.3  # a violation of 90 degrees or 30 cm counts as "1" in the reward
 SPIN_UNIT, FLAG_UNIT = 90.0, 1.0  # ... and so does 90 deg/s, or a yes/no (touching, held) that is the wrong way round
-FLAGS = {"held", "grip", "closure", "fingers_touching", "in_hand"}
+FLAGS = {"held", "grip", "closure", "fingers_touching", "in_hand", "between"}
 
 
 class ExprError(ValueError):
@@ -414,7 +415,7 @@ RANGES = {"yaw_deg": (-180.0, 180.0), "roll_deg": (-180.0, 180.0), "pitch_deg": 
           "base_tilt_deg": (0.0, 180.0), "held": (0.0, 1.0), "in_hand": (0.0, 1.0), "grip": (0.0, 1.0),
           "closure": (0.0, 1.0), "speed": (0.0, INF), "spin_dps": (0.0, INF), "travelled": (0.0, INF),
           "hand_dist": (0.0, INF), "touch_dist": (0.0, INF), "lifted": (0.0, INF), "grip_gap": (0.0, INF),
-          "fingers_touching": (0.0, INF)}
+          "fingers_touching": (0.0, INF), "between": (0.0, 1.0)}
 UNIT_FUNCS = {"touching", "joint_frac", "joint_frac_min", "joint_frac_max"}  # 0..1
 
 
@@ -907,6 +908,7 @@ WORDS = {
     "closure": ("the gripper closed", "pct"), "touch_dist": ("the nearest fingertip's gap to it", "m"),
     "lifted": ("it lifted", "m"), "hand_dist": ("the hand's distance to it", "m"),
     "grip_gap": ("the hand's distance from Morph's grip", "m"),
+    "between": ("it between the fingers", "flag"),
     "hand_x": ("the hand's x", "m"), "hand_y": ("the hand's y", "m"), "hand_z": ("the hand's height", "m"),
     "robot_x": ("the robot's x", "m"), "robot_y": ("the robot's y", "m"), "base_z": ("the robot body's height", "m"),
     "base_tilt_deg": ("the robot body's tilt", "deg"), "spin_dps": ("how fast it spins", "deg/s"),

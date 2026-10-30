@@ -70,7 +70,7 @@ class LearnedWalker:
         self._v = np.array([m.joint(j).dofadr[0] for j in s.joints])
         self._imu = int(m.sensor("morph_gyro").objid[0])
         self.default = np.array(s.default_pose)
-        self.last_act = np.zeros(s.n)
+        self.last_act = np.zeros(len(s.acts))
         self.env.track_extra = lambda: self.env.data.qpos[self._fq:self._fq + 2]
         self.ticks = 0
         self.on_tick = None
@@ -177,7 +177,9 @@ class LearnedWalker:
             self.mode = "learned"
         a = self.policy(self.obs(np.asarray(cmd, dtype=float)))
         self.last_act = a
-        log = self.env.advance(self.default + self.setup.action_scale * a)
+        ctrl = self.default.copy()
+        ctrl[self.setup.acts] += self.setup.action_scale * a  # the legs; anything else holds its resting pose
+        log = self.env.advance(ctrl)
         self.ticks += 1
         if self.on_tick is not None:
             self.on_tick(self, log)

@@ -160,6 +160,7 @@ def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
                 act.gainprm[0] *= g["gain_scale"]
                 act.biasprm[1] *= g["gain_scale"]
                 act.biasprm[2] *= g["gain_scale"]
+    _grip_force(robot, rm, g)
     if accurate:
         scene.option.timestep = 0.002
         scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICIT
@@ -183,6 +184,36 @@ def build_task_spec(task: dict, accurate: bool = False) -> mujoco.MjSpec:
     root = [b for b in range(1, rm.nbody) if rm.body_parentid[b] == 0][0]
     frame.attach_body(robot.body(rm.body(root).name), "robot_", "")
     return scene
+
+
+GRIP_FORCE = 130.0  # N at the fingertips: what a real gripper squeezes with (Spot's peak is 130 N)
+
+
+def _grip_force(robot: mujoco.MjSpec, rm: mujoco.MjModel, g: dict) -> None:
+    """A gripper motor the robot's file leaves without a force limit squeezes no harder than a real gripper: Spot's
+    (its file says the actuators aren't tuned) closed with up to 1000 N m, sank into a 5 cm parcel at 300-475 N and
+    squirted it out sideways."""
+    try:
+        a = rm.actuator(g.get("actuator", "")).id
+    except KeyError:
+        return
+    if rm.actuator_trntype[a] != mujoco.mjtTrn.mjTRN_JOINT or rm.actuator_forcelimited[a]:
+        return
+    j = int(rm.actuator_trnid[a, 0])
+    if rm.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE:  # a jaw on a hinge: the force at its far end
+        d = mujoco.MjData(rm)
+        mujoco.mj_forward(rm, d)
+        b = int(rm.jnt_bodyid[j])
+        own = [k for k in range(rm.ngeom) if rm.geom_bodyid[k] == b]
+        reach = max([float(np.linalg.norm(d.geom_xpos[k] - d.xanchor[j])) + float(rm.geom_rbound[k]) for k in own] or [0.1])
+        cap = GRIP_FORCE * reach
+    else:
+        cap = GRIP_FORCE
+    limit = rm.jnt_actfrcrange[j] if rm.jnt_actfrclimited[j] else None
+    if limit is not None and max(abs(limit[0]), abs(limit[1])) <= cap:
+        return
+    act = robot.actuator(g["actuator"])
+    act.forcelimited, act.forcerange = True, [-cap, cap]
 
 
 def build_task_model(task: dict, accurate: bool = False) -> mujoco.MjModel:
@@ -232,6 +263,9 @@ class Indices:
     grasp_body: int = -1
     grasp_off: np.ndarray | None = None
     grasp_point: np.ndarray | None = None
+    # pairs of end parts (positions in tips) that close on an object from either side: a gripper's fingers, a hand's
+    # fingertips; for "between"
+    grip_pairs: np.ndarray | None = None
 
 
 def is_position(m: mujoco.MjModel, a: int) -> bool:
@@ -241,6 +275,56 @@ def is_position(m: mujoco.MjModel, a: int) -> bool:
 def robot_joints(m: mujoco.MjModel, prefix: str = "robot_") -> list[int]:
     return [j for j in range(m.njnt) if m.joint(j).name.startswith(prefix)
             and int(m.jnt_type[j]) in (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))]
+
+
+def _grip_pairs(m: mujoco.MjModel, task: dict, tips: list, labels: list) -> np.ndarray | None:
+    """The end parts that close on an object, paired: a gripper's (the ones hanging from the body its grip point is on,
+    not the Stretch's head or the markers on its wrist), else a hand's fingertips, else every end part (two hands
+    pressing a box between them)."""
+    def under(b, top):
+        while b > 0:
+            if b == top:
+                return True
+            b = int(m.body_parentid[b])
+        return False
+    tcp = (task.get("gripper") or {}).get("tcp_body")
+    try:
+        top = int(m.body_parentid[m.body("robot_" + tcp).id]) if tcp else -1
+    except KeyError:
+        top = -1
+    pick = [k for k, b in enumerate(tips) if top > 0 and under(int(b), top)]
+    if len(pick) < 2:
+        pick = [k for k, lab in enumerate(labels) if lab]
+    if len(pick) < 2:
+        pick = list(range(len(tips)))
+    pairs = [(a, b) for i, a in enumerate(pick) for b in pick[i + 1:]]
+    return np.array(pairs, dtype=int) if pairs else None
+
+
+BETWEEN_MARGIN = 0.005  # m: the line between two fingertips may pass this close outside the object (a fingertip's
+# point sits a little past the surface it closes on). At 1 cm a Stretch closed beside a pen, one tip on the floor next
+# to it and the other above, passed for "between" and learned to do just that
+BETWEEN_MIDDLE = 0.25  # the object crosses the line at least this far from either end: in the gap, not at one tip
+
+
+def between_terms(xp, pts, bp, R, half, pairs):
+    """Is the object between two parts that close on it (1 or 0), and a graded version for the learner: the line from
+    one to the other passes through the object, crossing it somewhere along its middle (not just touching one of
+    them, or beside one of them). A gripper can only grab what is between its fingers; near the object isn't enough (the Stretch's fingers
+    came within 2.5 cm of a pen and closed beside it, round after round)."""
+    if pairs is None:
+        return xp.asarray(0.0), xp.asarray(0.0)
+    a, b = pts[pairs[:, 0]], pts[pairs[:, 1]]
+    ab = b - a
+    t = xp.clip(xp.sum((bp - a) * ab, axis=1) / (xp.sum(ab * ab, axis=1) + 1e-9), 0.0, 1.0)
+    L = (a + t[:, None] * ab - bp) @ R  # the point on the line nearest the object's centre, in the object's frame
+    out = xp.maximum(xp.abs(L) - xp.asarray(half), 0.0)
+    out = xp.sqrt(xp.sum(out * out, axis=1) + 1e-12)
+    # in the middle of the gap (at an end it's only beside one of them, and a closed gripper has no middle to fill)
+    inner = xp.clip((xp.minimum(t, 1.0 - t) - BETWEEN_MIDDLE) / 0.1 + 0.5, 0.0, 1.0)
+    strict = xp.any((out < BETWEEN_MARGIN) & (inner > 0.5))
+    graded = xp.max(xp.exp(-xp.maximum(out - BETWEEN_MARGIN, 0.0) / 0.02) * inner)
+    return xp.asarray(strict, dtype=float), graded
 
 
 def indices(m: mujoco.MjModel, task: dict) -> Indices:
@@ -274,6 +358,8 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
     act_scale, act_step = action_units(m, task.get("action_scale", 0.8))
     for a, (sc, st) in (task.get("action_units") or {}).items():  # widened to cover what the recipe does (demo_to_task)
         act_scale[int(a)], act_step[int(a)] = max(act_scale[int(a)], sc), max(act_step[int(a)], st)
+    for a in task.get("legs_still", []):  # legs that hold it standing where it works (learn_task._legged_stance)
+        act_scale[int(a)] = 0.0
     g_ticks = task.get("gripper_ticks")  # how many control ticks the gripper takes to cross its range
     if g_ticks and task.get("gripper"):
         try:
@@ -302,6 +388,7 @@ def indices(m: mujoco.MjModel, task: dict) -> Indices:
                             grasp_point=np.array(g["point"], dtype=float))
         except KeyError:  # a different robot model than the grip was planned on
             pass
+    ix_extra["grip_pairs"] = _grip_pairs(m, task, tips, ix_extra["tip_labels"])
     fp = finger_points(m)
     if fp is not None:
         ix_extra.update(finger_body=fp[0], finger_off=fp[1], finger_rad=fp[2], finger_of=fp[3], finger_labels=fp[4])
@@ -655,6 +742,7 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None,
         closure = xp.clip((ctrl[ix.grip_act] - ix.grip_open) / (ix.grip_close - ix.grip_open), 0.0, 1.0)
     v["grip"], v["touch_dist"], v["lifted"] = grip_terms(xp, pts, bp, R, half, task, closure)
     v["closure"] = closure if closure is not None else xp.asarray(0.0)
+    v["between"], v["between_soft"] = between_terms(xp, pts, bp, R, half, ix.grip_pairs)
     v["grip"] = xp.maximum(v["grip"], xp.asarray(held, dtype=float) if xp is np else held)  # a real hold is a full grip
     v["parts"] = {n: pts[k] for k, n in enumerate(ix.tip_names or [])}  # the robot's own body (goal_terms BODY_FUNCS)
     v["touch"] = touch if touch is not None else tip_touch(xp, pts, bp, R, half, ix, xpos, xmat)
@@ -673,4 +761,5 @@ def measure(xp, xpos, xmat, qvel, ix: Indices, task: dict, held=None, ctrl=None,
 def soft(v: dict) -> dict:
     """The same quantities with "held" graded (grip) instead of yes/no: for the learner's hints only; whether a
     step or the goal is done is always decided on the strict ones."""
-    return dict(v, held=v["grip"]) if "grip" in v else v
+    v = dict(v, held=v["grip"]) if "grip" in v else v
+    return dict(v, between=v["between_soft"]) if "between_soft" in v else v

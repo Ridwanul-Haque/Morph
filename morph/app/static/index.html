@@ -4,21 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Morph</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {
   color-scheme: dark;  /* native controls (dropdown lists, scrollbars) drawn dark, so their text stays readable */
-  --bg: #0a0f1a; --bg2: #0e1524; --panel: #121b2d; --raise: #182338; --hover: #1d2a43;
-  --line: rgba(148, 163, 184, .12); --line2: rgba(148, 163, 184, .22);
-  --text: #e7edf6; --dim: #94a3b8; --faint: #64748b;
-  --accent: #6aa8ff; --accent2: #8b7bff; --ok: #34d399; --bad: #f87171; --warn: #fbbf24;
-  --okbg: rgba(52, 211, 153, .12); --badbg: rgba(248, 113, 113, .12); --warnbg: rgba(251, 191, 36, .12); --accbg: rgba(106, 168, 255, .12);
-  --r: 12px; --r2: 16px; --shadow: 0 8px 28px rgba(0, 0, 0, .35);
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #121417; --bg2: #16191d; --panel: #1a1d22; --raise: #22262c; --hover: #2a2f36;
+  --line: #282c32; --line2: #363c44;
+  --text: #ebe8e3; --dim: #a8a49d; --faint: #75716b;
+  --accent: #4fb3a9; --ink: #c9a27e; --ok: #8cc47a; --bad: #e0675f; --warn: #e2b84f;
+  --okbg: rgba(140, 196, 122, .12); --badbg: rgba(224, 103, 95, .12); --warnbg: rgba(226, 184, 79, .12); --accbg: rgba(79, 179, 169, .13);
+  --r: 4px; --r2: 6px; --shadow: 0 10px 30px rgba(0, 0, 0, .45);
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
-body { background: radial-gradient(1200px 600px at 60% -10%, #13203a 0%, var(--bg) 60%); color: var(--text);
-  font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+body { background: var(--bg); color: var(--text);
+  font: 14px/1.5 "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
 button, select, input, textarea { font: inherit; color: var(--text); }
 a { color: var(--accent); }
 .hidden { display: none !important; }
@@ -27,40 +29,40 @@ a { color: var(--accent); }
 
 /* ---------- header ---------- */
 header { height: 60px; display: flex; align-items: center; gap: 14px; padding: 0 20px; border-bottom: 1px solid var(--line);
-  background: rgba(10, 15, 26, .7); backdrop-filter: blur(8px); }
+  background: var(--bg2); }
 .brand { display: flex; align-items: center; gap: 10px; }
-.brand b { font-size: 17px; letter-spacing: .02em; }
+.brand b { font: 600 14px var(--mono); letter-spacing: .18em; text-transform: uppercase; }
 .brand .tag { color: var(--dim); font-size: 13px; padding-left: 10px; border-left: 1px solid var(--line2); }
 .spacer { flex: 1; }
-.chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 99px;
+.chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 3px;
   background: var(--panel); border: 1px solid var(--line); color: var(--dim); font-size: 12.5px; cursor: default; white-space: nowrap; }
 .chip b { color: var(--text); font-weight: 600; }
-.chip.job { color: var(--text); border-color: rgba(106, 168, 255, .55); background: rgba(106, 168, 255, .12); animation: glow 1.6s ease-in-out infinite; }
+.chip.job { color: var(--text); border-color: rgba(79, 179, 169, .55); background: rgba(79, 179, 169, .12); }
 .chip.job .spin { border-color: var(--accent); border-top-color: transparent; }
 .chip.job button { height: 22px; padding: 0 9px; font-size: 12px; }
-.rgroup { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin: 10px 0 2px; }
+.rgroup { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); margin: 10px 0 2px; }
 .rgroup:first-child { margin-top: 0; }
 .rw { padding: 10px 0 9px; border-top: 1px solid var(--line); }
 .rgroup + .rw { border-top: none; }
 .rw .top { display: flex; align-items: center; gap: 10px; }
 .rw .name { flex: 1; min-width: 0; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rw .wt { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 99px; font-size: 11px; font-weight: 600; color: var(--warn); background: var(--warnbg); vertical-align: 1px; }
+.rw .wt { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px; font-size: 11px; font-weight: 600; color: var(--warn); background: var(--warnbg); vertical-align: 1px; }
 .rw .val { flex: none; font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; white-space: nowrap; }
 .rw .val.neg { color: var(--bad); }
 .rw .up { color: var(--ok); font-size: 11px; } .rw .down { color: var(--bad); font-size: 11px; }
-.rw select { flex: none; width: 84px; height: 26px; padding: 0 6px 0 10px; font-size: 12px; border-radius: 99px; color: var(--dim); background: var(--bg2); cursor: pointer; }
+.rw select { flex: none; width: 84px; height: 26px; padding: 0 6px 0 10px; font-size: 12px; border-radius: 3px; color: var(--dim); background: var(--bg2); cursor: pointer; }
 .rw select:hover { color: var(--text); border-color: var(--accent); }
-.rw .bar { margin-top: 7px; height: 6px; border-radius: 99px; background: rgba(148, 163, 184, .12); overflow: hidden; }
-.rw .bar i { display: block; height: 100%; border-radius: 99px; min-width: 3px; }
-.rw .bar i.pos { background: linear-gradient(90deg, var(--accent), var(--accent2)); } .rw .bar i.neg { background: var(--bad); opacity: .85; }
-.rw .pending { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 9px; border-radius: 99px; font-size: 11.5px; color: var(--accent); background: var(--accbg); }
+.rw .bar { margin-top: 7px; height: 6px; border-radius: 3px; background: rgba(148, 163, 184, .12); overflow: hidden; }
+.rw .bar i { display: block; height: 100%; border-radius: 3px; min-width: 3px; }
+.rw .bar i.pos { background: var(--accent); } .rw .bar i.neg { background: var(--bad); opacity: .85; }
+.rw .pending { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 9px; border-radius: 3px; font-size: 11.5px; color: var(--accent); background: var(--accbg); }
 .rw .what { margin-top: 5px; font-size: 12px; line-height: 1.4; color: var(--faint); }
 .rsteps { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 8px; }
-.rstep { border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; background: rgba(148, 163, 184, .04); }
-.rstep.now { border-color: rgba(106, 168, 255, .55); background: var(--accbg); }
-.rstep.done { border-color: rgba(52, 211, 153, .35); }
+.rstep { border: 1px solid var(--line); border-radius: 4px; padding: 9px 11px; background: rgba(148, 163, 184, .04); }
+.rstep.now { border-color: rgba(79, 179, 169, .55); background: var(--accbg); }
+.rstep.done { border-color: rgba(140, 196, 122, .35); }
 .rstep .h { display: flex; align-items: flex-start; gap: 9px; }
-.rstep .n { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700;
+.rstep .n { flex: none; width: 22px; height: 22px; border-radius: 3px; display: grid; place-items: center; font-size: 12px; font-weight: 700;
   background: rgba(148, 163, 184, .15); color: var(--dim); }
 .rstep.now .n { background: var(--accent); color: #0a0f1a; } .rstep.done .n { background: var(--ok); color: #0a0f1a; }
 .rstep .t { flex: 1; min-width: 0; font-weight: 600; color: var(--text); line-height: 1.35; }
@@ -68,15 +70,15 @@ header { height: 60px; display: flex; align-items: center; gap: 14px; padding: 0
 .rstep .when { margin: 6px 0 0 31px; font-size: 12.5px; line-height: 1.45; color: var(--text); }
 .rstep .when b { color: var(--dim); font-weight: 600; }
 .rstep .tag { font-size: 11px; font-weight: 600; color: var(--accent); margin-left: 6px; }
-.rstep .edit { flex: none; height: 24px; padding: 0 10px; font-size: 12px; border-radius: 99px; }
+.rstep .edit { flex: none; height: 24px; padding: 0 10px; font-size: 12px; border-radius: 3px; }
 .rstep .editor { margin: 8px 0 0 31px; }
 .rstep .editor textarea { min-height: 54px; font-size: 13px; }
 .rstep .editor .row { gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .rstep .pending { margin-left: 31px; }
-.hole { border: 1px solid rgba(251, 191, 36, .45); background: var(--warnbg); color: var(--warn); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; line-height: 1.45; }
+.hole { border: 1px solid rgba(226, 184, 79, .45); background: var(--warnbg); color: var(--warn); border-radius: 4px; padding: 10px 12px; margin-bottom: 10px; line-height: 1.45; }
 .chip.click { cursor: pointer; } .chip.click:hover { border-color: var(--line2); color: var(--text); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
-.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .15); }
+.dot.ok { background: var(--ok); }
 .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
 
 /* ---------- layout ---------- */
@@ -88,72 +90,72 @@ main { display: grid; grid-template-columns: 370px minmax(0, 1fr) 390px; height:
 
 /* ---------- step cards ---------- */
 .step { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 14px; margin-bottom: 14px; }
-.step.active { border-color: rgba(106, 168, 255, .35); }
+.step.active { border-color: rgba(79, 179, 169, .35); }
 .stephead { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-.num { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700;
+.num { width: 24px; height: 24px; border-radius: 3px; display: grid; place-items: center; font-size: 12px; font-weight: 700;
   background: var(--raise); color: var(--dim); border: 1px solid var(--line2); flex: none; }
 .step.done .num { background: var(--ok); color: #06281c; border-color: var(--ok); }
-.step.active .num { background: var(--accent); color: #07162e; border-color: var(--accent); }
+.step.active .num { background: var(--accent); color: #0f1b1a; border-color: var(--accent); }
 .stephead h3 { margin: 0; font-size: 15px; }
 .help { color: var(--dim); font-size: 12.5px; margin: 0 0 12px 34px; }
 
 select option { background: var(--raise); color: var(--text); }
 select option:checked { background: var(--hover); }
-select, input[type=text], input[type=number], textarea { background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px;
+select, input[type=text], input[type=number], textarea { background: var(--bg2); border: 1px solid var(--line2); border-radius: 4px;
   padding: 8px 10px; width: 100%; outline: none; transition: border-color .15s; }
 select:focus, input:focus, textarea:focus { border-color: var(--accent); }
 textarea { resize: vertical; min-height: 70px; line-height: 1.45; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row > .grow { flex: 1; }
 
-button { background: var(--raise); border: 1px solid var(--line2); border-radius: 10px; padding: 8px 14px; cursor: pointer;
+button { background: var(--raise); border: 1px solid var(--line2); border-radius: 4px; padding: 8px 14px; cursor: pointer;
   transition: background .15s, border-color .15s, transform .05s; }
 button:hover:not(:disabled) { background: var(--hover); border-color: rgba(148, 163, 184, .35); }
 button:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: .45; cursor: not-allowed; }
-.primary { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: 0; color: #fff; font-weight: 650; }
-.primary:hover:not(:disabled) { filter: brightness(1.08); background: linear-gradient(135deg, var(--accent), var(--accent2)); }
-.big { width: 100%; padding: 12px; font-size: 15px; border-radius: 12px; }
+.primary { background: var(--accent); border: 1px solid var(--accent); color: #0f1b1a; font-weight: 600; }
+.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); border-color: var(--accent); }
+.big { width: 100%; padding: 12px; font-size: 15px; border-radius: 4px; }
 .ghost { background: transparent; border-color: var(--line); }
-.danger { color: var(--bad); border-color: rgba(248, 113, 113, .4); background: transparent; }
+.danger { color: var(--bad); border-color: rgba(224, 103, 95, .4); background: transparent; }
 .icon { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; }
-.xs { padding: 3px 9px; font-size: 12px; border-radius: 8px; }
+.xs { padding: 3px 9px; font-size: 12px; border-radius: 4px; }
 
 /* scene items */
 .things { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
 .things .note { grid-column: 1 / 3; }
-.thing { display: grid; grid-template-columns: 26px 1fr; gap: 8px; align-items: center; padding: 7px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); min-width: 0; }
+.thing { display: grid; grid-template-columns: 26px 1fr; gap: 8px; align-items: center; padding: 7px 8px; border-radius: 4px; background: var(--bg2); border: 1px solid var(--line); min-width: 0; }
 .thing > div { min-width: 0; } .thing .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.thing .ico { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; font-size: 14px; }
+.thing .ico { width: 26px; height: 26px; border-radius: 4px; display: grid; place-items: center; font-size: 14px; }
 .thing b { font-weight: 600; } .thing .sub { color: var(--dim); font-size: 12px; }
-.k-object .ico { background: rgba(251, 191, 36, .15); color: var(--warn); }
-.k-container .ico { background: rgba(106, 168, 255, .15); color: var(--accent); }
-.k-surface .ico { background: rgba(52, 211, 153, .15); color: var(--ok); }
-.k-obstacle .ico { background: rgba(248, 113, 113, .13); color: var(--bad); }
+.k-object .ico { background: rgba(226, 184, 79, .15); color: var(--warn); }
+.k-container .ico { background: rgba(79, 179, 169, .15); color: var(--accent); }
+.k-surface .ico { background: rgba(140, 196, 122, .15); color: var(--ok); }
+.k-obstacle .ico { background: rgba(224, 103, 95, .13); color: var(--bad); }
 
 /* robots */
 .filters { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
-.fchip { padding: 4px 10px; border-radius: 99px; font-size: 12px; background: var(--bg2); border: 1px solid var(--line); cursor: pointer; color: var(--dim); }
-.fchip.on { background: var(--accbg); border-color: rgba(106, 168, 255, .4); color: var(--text); }
+.fchip { padding: 4px 10px; border-radius: 3px; font-size: 12px; background: var(--bg2); border: 1px solid var(--line); cursor: pointer; color: var(--dim); }
+.fchip.on { background: var(--accbg); border-color: rgba(79, 179, 169, .4); color: var(--text); }
 .robots { display: flex; flex-direction: column; gap: 6px; max-height: 250px; overflow-y: auto; padding-right: 2px; }
-.bot { display: grid; grid-template-columns: 32px 1fr auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 12px;
+.bot { display: grid; grid-template-columns: 32px 1fr auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 4px;
   background: var(--bg2); border: 1px solid var(--line); cursor: pointer; transition: border-color .15s, background .15s; }
 .bot:hover { border-color: var(--line2); }
-.bot.sel { background: var(--accbg); border-color: rgba(106, 168, 255, .45); }
+.bot.sel { background: var(--accbg); border-color: rgba(79, 179, 169, .45); }
 .bot.absent { opacity: .45; cursor: not-allowed; }
-.bot .ico { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; background: var(--raise); color: var(--dim); }
-.bot.sel .ico { background: var(--accent); color: #07162e; }
+.bot .ico { width: 32px; height: 32px; border-radius: 4px; display: grid; place-items: center; background: var(--raise); color: var(--dim); }
+.bot.sel .ico { background: var(--accent); color: #0f1b1a; }
 .bot .name { font-weight: 600; }
 .bot .st { font-size: 12px; }
 .st.ok { color: var(--ok); } .st.bad { color: var(--bad); } .st.warn { color: var(--warn); } .st.dim { color: var(--faint); }
 
 /* goal */
 .examples { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-.ex { padding: 4px 10px; border-radius: 99px; font-size: 12px; background: var(--bg2); border: 1px dashed var(--line2); color: var(--dim); cursor: pointer; }
+.ex { padding: 4px 10px; border-radius: 3px; font-size: 12px; background: var(--bg2); border: 1px dashed var(--line2); color: var(--dim); cursor: pointer; }
 .ex:hover { color: var(--text); border-color: var(--accent); }
-.drop { border: 1px dashed var(--line2); border-radius: 12px; padding: 10px; text-align: center; color: var(--dim); cursor: pointer; font-size: 12.5px; transition: border-color .15s, background .15s; }
+.drop { border: 1px dashed var(--line2); border-radius: 4px; padding: 10px; text-align: center; color: var(--dim); cursor: pointer; font-size: 12.5px; transition: border-color .15s, background .15s; }
 .drop:hover, .drop.drag { border-color: var(--accent); background: var(--accbg); }
-.drop.has { border-style: solid; border-color: rgba(106, 168, 255, .45); color: var(--text); }
+.drop.has { border-style: solid; border-color: rgba(79, 179, 169, .45); color: var(--text); }
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
 .switch input { display: none; }
 .switch .tr { width: 34px; height: 20px; border-radius: 99px; background: var(--raise); border: 1px solid var(--line2); position: relative; transition: background .15s; flex: none; }
@@ -165,20 +167,20 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 /* ---------- center ---------- */
 .progress { display: flex; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 10px 14px; }
 .pstep { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 13px; white-space: nowrap; }
-.pstep .pd { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line2); display: grid; place-items: center; font-size: 11px; }
-.pstep.on { color: var(--text); } .pstep.on .pd { border-color: var(--accent); background: var(--accbg); animation: glow 1.4s infinite; }
+.pstep .pd { width: 22px; height: 22px; border-radius: 3px; border: 2px solid var(--line2); display: grid; place-items: center; font-size: 11px; }
+.pstep.on { color: var(--text); } .pstep.on .pd { border-color: var(--accent); background: var(--accbg); color: var(--accent); }
 .pstep.done { color: var(--dim); } .pstep.done .pd { border-color: var(--ok); background: var(--ok); color: #06281c; }
-@keyframes glow { 50% { box-shadow: 0 0 0 5px rgba(106, 168, 255, .15); } }
-.pline { flex: 1; height: 2px; background: var(--line2); margin: 0 10px; min-width: 16px; }
-.pline.done { background: var(--ok); }
+.pline { flex: 1; height: 2px; background: var(--line2); margin: 0 10px; min-width: 16px; position: relative; overflow: hidden; }
+.pline::after { content: ""; position: absolute; inset: 0; background: var(--ok); transform: scaleX(0); transform-origin: left; transition: transform .45s ease-out; }
+.pline.done::after { transform: none; }
 .progress .who { margin-left: 16px; padding-left: 14px; border-left: 1px solid var(--line2); color: var(--dim); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
 
-.viewer { position: relative; flex: 1; min-height: 0; border-radius: var(--r2); overflow: hidden; background: #070b13; border: 1px solid var(--line); box-shadow: var(--shadow); }
+.viewer { position: relative; flex: 1; min-height: 0; border-radius: var(--r2); overflow: hidden; background: #0d0f11; border: 1px solid var(--line); }
 .viewer img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .steps .step { display: grid; grid-template-columns: 22px 1fr; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
 .steps .step:first-of-type { border-top: 0; }
-.steps .n { width: 20px; height: 20px; border-radius: 50%; background: var(--raise); color: var(--dim); font-size: 11px; display: grid; place-items: center; }
-.steps .step.done .n { background: rgba(52,211,153,.18); color: var(--ok); }
+.steps .n { width: 20px; height: 20px; border-radius: 3px; background: var(--raise); color: var(--dim); font-size: 11px; display: grid; place-items: center; }
+.steps .step.done .n { background: rgba(140,196,122,.18); color: var(--ok); }
 .steps .step.now .n { background: rgba(106,168,255,.2); color: var(--accent); box-shadow: 0 0 0 2px rgba(106,168,255,.35); }
 .steps .t { font-size: 13px; } .steps .h { font-size: 12px; color: var(--dim); margin-top: 2px; line-height: 1.4; }
 .steps .w { font-size: 11.5px; color: var(--faint); margin-top: 2px; font-style: italic; }
@@ -192,18 +194,18 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .empty h2 { margin: 12px 0 6px; font-size: 20px; }
 .empty ol { text-align: left; color: var(--dim); margin: 14px auto 0; max-width: 420px; line-height: 1.9; }
 .hud { position: absolute; left: 14px; top: 14px; display: flex; gap: 8px; }
-.hud .pill { background: rgba(7, 11, 19, .75); backdrop-filter: blur(6px); border: 1px solid var(--line); padding: 5px 11px; border-radius: 99px; font-size: 12.5px; display: flex; gap: 7px; align-items: center; }
+.hud .pill { background: rgba(13, 15, 17, .82); backdrop-filter: blur(6px); border: 1px solid var(--line); padding: 5px 11px; border-radius: 3px; font-size: 12.5px; display: flex; gap: 7px; align-items: center; }
 .live { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); animation: blink 1.2s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
 .hud.r { left: auto; right: 14px; }
-.cap { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); background: rgba(7, 11, 19, .8); backdrop-filter: blur(6px);
-  border: 1px solid var(--line); padding: 8px 16px; border-radius: 12px; font-size: 14px; max-width: 80%; text-align: center; }
+.cap { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); background: rgba(13, 15, 17, .85); backdrop-filter: blur(6px);
+  border: 1px solid var(--line); padding: 8px 16px; border-radius: 4px; font-size: 14px; max-width: 80%; text-align: center; }
 .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.viewer video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #070b13; cursor: default; }
+.viewer video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #0d0f11; cursor: default; }
 .viewer.vidmode .cap { bottom: 64px; }
 /* videos: the picker */
 .modal { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; padding: 16px;
-  background: rgba(4, 7, 13, .66); backdrop-filter: blur(3px); }
+  background: rgba(4, 5, 7, .7); backdrop-filter: blur(3px); }
 .modal .box { width: min(780px, 100%); max-height: min(84vh, 920px); display: flex; flex-direction: column; background: var(--panel);
   border: 1px solid var(--line2); border-radius: var(--r2); box-shadow: var(--shadow); }
 .modal .mhead { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
@@ -211,23 +213,23 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .modal .mbody { overflow-y: auto; padding: 4px 16px 14px; }
 .modal .mfoot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); }
 .vsec { margin-top: 14px; }
-.vsec > h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 650; }
+.vsec > h4 { margin: 0 0 6px; font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .14em; color: var(--faint); }
 .vgroup { padding: 10px 12px; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--line); margin-bottom: 8px; }
 .vgroup .vtop { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .vgroup .vtop b { font-weight: 600; }
 .vrobot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; }
 .vrobot > span { min-width: 92px; color: var(--dim); }
-.vtry { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px 3px 6px; border-radius: 99px; border: 1px solid var(--line2);
+.vtry { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px 3px 6px; border-radius: 3px; border: 1px solid var(--line2);
   background: var(--panel); cursor: pointer; font-size: 12px; user-select: none; }
 .vtry input, .vclip input { margin: 0; accent-color: var(--accent); }
 .vtry.on { border-color: var(--accent); background: var(--accbg); }
 .vtry .ok { color: var(--ok); } .vtry .bad { color: var(--bad); }
-.vclip { display: flex; align-items: center; gap: 9px; padding: 5px 6px; border-radius: 8px; font-size: 12.5px; cursor: pointer; margin-top: 2px; }
+.vclip { display: flex; align-items: center; gap: 9px; padding: 5px 6px; border-radius: 4px; font-size: 12.5px; cursor: pointer; margin-top: 2px; }
 .vclip:hover { background: var(--hover); }
 .vclip .drawn { margin-left: auto; font-size: 11px; color: var(--faint); white-space: nowrap; }
 .linkbtn { background: none; border: 0; padding: 0; color: var(--accent); font-size: 12px; cursor: pointer; }
 .linkbtn:hover:not(:disabled) { background: none; text-decoration: underline; }
-.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 3px; }
 .seg button { border: 0; background: transparent; padding: 5px 10px; border-radius: 7px; font-size: 12.5px; color: var(--dim); }
 .seg button.on { background: var(--raise); color: var(--text); }
 .tlabel { font-size: 12px; color: var(--faint); }
@@ -237,8 +239,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .trainbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r2); padding: 10px 14px 12px; flex: none; }
 .trainbox .trainhead .row { gap: 6px 12px; flex-wrap: wrap; }
 .trainbox #traintitle { white-space: nowrap; }
-.bar { height: 8px; background: var(--raise); border-radius: 99px; overflow: hidden; }
-.bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .4s; }
+.bar { height: 8px; border-radius: 2px; overflow: hidden;
+  background: repeating-linear-gradient(90deg, transparent 0 calc(10% - 1px), var(--line2) calc(10% - 1px) 10%), var(--raise); }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width .6s linear; }
 canvas { width: 100%; height: 160px; display: block; }
 
 /* ---------- right: tabs ---------- */
@@ -248,35 +251,37 @@ canvas { width: 100%; height: 160px; display: block; }
 .tab.on { color: var(--text); border-bottom-color: var(--accent); }
 .pane { overflow-y: auto; padding: 16px; flex: 1; }
 .sec { margin-bottom: 18px; }
-.sec h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 650; }
+.sec h4 { margin: 0 0 8px; font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .14em; color: var(--faint); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; }
 .cond { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; align-items: start; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .cond:last-child { border-bottom: 0; }
-.cmark { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 800; background: var(--raise); color: var(--faint); }
+.cmark { width: 20px; height: 20px; border-radius: 3px; display: grid; place-items: center; font-size: 12px; font-weight: 800; background: var(--raise); color: var(--faint); }
 .cmark.ok { background: var(--okbg); color: var(--ok); } .cmark.bad { background: var(--badbg); color: var(--bad); }
 .cond .meas { font-size: 12px; color: var(--dim); }
-.src { display: inline-block; font-size: 10.5px; padding: 0 7px; border-radius: 99px; background: var(--raise); color: var(--dim); margin-left: 6px; vertical-align: 1px; }
-.src.description { background: var(--accbg); color: var(--accent); } .src.demo { background: rgba(139, 123, 255, .15); color: #b3a8ff; }
+.src { display: inline-block; font-size: 10.5px; padding: 0 7px; border-radius: 3px; background: var(--raise); color: var(--dim); margin-left: 6px; vertical-align: 1px; }
+.src.description { background: var(--accbg); color: var(--accent); } .src.demo { background: rgba(201, 162, 126, .13); color: var(--ink); }
 .x { background: none; border: 0; color: var(--faint); padding: 0 4px; font-size: 16px; line-height: 1; }
 .x:hover:not(:disabled) { color: var(--bad); background: none; }
-.note { font-size: 12.5px; color: var(--dim); margin-top: 8px; padding: 8px 10px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); }
+.note { font-size: 12.5px; color: var(--dim); margin-top: 8px; padding: 8px 10px; border-radius: 4px; background: var(--bg2); border: 1px solid var(--line); }
 .res { padding: 12px; border-radius: var(--r); background: var(--panel); border: 1px solid var(--line); margin-bottom: 8px; }
 .res .top { display: flex; align-items: center; gap: 8px; }
 .res .top b { font-size: 14.5px; }
-.plan { font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--raise); color: var(--dim); white-space: nowrap; }
+.plan { font-size: 11.5px; padding: 2px 8px; border-radius: 3px; background: var(--raise); color: var(--dim); white-space: nowrap; }
 .plan.grasp_place_topdown, .plan.legged_foot_push, .plan.mobile_push { background: var(--accbg); color: var(--accent); }
-.plan.program { background: rgba(52,211,153,.14); color: var(--ok); }
+.plan.program { background: rgba(140,196,122,.14); color: var(--ok); }
 .prog { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
 .prog summary { cursor: pointer; font-size: 12.5px; } .prog ol { margin: 4px 0 2px 18px; padding: 0; font-size: 11.5px; color: var(--dim); }
 .prog .rep { font-size: 11px; color: var(--faint); margin: 3px 0 0 18px; } .prog .why3 { font-size: 11.5px; color: var(--dim); margin: 3px 0; font-style: italic; }
-.plan.unsupported { background: var(--badbg); color: var(--bad); } .plan.learned_skill { background: rgba(139, 123, 255, .15); color: #b3a8ff; } .plan.learn_policy { background: var(--warnbg); color: var(--warn); }
-.score { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
-.sbar { height: 6px; background: var(--raise); border-radius: 99px; margin: 10px 0 8px; overflow: hidden; }
+.plan.unsupported { background: var(--badbg); color: var(--bad); } .plan.learned_skill { background: rgba(201, 162, 126, .13); color: var(--ink); } .plan.learn_policy { background: var(--warnbg); color: var(--warn); }
+.score { margin-left: auto; font: 600 14px var(--mono); overflow: hidden; }
+.sbar { height: 6px; background: var(--raise); border-radius: 3px; margin: 10px 0 8px; overflow: hidden; }
 .sbar div { height: 100%; background: var(--ok); width: 0; transition: width .4s; }
 .sqs { display: flex; gap: 5px; flex-wrap: wrap; }
-.sq { width: 20px; height: 20px; border-radius: 6px; background: var(--raise); border: 1px solid var(--line2); transition: transform .1s; }
+.sq { width: 20px; height: 20px; border-radius: 2px; background: var(--raise); border: 1px solid var(--line2); transition: transform .1s; }
 .sq.ok { background: var(--ok); border-color: var(--ok); } .sq.bad { background: var(--bad); border-color: var(--bad); }
-.sq.run { background: var(--accent); border-color: var(--accent); animation: blink 1s infinite; }
+.sq.run { border-color: var(--accent); background: linear-gradient(0deg, var(--accbg) 50%, var(--raise) 50%) 0 0 / 100% 200%;
+  animation: fill 1.6s linear infinite; }  /* a try in progress fills from the bottom */
+@keyframes fill { from { background-position: 0 0; } to { background-position: 0 100%; } }
 .sq.click { cursor: pointer; } .sq.click:hover { transform: scale(1.15); }
 .why { font-size: 12.5px; color: var(--dim); margin-top: 8px; }
 .how { font-size: 12.5px; color: var(--dim); margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
@@ -290,19 +295,35 @@ dl.kv dt { color: var(--faint); } dl.kv dd { margin: 0; }
 .opt .t { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 4px; }
 .opt .price { margin-left: auto; font-variant-numeric: tabular-nums; }
 .gpus { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
-.gpu { display: grid; grid-template-columns: 16px 1fr auto 56px; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 8px; font-size: 12.5px; cursor: pointer; }
+.gpu { display: grid; grid-template-columns: 16px 1fr auto 56px; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 4px; font-size: 12.5px; cursor: pointer; }
 .gpu:hover { background: var(--hover); } .gpu.on { background: var(--raise); }
 .gpu .c { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; text-align: right; }
 .log { font-family: var(--mono); font-size: 11.5px; color: var(--dim); white-space: pre-wrap; line-height: 1.55; }
 .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--faint); border-top-color: transparent; border-radius: 50%; animation: s .8s linear infinite; vertical-align: -2px; }
 @keyframes s { to { transform: rotate(360deg); } }
-.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raise); border: 1px solid var(--line2); padding: 10px 16px; border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; z-index: 20; }
-.toast.bad { border-color: rgba(248, 113, 113, .5); }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raise); border: 1px solid var(--line2); padding: 10px 16px; border-radius: 4px; box-shadow: var(--shadow); font-size: 13px; z-index: 20; }
+.toast.bad { border-color: rgba(224, 103, 95, .5); }
 [data-tip] { position: relative; }
 [data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: max-content; max-width: 260px;
-  background: #1f2a40; border: 1px solid var(--line2); color: var(--text); padding: 7px 10px; border-radius: 8px; font-size: 12px; font-weight: 400; line-height: 1.4; white-space: normal; box-shadow: var(--shadow); text-transform: none; letter-spacing: 0; }
+  background: var(--raise); border: 1px solid var(--line2); color: var(--text); padding: 7px 10px; border-radius: 4px; font-size: 12px; font-weight: 400; line-height: 1.4; white-space: normal; box-shadow: var(--shadow); text-transform: none; letter-spacing: 0; }
 header [data-tip]:hover::after { left: auto; right: 0; }
-::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: #243149; border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+
+/* ---------- motion: only where something changed that is worth seeing ---------- */
+@keyframes land { from { transform: scale(.5); } to { transform: none; } }
+.sq.fresh { animation: land .22s cubic-bezier(.2, .8, .3, 1); }  /* a try's result arriving */
+@keyframes rollup { from { transform: translateY(80%); opacity: 0; } to { transform: none; opacity: 1; } }
+.roll { display: inline-block; animation: rollup .26s ease-out; }  /* the score turning over, like a counter */
+@keyframes reached { from { background: rgba(140, 196, 122, .2); border-color: var(--ok); } }
+.rstep.justdone, .steps .step.justdone { animation: reached 1.2s ease-out; }  /* a step it just got through */
+.rstep.justdone .n, .steps .step.justdone .n { animation: land .25s cubic-bezier(.2, .8, .3, 1); }
+@keyframes enter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.pane:not(.hidden) { animation: enter .16s ease-out; }
+.cap.swap { animation: capin .2s ease-out; }
+@keyframes capin { from { opacity: 0; transform: translate(-50%, 4px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.toast:not(.hidden) { animation: capin .18s ease-out; }
+.modal:not(.hidden) .box { animation: enter .16s ease-out; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
 <body>
@@ -315,8 +336,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
 
 <header>
   <div class="brand">
-    <svg width="28" height="28" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="#6aa8ff"/><stop offset="1" stop-color="#8b7bff"/></linearGradient></defs>
-      <rect width="32" height="32" rx="9" fill="url(#g)"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <svg width="26" height="26" viewBox="0 0 32 32"><rect x=".5" y=".5" width="31" height="31" rx="4" fill="#22262c" stroke="#363c44"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#4fb3a9" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="miter"/></svg>
     <b>Morph</b><span class="tag">describe a task once, any robot does it</span>
   </div>
   <span class="spacer"></span>
@@ -394,7 +414,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
 
   <div class="viewer" id="viewer">
     <div class="empty" id="empty"><div>
-      <svg width="54" height="54" viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="#182338"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#6aa8ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <svg width="48" height="48" viewBox="0 0 32 32"><rect x=".5" y=".5" width="31" height="31" rx="4" fill="#1a1d22" stroke="#363c44"/><path d="M8 22V10l8 7 8-7v12" fill="none" stroke="#4fb3a9" stroke-width="2.2" stroke-linecap="square" stroke-linejoin="miter"/></svg>
       <h2>The simulation plays here</h2>
       <div class="muted">A preview of your scene and robots shows here; during a run you watch the physics live.</div>
       <ol><li>Pick a scene</li><li>Pick the robots to try</li><li>Describe the goal and press <b>Understand goal</b></li><li>Press <b>Run</b></li></ol>
@@ -739,7 +759,7 @@ function status(r) {
   if (!p) return S.sel.has(r.path) ? ["dim", "checking against the goal…"] : ["dim", "select to check it against the goal"];
   if (p.plan === "unsupported") return ["bad", p.why_not || "can't do this goal"];
   if (p.learned) return ["ok", "ready: its learned skill"];
-  if (p.plan === "learn_policy") return ["warn", p.legs === 4 ? "needs to learn to walk first (ⓘ)" : "no ready-made skill: it can learn this (ⓘ)"];
+  if (p.plan === "learn_policy") return ["warn", "no ready-made skill: it can learn this (ⓘ)"];
   return ["ok", "ready: " + planLabel(p).toLowerCase()];
 }
 function renderRobots() {
@@ -814,9 +834,9 @@ async function profile(i) {
       <button class="xs ghost" onclick="openVideos(['learn:${esc(p.learned)}:progress'])">Pick videos…</button></div>
       <div class="row" style="margin-top:10px"><button class="xs" onclick="robustTest(this, '${esc(p.learned)}')" data-tip="Ten tries in which the ${esc((S.scene && S.scene.summary.object.name) || "object")} is suddenly knocked (it slides a few cm) a quarter of the way through. Once with the program alone, replayed move for move, and once with the learned skill, which sees where things are and corrects. Takes a few seconds; no Nemotron calls.">Test it: knock the ${esc((S.scene && S.scene.summary.object.name) || "object")} mid-task</button>
       <span class="tiny muted grow" id="robust-${esc(p.learned)}"></span></div></div></div>` : ""}
-    ${S.goal && !p.learned && !noGait && (p.plan === "learn_policy" || readyFailed(r) || recipeWorks(r)) ? learnCard(r, i, readyFailed(r)) : ""}
-    ${noGait ? `<div class="sec"><h4>Teach it to walk</h4><div class="card small">
-      <div class="muted">${esc(r.name)} has no walking skill yet. Morph can train one in simulation (300M practice steps), then use it for pushing goals.</div>
+    ${S.goal && !p.learned && (p.plan === "learn_policy" || readyFailed(r) || recipeWorks(r)) ? learnCard(r, i, readyFailed(r)) : ""}
+    ${noGait && !(S.goal && p.works_standing) ? `<div class="sec"><h4>Teach it to walk</h4><div class="card small">
+      <div class="muted">${esc(r.name)} has no walking skill yet. Morph can train one in simulation (300M practice steps), then use it for goals it can do by walking and pushing.</div>
       <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
         : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your own Nebius account.`}
         <a href="#" onclick="showTab('compute');return false">Change</a></div>
@@ -846,9 +866,11 @@ function learnCard(r, i, failed) {
       slips or starts somewhere else, it doesn't notice. Learning turns it into a skill that reacts: the learner starts from the program and practises
       only corrections on top of it, with varied physics,` : `${failed ? `Morph's ready-made skill didn't work for ${esc(r.name)} here` : `None of Morph's ready-made skills fit ${esc(r.name)} for this goal`}, so it can learn one: it practises in
       simulation thousands of times at once, scored by the goal checklist,`} (${(e.steps / 1e6).toFixed(0)}M practice steps), then tries it here.
+      ${p.works_standing ? `${esc(r.name)} works the way a person does: it walks to a spot where its arm reaches the ${esc((S.scene && S.scene.summary.object.name) || "object")} and where it has to go, stands there on its legs, and practises with its arm and gripper.
+        ${p.walks_first ? `It can't walk yet, so it learns that first (300M practice steps, included in the time below).` : `It gets there on the walking skill it already has.`}` : ""}
       ${ok ? "" : `Nemotron first writes a program that does it (any robot that stands still, and arms with or without a gripper); the learner starts from it and practises corrections on top.`}
       Practice starts near the end of the task and works back; between rounds Nemotron reads what the robot actually did and adjusts the steps and reward terms.</div>
-    <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes} min</b>, no bill (about $${(e.local.electricity || 0).toFixed(2)} of electricity).`
+    <div style="margin:10px 0">${c.mode === "local" ? `On <b>this computer</b> (${esc(e.local.gpu)}): about <b>${e.local.minutes + (p.walks_first && S.est ? S.est.local.minutes : 0)} min</b>, no bill (about $${((e.local.electricity || 0) + (p.walks_first && S.est ? S.est.local.electricity || 0 : 0)).toFixed(2)} of electricity).`
       : `On a <b>Nebius ${esc(g.label)}</b>: about <b>${g.minutes} min</b>, about <b>$${g.cost.toFixed(2)}</b>. Morph prepares the job; you start it with your Nebius account.`}
       <a href="#" onclick="showTab('compute');return false">Change</a></div>
     <label class="tiny muted" style="display:block;margin-bottom:10px" data-tip="Every practice copy gets slightly different physics: floor and parcel friction, parcel weight, motor strength, a one-step control delay, and sensor noise. The policy can't rely on one exact simulation, so it copes better with a different setup or a real robot. Learning takes a little longer.">
@@ -896,12 +918,15 @@ async function planSteps(i) {
         $("stepsbox").innerHTML = stepsHtml(S.planned, 0, false); refreshCosts(); }
   catch (e) { $("stepsbox").innerHTML = ""; toast(e.message, true); }
 }
+function justReached(k) {  // a step practice got through for the first time, in the last moment
+  const r = S.reachedNow; return !!r && k >= r.from && k < r.to && Date.now() - r.at < 1000;
+}
 function stepsHtml(v, reached, live) {  // the steps to go about it; live: ticked off as practice runs reach them
   if (!v || !v.steps || !v.steps.length) return "";
   const from = (v.from || "").startsWith("nemotron") ? "Nemotron" : "Morph's own rules";
   return `<div class="steps"><div class="tiny muted" style="margin-bottom:6px">How ${esc(v.robot)} will go about it <span class="faint">(planned by ${from})</span></div>
     ${v.steps.map((st, k) => { const last = k === v.steps.length - 1, done = live && k < reached, now = live && k === reached;
-      return `<div class="step ${done ? "done" : ""} ${now ? "now" : ""}"><span class="n">${done ? "✓" : k + 1}</span><div>
+      return `<div class="step ${done ? "done" : ""} ${now ? "now" : ""} ${done && justReached(k) ? "justdone" : ""}"><span class="n">${done ? "✓" : k + 1}</span><div>
         <div class="t">${esc(st.name)}${(st.body_parts || []).length ? ` <span class="faint tiny">· ${esc(st.body_parts.join(", "))}</span>` : ""}</div>
         ${st.how ? `<div class="h">${esc(st.how)}</div>` : ""}${st.why && !last ? `<div class="w">why: ${esc(st.why)}</div>` : ""}
         ${!last ? `<div class="f" data-tip="How Morph tells this step is done (measured every moment of a practice run)">done when ${esc(st.done_words || st.done_when)}${st.keep ? ` · keep ${esc(st.keep_words || st.keep)}` : ""}</div>` : ""}</div></div>`; }).join("")}
@@ -952,7 +977,7 @@ function renderGoal(results) {
       ${S.running ? "<span></span>" : `<button class="x" title="remove this condition" onclick="removeCond(${i})">×</button>`}</div>`;
   }).join("");
   const d = g.demo, from = g.from.replace(/nemotron \(([\d.]+)s\)/, "Nemotron ($1 s)").replace("rules", "built-in reader").replace("measured", "measured from the demo");
-  $("goalnotes").innerHTML = (g.warnings || []).map(w => `<div class="note" style="border-color:rgba(251,191,36,.45);color:var(--warn)">⚠ ${esc(w)}</div>`).join("") +
+  $("goalnotes").innerHTML = (g.warnings || []).map(w => `<div class="note" style="border-color:rgba(226,184,79,.45);color:var(--warn)">⚠ ${esc(w)}</div>`).join("") +
     (g.start ? `<div class="note">✋ The ${esc((S.scene && S.scene.summary.object.name) || "object")} ${esc(g.start)}: Morph puts it there before every try.</div>` : "") +
     (g.checked_when ? `<div class="tiny muted" style="margin-top:6px">${esc(g.checked_when)}</div>` : "") +
     `<div class="tiny faint" style="margin-top:6px">Understood by: ${esc(from)}</div>` +
@@ -1014,7 +1039,7 @@ function replay(robot, i) {
   $("empty").classList.add("hidden"); $("hud").classList.remove("hidden");
   const dl = t && t.video ? ` <button class="linkbtn" style="margin-left:6px" onclick="downloadVideo('try:${esc(t.video)}', this)">⬇ video</button>` : "";
   $("hudtxt").innerHTML = `REPLAY · ${esc(robot)}, try ${i + 1}${dl} <a href="#" onclick="showLive();return false" style="margin-left:6px">back to live</a>`;
-  $("livedot").style.background = "var(--accent2)";
+  $("livedot").style.background = "var(--ink)";
   if (t && t.replay) {  // frames still in memory
     hideVid(); $("live").classList.remove("hidden");
     $("live").src = `/api/replay.mjpg?robot=${encodeURIComponent(robot)}&i=${i}&t=${Date.now()}`;
@@ -1033,14 +1058,18 @@ function hideVid() {
   const v = $("vid"); if (v.classList.contains("hidden")) return;
   v.pause(); v.removeAttribute("src"); v.load(); v.classList.add("hidden"); $("viewer").classList.remove("vidmode");
 }
+const seen = {tries: {}, score: {}};  // what the results showed last time: only what changed since moves
 function renderResults() {
   $("results").innerHTML = S.order.length ? S.order.map(k => {
     const R = S.results[k], ts = R.trials, ok = ts.filter(t => t && t !== "run" && t.success).length;
+    const turned = seen.score[k] !== undefined && seen.score[k] !== ok; seen.score[k] = ok;
+    const fresh = ts.map((t, i) => { const st = t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad", was = seen.tries[k + ":" + i];
+      seen.tries[k + ":" + i] = st; return was !== undefined && was !== st && (st === "ok" || st === "bad"); });
     return `<div class="res"><div class="top"><b>${esc(k)}</b>${R.plan ? `<span class="plan ${R.plan}">${esc(PLAN[R.plan])}</span>` : `<span class="plan">waiting</span>`}
-      <span class="score">${R.skip ? `<span class="muted">n/a</span>` : `${ok}/${ts.length}`}</span></div>
+      <span class="score">${R.skip ? `<span class="muted">n/a</span>` : `${turned ? `<span class="roll">${ok}</span>` : ok}/${ts.length}`}</span></div>
       ${R.skip ? `<div class="why">${esc(R.why || "")}</div>` : `<div class="sbar"><div style="width:${100 * ok / ts.length}%"></div></div>
       <div class="sqs">${ts.map((t, i) => { const can = t && t !== "run" && (t.replay || t.video);
-        return `<div class="sq ${t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad"} ${can ? "click" : ""}"
+        return `<div class="sq ${t === "run" ? "run" : !t ? "" : t.success ? "ok" : "bad"} ${can ? "click" : ""} ${fresh[i] ? "fresh" : ""}"
           title="try ${i + 1}${t && t.reasons ? (t.success ? ": success" : ": " + esc(t.reasons.join("; "))) : ""}${can ? " (click to replay)" : ""}" ${can ? `onclick="replay('${esc(k)}', ${i})"` : ""}></div>`; }).join("")}</div>`}
       ${ts.some(t => t && t.video) ? `<div class="row" style="margin-top:6px"><button class="linkbtn" onclick="openVideos(S.results['${esc(k)}'].trials.filter(t => t && t.video).map(t => 'try:' + t.video))">⬇ Videos…</button></div>` : ""}
       ${R.how ? `<div class="how" onclick="this.classList.toggle('open')" title="click to expand">${esc(R.how)}</div>` : ""}
@@ -1058,7 +1087,11 @@ function progress(stage, who) {
   if (who !== undefined) $("who").textContent = who;
 }
 let cur = {robot: "", i: 0, n: 0};
-function caption(t) { $("cap").classList.remove("hidden"); $("cap").textContent = t; }
+function caption(t) {
+  const c = $("cap"); c.classList.remove("hidden");
+  if (c.textContent === t) return;
+  c.textContent = t; c.classList.remove("swap"); void c.offsetWidth; c.classList.add("swap");  // restart the slide-in
+}
 function hudr() { $("hudr1").textContent = cur.n ? `${cur.robot} · try ${cur.i + 1} of ${cur.n}` : cur.robot; }
 const CAPTIONS = {"moving over the object": "Moving over the object", "lowering to grasp": "Lowering to grab it", "closing the gripper": "Closing the gripper",
   "opening the gripper": "Opening the gripper", "backing off to try again": "Backing off to try again", lifting: "Lifting", carrying: "Carrying it",
@@ -1099,7 +1132,9 @@ function events() {
       case "error": setRunning(false); $("runerr").textContent = e.text; toast(e.text, true); break;
       case "training_round_start": S.curve = []; S.trainSteps = e.steps; trainLabel(); break;
       case "suggestion": caption(e.now ? "Ending this round early to use your suggestion" : "Got it: Nemotron will use your suggestion at the end of this round"); break;
-      case "training_start": S.trainRobot = e.robot; progress("setup", `${e.robot} is ${e.kind === "task" ? "learning" : "learning to walk"}`); $("trainbox").classList.remove("hidden"); $("tab-learning").classList.remove("hidden"); showTab("learning"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = ""; trainLabel();
+      case "reward_info": if (!(S.reward && S.reward.kind === "walk")) S.taskReward = S.reward; S.reward = e; renderReward(); break;
+      case "training_start": if (e.kind === "task" && S.reward && S.reward.kind === "walk") { S.reward = S.taskReward; $("rewardbox").innerHTML = "Shown once practice starts."; $("rewardbox").classList.add("faint"); }
+        S.trainRobot = e.robot; progress("setup", `${e.robot} is ${e.kind === "task" ? "learning" : "learning to walk"}`); $("trainbox").classList.remove("hidden"); $("tab-learning").classList.remove("hidden"); showTab("learning"); S.curve = []; S.trainSteps = e.steps; S.rounds = {}; $("trainrounds").innerHTML = ""; trainLabel();
         $("curvenote").textContent = e.kind === "task" ? "Score per practice run: higher means it gets further through the steps and closer to the goal. The ticks show the furthest step a practice run has reached."
           : "Score per practice run: higher means it walks and follows directions better.";
         if (e.kind !== "task") $("trainsteps").innerHTML = "";
@@ -1116,7 +1151,8 @@ function events() {
         caption(e.blew_up ? `Practice try ${e.id + 1} (${when}): still flailing (knocked the object away)`
           : `Practice try ${e.id + 1} (${when}): ended ${e.dist_cm} cm from the target${e.tilt_deg > 10 ? ", tipped over" : ""}${far}`);
         S.lastTry = e.id; $("rateBox").classList.remove("hidden"); $("rated").textContent = "";
-        if (S.skillSteps && e.steps_total) { S.bestStep = Math.max(S.bestStep || 0, e.steps_reached);
+        if (S.skillSteps && e.steps_total) { const before = S.bestStep || 0; S.bestStep = Math.max(before, e.steps_reached);
+          if (S.bestStep > before) S.reachedNow = {from: before, to: S.bestStep, at: Date.now()};
           $("trainsteps").innerHTML = stepsHtml(S.skillSteps, S.bestStep, true); if (S.stepEdit == null) renderReward(); }
         break; }
       case "program": if (S.results[e.robot]) { const R = S.results[e.robot]; R.programs = (R.programs || []).map(x => ({...x, open: false}));
@@ -1155,7 +1191,7 @@ function events() {
         break; }
       case "skill_steps": S.skillSteps = e; S.bestStep = 0; $("trainsteps").innerHTML = stepsHtml(e, 0, true);
         S.stepPending = {}; S.stepEdit = null;
-        if (e.reward_parts) { S.reward = e; S.rewardPending = {}; } renderReward(); break;
+        if (e.reward_parts) { if (S.reward && S.reward.kind === "walk") S.taskReward = e; else S.reward = e; S.rewardPending = {}; } renderReward(); break;
       case "training_retry": toast(`Out of GPU memory: retrying with ${e.envs} practice copies at once`); break;
       case "training": S.curve.push(e); drawCurve(); renderReward(); break;
       case "training_done": $("trainpct").textContent = !e.ok ? `Training failed: ${e.why || "see Log"}` : e.kind === "task" ? "Learned. Now trying it…" : "Done: plans now use this gait";
@@ -1281,6 +1317,7 @@ function renderReward() {
   const w = (S.reward && S.reward.reward_weights) || {}, w0 = (S.reward && S.reward.reward_defaults) || {};
   $("rewardbox").classList.remove("faint");
   S.rewardKeys = keys;
+  const walking = S.reward && S.reward.kind === "walk";  // learning to walk: its own fixed reward, nothing to adjust
   const row = (k, i) => {
     const v = last[k], d = v - (first[k] || 0), pct = Math.max(2, 100 * Math.abs(v) / big);
     const trend = pts.length > 1 && Math.abs(d) > 0.05 * big ? `<span class="${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}</span> ` : "";
@@ -1288,9 +1325,9 @@ function renderReward() {
     return `<div class="rw"><div class="top">
         <div class="name" title="${esc(rewardShort(k))}">${esc(rewardShort(k))}${changed ? `<span class="wt" data-tip="Changed from Morph's default (×${w0[k]}) by a suggestion">×${w[k]}</span>` : ""}</div>
         <div class="val ${v < 0 ? "neg" : ""}">${trend}${v > 0 ? "+" : ""}${v.toFixed(1)}</div>
-        <select onchange="rewardChange(${i}, this)" aria-label="Adjust ${esc(rewardShort(k))}">
+        ${walking ? "" : `<select onchange="rewardChange(${i}, this)" aria-label="Adjust ${esc(rewardShort(k))}">
           <option value="">Adjust</option><option value="less">Less of this</option><option value="more">More of this</option>
-          <option value="gripping">Only once it's gripping</option><option value="remove">Remove it</option><option value="own">Say it my way…</option></select></div>
+          <option value="gripping">Only once it's gripping</option><option value="remove">Remove it</option><option value="own">Say it my way…</option></select>`}</div>
       <div class="bar"><i class="${v >= 0 ? "pos" : "neg"}" style="width:${pct.toFixed(0)}%"></i></div>
       <div class="what">${esc(cap(rewardLabel(k)))}${k === "steps" && planSteps().length ? ". Each step below pays when it's done; if one was understood wrongly, edit it." : ""}</div>
       ${k === "steps" ? rewardStepsHtml() : ""}
@@ -1301,7 +1338,7 @@ function renderReward() {
   if (keys.includes("steps") && planSteps().length) $("trainsteps").classList.add("hidden");  // shown here instead
   const ta2 = document.getElementById("stepedit");
   if (ta2 && typing && typing.focus) { ta2.focus(); ta2.setSelectionRange(typing.a, typing.b); }
-  const h = rewardHole(pts);
+  const h = walking ? null : rewardHole(pts);
   $("rewardhole").innerHTML = h ? `<div class="hole">⚠ Possible loophole: its score rose from ${h.ra.toFixed(0)} to ${h.rb.toFixed(0)} but it isn't meeting the checklist more often. Most of the rise comes from <b>${esc(rewardShort(h.k))}</b> (${h.from.toFixed(1)} → ${h.to.toFixed(1)}): it may be earning those points without getting closer to the goal. Watch what it does; if that's what's happening, change that part.</div>` : "";
 }
 // the plan's steps, in plain words, each editable (in words: Nemotron rewrites it and Morph checks it can measure it)
@@ -1311,7 +1348,7 @@ function rewardStepsHtml() {
   return `<ol class="rsteps">${st.map((x, i) => {
     const last = i === st.length - 1, done = !last && i < reached, now = !last && i === reached;
     const when = last ? "the whole goal checklist is met" : (x.done_words || x.done_when);
-    return `<li class="rstep ${done ? "done" : ""} ${now ? "now" : ""}">
+    return `<li class="rstep ${done ? "done" : ""} ${now ? "now" : ""} ${done && justReached(i) ? "justdone" : ""}">
       <div class="h"><span class="n">${done ? "✓" : i + 1}</span>
         <div class="t">${esc(x.name)}${now ? `<span class="tag">working on this</span>` : ""}${x.how ? `<small>${esc(x.how)}</small>` : ""}</div>
         ${last ? "" : `<button class="xs edit" onclick="stepEdit(${i})">${ed === i ? "Close" : "Edit"}</button>`}</div>
@@ -1360,9 +1397,10 @@ function drawCurve() {
   $("trainpct").textContent = `this round: ${(last.step / 1e6).toFixed(1)}M of ${(S.trainSteps / 1e6).toFixed(0)}M practice steps · ${Math.round(last.wall_s / 60)} min · score ${last.reward.toFixed(1)}`;
   g.clearRect(0, 0, c.width, c.height);
   const maxR = Math.max(1, ...pts.map(p => p.reward)), W = c.width, H = c.height;
-  g.strokeStyle = "rgba(148,163,184,.2)"; g.beginPath(); g.moveTo(0, H - 1); g.lineTo(W, H - 1); g.stroke();
-  const grd = g.createLinearGradient(0, 0, W, 0); grd.addColorStop(0, "#6aa8ff"); grd.addColorStop(1, "#8b7bff");
-  g.strokeStyle = grd; g.lineWidth = 3; g.beginPath();
+  g.strokeStyle = "#363c44"; g.lineWidth = 1; g.beginPath(); g.moveTo(0, H - 1); g.lineTo(W, H - 1); g.stroke();
+  g.strokeStyle = "rgba(54,60,68,.7)"; g.lineWidth = 1; g.beginPath();  // a quarter grid, like a scope
+  for (let q = 1; q < 4; q++) { g.moveTo(0, Math.round(H * q / 4) + .5); g.lineTo(W, Math.round(H * q / 4) + .5); } g.stroke();
+  g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#4fb3a9"; g.lineWidth = 2; g.beginPath();
   pts.forEach((p, i) => { const x = W * p.step / (S.trainSteps || 1), y = H - 8 - (H - 16) * p.reward / maxR; i ? g.lineTo(x, y) : g.moveTo(x, y); });
   g.stroke();
 }
@@ -1387,7 +1425,7 @@ function renderCompute() {
 async function setCompute(c) { S.compute = await api("/api/compute", c); renderCompute(); if (S.profiled !== undefined && !$("p-robot").classList.contains("hidden")) profile(S.profiled); }
 function showCloudJob(e) {
   showTab("robot");
-  $("cloudjob").innerHTML = `<div class="card" style="border-color:rgba(106,168,255,.45);margin-bottom:12px">
+  $("cloudjob").innerHTML = `<div class="card" style="border-color:rgba(79,179,169,.45);margin-bottom:12px">
     <b>Cloud job ready: ${esc(e.robot)}</b><div class="small muted" style="margin:6px 0">${esc(e.gpu)} · about ${e.estimate.minutes} min · about <b>$${e.estimate.cost.toFixed(2)}</b></div>
     <ol class="small" style="margin:6px 0 8px 18px;padding:0">${e.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>
     <div class="tiny faint mono" style="word-break:break-all">${esc(e.folder)}</div></div>`;

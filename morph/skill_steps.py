@@ -318,7 +318,7 @@ def rule_steps(prof, goal, scene, p: dict) -> list[Step]:
 
 
 OBJECT_VARS = {"x", "y", "z", "bottom", "top", "tilt_deg", "yaw_deg", "speed", "vx", "vy", "vz", "travelled", "held", "grip",
-               "touch_dist", "lifted", "hand_dist", "spin_dps", "spin_z_dps", "dist_to", "grip_gap"}
+               "touch_dist", "lifted", "hand_dist", "spin_dps", "spin_z_dps", "dist_to", "grip_gap", "between"}
 
 
 def body_only(goal) -> bool:

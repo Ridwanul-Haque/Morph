@@ -17,6 +17,7 @@ import copy
 import io
 import json
 import re
+import shutil
 import os
 import queue
 import subprocess
@@ -214,6 +215,7 @@ class App:
         self.planned: dict = {}  # (robot path, goal) -> task.json whose steps were already planned and shown
         self.placements: dict = {}  # robot path -> (x, y, heading rad) where the user put it; else Morph chooses
         self.latest_ckpt = None
+        self.latest_walk = None  # (folder, step) of the walking practice's latest snapshot, while it learns to walk
         self.demo: threading.Thread | None = None
         self.llm = None
         self.videos = None  # TrialRecorder for the current job
@@ -247,6 +249,12 @@ class App:
 
     def on_checkpoint(self, e: dict):
         """A training checkpoint arrived: play it in the viewer (keeps replaying until a newer one comes)."""
+        if e.get("kind") == "walk":
+            self.latest_walk = (Path(e["checkpoint"]), int(e["step"]))
+            if self.demo is None or not self.demo.is_alive():
+                self.demo = threading.Thread(target=self._walk_loop, daemon=True)
+                self.demo.start()
+            return
         self.latest_ckpt = (Path(e["checkpoint"]), int(e["step"]))
         if self.training_task is not None and (self.demo is None or not self.demo.is_alive()):
             self.demo = threading.Thread(target=self._practice_loop, daemon=True)
@@ -315,6 +323,42 @@ class App:
                 continue
             self.practice_seen[k] = r.get("did", {})  # so a rating of this try can say what it did
             self.send(type="practice", robot=robot, step=step, id=k, **r)
+            k += 1
+        self.live.pace = False
+
+    def _walk_loop(self):
+        """While it learns to walk: its latest snapshot in the viewer, walking forward, turning, side-stepping,
+        backing up and standing (until a newer snapshot comes, then that one)."""
+        from ..robots.learned_walker import LearnedWalker
+        from ..sim import PhysicalParams
+        moves = [("walks forward", (0.5, 0.0, 0.0), 2.5), ("turns", (0.0, 0.0, 0.8), 2.0),
+                 ("steps sideways", (0.0, 0.3, 0.0), 2.0), ("walks backwards", (-0.3, 0.0, 0.0), 2.0),
+                 ("stands still", (0.0, 0.0, 0.0), 1.5)]
+        k = 0
+        while self.latest_walk is not None and not self.live.cancel:
+            path, step = self.latest_walk
+            try:
+                w = LearnedWalker(path)
+                w.reset(k, (3.0, 3.0, 0.0), PhysicalParams())  # the object well out of the way
+            except Exception as ex:  # noqa: BLE001  (a snapshot replaced while it loaded: take the next)
+                self.send(type="log", text=f"walking practice try skipped: {ex}")
+                time.sleep(3)
+                continue
+            self.live.pace, self.live.anchor = True, None
+            try:
+                for what, cmd, secs in moves:
+                    if self.latest_walk is None or self.latest_walk[0] != path or self.live.cancel:
+                        break
+                    self.send(type="caption", robot=w.setup.name,
+                              text=f"Walking practice, what it knows after {step / 1e6:.0f}M steps: it {what}")
+                    w.walk(cmd, secs)
+                    if w.fallen():
+                        self.send(type="caption", robot=w.setup.name,
+                                  text=f"Walking practice after {step / 1e6:.0f}M steps: it fell over")
+                        time.sleep(1.5)
+                        break
+            except Cancelled:
+                break
             k += 1
         self.live.pace = False
 
@@ -390,7 +434,10 @@ class App:
              "import_notes": self._imports.get(path, ("", []))[1] if hasattr(self, "_imports") else [],
              "learned": (lambda t: t.parent.name if t else None)(learned_for(prof.name, self.goal, self.resolve(path))
                                                                   if self.goal else None),
-             "recipes": P.program_body(prof)}
+             "recipes": P.program_body(prof),
+             # legs and an arm: it works standing in one place and walks there; learning this goal teaches it to walk
+             "works_standing": prof.base == "floating" and prof.n_legs >= 2 and prof.has_gripper,
+             "walks_first": walks_first(self.resolve(path), self.goal)}
         if self.goal is not None and self.goal.start == "in_hand" and not r["learned"]:  # learned, never a program
             from ..project import body_problem
             r["plan"], r["recipes"] = "learn_policy", None
@@ -506,25 +553,57 @@ class App:
             job = cloud_job(path, prof.name, self.compute["gpu"])
             self.send(type="cloud_job", robot=prof.name, **job)
             return
-        py = ROOT / ".venv-rl" / "bin" / "python"
-        out = WALK_DIR / prof.name
-        if (out / "walk_policy.npz").exists():  # never overwrite a trained gait from the UI
-            self.send(type="error", text=f"{prof.name} already has a walking policy ({out}); move it away to retrain")
+        if (WALK_DIR / prof.name / "walk_policy.npz").exists():  # never overwrite a trained gait from the UI
+            self.send(type="error", text=f"{prof.name} already has a walking policy ({WALK_DIR / prof.name}); move it away to retrain")
             return
-        cmd = [str(py), str(ROOT / "scripts" / "train_walk.py"), path, "--steps", "300000000", "--out", str(out)]
-        if not py.exists():
-            self.send(type="error", text="the RL environment (.venv-rl) isn't installed; see requirements-rl.lock")
-            return
-        try:
-            code, oom = _stream_training(self, cmd, prof.name, 300_000_000, "walk")
-        except Cancelled:
-            if out.exists() and not any(out.iterdir()):
-                out.rmdir()  # nothing was saved
-            raise
-        ok = code == 0 and (out / "walk_policy.npz").exists()
-        self.profiles = {}
-        self.send(type="training_done", robot=prof.name, ok=ok,
-                  why="" if ok else ("the GPU ran out of memory" if oom else "the trainer stopped with an error"))
+        ok, why = _train_walk(self, path, prof.name)
+        self.send(type="training_done", robot=prof.name, ok=ok, why=why)
+
+
+# what learning to walk is rewarded for (scripts/train_walk.py's reward parts), in plain words, and short
+WALK_REWARD = {
+    "tracking_lin_vel": ("walking at the speed and in the direction it's asked to", "Going where it's told"),
+    "tracking_ang_vel": ("turning at the rate it's asked to", "Turning as told"),
+    "tracking_fine": ("matching slow, careful moves exactly (for getting into position next to something)", "Careful slow moves"),
+    "feet_air_time": ("taking proper steps, each foot in the air for a moment", "Proper steps"),
+    "pose": ("keeping a natural standing pose", "Natural pose"),
+    "orientation": ("tilting its body instead of keeping it level", "Tilting"),
+    "lin_vel_z": ("bobbing up and down", "Bobbing"),
+    "ang_vel_xy": ("rocking side to side or nose to tail", "Rocking"),
+    "termination": ("falling over", "Falling"),
+    "stand_still": ("moving its legs when asked to stand still", "Fidgeting"),
+    "dof_pos_limits": ("pushing its joints to the ends of their range", "Joints at their limits"),
+    "torques": ("straining its motors", "Straining"),
+    "energy": ("using energy", "Energy"),
+    "action_rate": ("jerky, twitchy leg movements", "Jerky moves"),
+    "feet_clearance": ("not lifting its feet high enough while stepping", "Feet too low"),
+    "feet_height": ("lifting its feet to the wrong height", "Step height"),
+    "feet_slip": ("feet slipping on the floor", "Slipping"),
+}
+
+
+def _train_walk(app: "App", path: str, robot: str) -> tuple[bool, str]:
+    """Teach a legged robot to walk on this computer (scripts/train_walk.py). Returns (it can walk now, why not)."""
+    from ..planner import WALK_DIR
+    py = ROOT / ".venv-rl" / "bin" / "python"
+    out = WALK_DIR / robot
+    if not py.exists():
+        return False, "the RL environment (.venv-rl) isn't installed; see requirements-rl.lock"
+    cmd = [str(py), str(ROOT / "scripts" / "train_walk.py"), path, "--steps", "300000000", "--out", str(out)]
+    app.send(type="reward_info", kind="walk", reward_parts={k: t for k, (t, _) in WALK_REWARD.items()},
+             reward_short={k: sh for k, (_, sh) in WALK_REWARD.items()})
+    try:
+        code, oom = _stream_training(app, cmd, robot, 300_000_000, "walk")
+    except Cancelled:
+        shutil.rmtree(out / "snapshots", ignore_errors=True)
+        if out.exists() and not any(out.iterdir()):
+            out.rmdir()  # nothing was saved
+        raise
+    finally:
+        app.latest_walk = None
+    ok = code == 0 and (out / "walk_policy.npz").exists()
+    app.profiles = {}
+    return ok, "" if ok else ("the GPU ran out of memory" if oom else "the trainer stopped with an error")
 
 
 NOISE = ("Module", "external/", "W0", "I0", "WARNING: Attach", "Warp ", "CUDA Toolkit", "Devices:", '"cpu"', '"cuda:',
@@ -629,6 +708,13 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
     py = ROOT / ".venv-rl" / "bin" / "python"
     if not py.exists():
         raise ValueError("the RL environment (.venv-rl) isn't installed; see requirements-rl.lock")
+    if json.loads(task.read_text()).get("walk_from") and walks_first(app.resolve(path), goal):
+        # it works with its arm standing in one place and walks there (learn_task._legged_stance): without a walking
+        # skill it learns that first, in the same job (after the checks above, which stop early if the task can't work)
+        app.send(type="caption", text=f"{robot} learns to walk first, to get to where it works")
+        ok, why = _train_walk(app, str(app.resolve(path)), robot)
+        app.send(type="log", robot=robot, text="it can walk now; next it learns the task" if ok else
+                 f"it didn't learn to walk ({why}): it learns the task anyway, and runs start where it works")
     app.training_task, app.latest_ckpt = task, None
     state = {"envs": 1024, "first": True, "oom": False}
 
@@ -690,6 +776,18 @@ def _learn(app: "App", path: str, steps: int = 60_000_000, randomize: str = "lig
              rounds=len(res.get("rounds", [])) + 1)
     app.send(type="done", summary=[{"robot": robot, "plan": "learned_skill", "success": res["success"], "n": res["n"]}])
     _learning_videos(app, task.parent, robot)
+
+
+def walks_first(path, goal) -> bool:
+    """Learning this goal starts by teaching the robot to walk: it has legs, an arm with a gripper, and no gait yet."""
+    from ..introspect import profile_robot
+    from ..planner import walk_policy_dir
+    try:
+        prof = profile_robot(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return (prof.base == "floating" and prof.n_legs >= 2 and prof.has_gripper and goal is not None
+            and goal.start != "in_hand" and walk_policy_dir(prof) is None)
 
 
 def _learning_videos(app: "App", folder: Path, robot: str):

@@ -347,7 +347,11 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
         log(f"  how: {plan['how']}")
     from .learn_task import learned_for
     learned = learned_for(prof.name, goal, robot_path)
-    if learned is not None and stand_at is not None:
+    walk_from = None
+    if learned is not None and json.loads(learned.read_text()).get("walk_from"):
+        # it works standing in one place and walks there first, from wherever it starts (learn_task._legged_stance)
+        walk_from = tuple(stand_at) if stand_at is not None else tuple(json.loads(learned.read_text())["walk_from"])
+    elif learned is not None and stand_at is not None:
         mx, my, myaw = json.loads(learned.read_text())["mount"]
         if math.hypot(mx - stand_at[0], my - stand_at[1]) > 0.05 or abs(math.remainder(myaw - stand_at[2], math.tau)) > 0.17:
             log("  (its learned skill was learned standing somewhere else: not used from this spot)")
@@ -365,7 +369,7 @@ def run_on_robot(pj: Project, goal: GoalSpec, robot_path: str, n: int = 5, llm=N
     if plan["plan_id"] == "learned_skill":
         from .learn_task import try_policy
         emit(type="stage", robot=prof.name, stage="trials", text="using its learned skill")
-        out |= try_policy(pj, goal, learned, n=n, log=log, emit=emit)
+        out |= try_policy(pj, goal, learned, n=n, log=log, emit=emit, walk_from=walk_from)
         log(f"{prof.name}: {out['success']}/{out['n']}")
     elif plan["plan_id"] in ("grasp_place_topdown", "legged_foot_push"):
         if plan["plan_id"] == "grasp_place_topdown":

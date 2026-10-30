@@ -19,6 +19,7 @@ import argparse
 import functools
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import asdict
@@ -42,7 +43,7 @@ from mujoco_playground import wrapper  # noqa: E402
 from mujoco_playground._src import mjx_env  # noqa: E402
 from mujoco_playground.config import locomotion_params  # noqa: E402
 
-from morph.robots.legged_model import CTRL_DT, SIM_DT, LeggedSetup, build_model, legged_setup  # noqa: E402
+from morph.robots.legged_model import CTRL_DT, REF_KP, SIM_DT, LeggedSetup, build_model, legged_setup  # noqa: E402
 
 GO1_STAND = 0.278  # Playground's Go1 standing height, the reference for command / foot-height scaling
 
@@ -84,6 +85,7 @@ class Walk(mjx_env.MjxEnv):
         n = setup.n
         self._init_q = jp.array(m.keyframe("home").qpos)
         self._default_pose = jp.array(setup.default_pose)
+        self._acts = jp.array(setup.acts)  # the leg joints: the rest hold their resting pose
         self._qadr = np.array([m.joint(j).qposadr[0] for j in setup.joints])
         self._vadr = np.array([m.joint(j).dofadr[0] for j in setup.joints])
         lo, hi = m.jnt_range[[m.joint(j).id for j in setup.joints]].T
@@ -129,7 +131,7 @@ class Walk(mjx_env.MjxEnv):
         rng, kc1, kc2 = jax.random.split(rng, 3)
         info = {"rng": rng, "command": jax.random.uniform(kc2, (3,), minval=-self._cmd_a, maxval=self._cmd_a),
                 "steps_until_next_cmd": jp.round(jax.random.exponential(kc1) * 5.0 / self.dt).astype(jp.int32),
-                "last_act": jp.zeros(self.setup.n), "feet_air_time": jp.zeros(self._nf),
+                "last_act": jp.zeros(len(self.setup.acts)), "feet_air_time": jp.zeros(self._nf),
                 "last_contact": jp.zeros(self._nf, dtype=bool), "swing_peak": jp.zeros(self._nf)}
         metrics = {f"reward/{k}": jp.zeros(()) for k in self._config.reward_config.scales.keys()}
         obs = self._obs(data, info)
@@ -137,7 +139,8 @@ class Walk(mjx_env.MjxEnv):
         return mjx_env.State(data, obs, reward, done, metrics, info)
 
     def step(self, state, action):
-        data = mjx_env.step(self._mjx_model, state.data, self._default_pose + action * self._config.action_scale,
+        data = mjx_env.step(self._mjx_model, state.data,
+                            self._default_pose.at[self._acts].add(action * self._config.action_scale),
                             self.n_substeps)
         foot_z = data.site_xpos[self._feet_site][:, 2]
         contact = foot_z < self._foot_r + 0.005
@@ -191,14 +194,21 @@ class Walk(mjx_env.MjxEnv):
         lin, gyro = self._sens(data, "local_linvel"), self._sens(data, "gyro")
         glin, gang = self._sens(data, "global_linvel"), self._sens(data, "global_angvel")
         up = self._sens(data, "upvector")
-        tau, qd = data.actuator_force, data.qvel[self._vadr]
-        feet_vel = data.sensordata[self._foot_vel_adr]
+        # effort as a share of what this robot's servos give (their gains are the Go1's scaled by weight x leg length):
+        # Spot's torques, 7.6x the Go1's, outweighed every reward and every try scored 0, with nothing to learn from
+        tau, qd = data.actuator_force * (REF_KP / self.setup.kp), data.qvel[self._vadr]
+        # speeds and heights in Go1 sizes, as the commands and foot height are scaled: a taller robot's feet move
+        # faster for the same gait (Spot's foot slip, clearance and bounce cost 3x the Go2's, tracking paid half)
+        k = self.setup.stand_height / GO1_STAND
+        lin, glin = lin / k, glin / k
+        cmd_xy = cmd[:2] / k
+        feet_vel = data.sensordata[self._foot_vel_adr] / k
         foot_z = data.site_xpos[self._feet_site][:, 2]
         vel_xy_norm = jp.sqrt(jp.linalg.norm(feet_vel[..., :2], axis=-1))
         return {
-            "tracking_lin_vel": jp.exp(-jp.sum(jp.square(cmd[:2] - lin[:2])) / rc.tracking_sigma),
+            "tracking_lin_vel": jp.exp(-jp.sum(jp.square(cmd_xy - lin[:2])) / rc.tracking_sigma),
             "tracking_ang_vel": jp.exp(-jp.square(cmd[2] - gyro[2]) / rc.tracking_sigma),
-            "tracking_fine": jp.exp(-(jp.sum(jp.square(cmd[:2] - lin[:2])) + jp.square(cmd[2] - gyro[2])) / rc.fine_sigma),
+            "tracking_fine": jp.exp(-(jp.sum(jp.square(cmd_xy - lin[:2])) + jp.square(cmd[2] - gyro[2])) / rc.fine_sigma),
             "lin_vel_z": jp.square(glin[2]),
             "ang_vel_xy": jp.sum(jp.square(gang[:2])),
             "orientation": jp.sum(jp.square(up[:2])),
@@ -209,7 +219,7 @@ class Walk(mjx_env.MjxEnv):
             "action_rate": jp.sum(jp.square(action - info["last_act"])),
             "energy": jp.sum(jp.abs(qd) * jp.abs(tau)),
             "feet_slip": jp.sum(jp.sum(jp.square(feet_vel[..., :2]), axis=-1) * contact) * (cmd_norm > 0.01),
-            "feet_clearance": jp.sum(jp.abs(foot_z - self._foot_r - rc.max_foot_height) * vel_xy_norm),
+            "feet_clearance": jp.sum(jp.abs(foot_z - self._foot_r - rc.max_foot_height) / k * vel_xy_norm),
             "feet_height": jp.sum(jp.square((info["swing_peak"] - self._foot_r) / rc.max_foot_height - 1.0)
                                   * first_contact) * (cmd_norm > 0.01),
             "feet_air_time": jp.sum((info["feet_air_time"] - 0.1) * first_contact) * (cmd_norm > 0.01),
@@ -231,7 +241,7 @@ class Walk(mjx_env.MjxEnv):
 
     @property
     def action_size(self) -> int:
-        return self.setup.n
+        return len(self.setup.acts)
 
     @property
     def mj_model(self):
@@ -267,11 +277,26 @@ def main() -> None:
         rec = {"step": int(step), "wall_s": round(time.time() - t0, 1),
                "reward": float(metrics.get("eval/episode_reward", float("nan"))),
                "episode_length": float(metrics.get("eval/avg_episode_length", float("nan"))),
-               "tracking_lin_vel": float(metrics.get("eval/episode_reward/tracking_lin_vel", float("nan")))}
+               "tracking_lin_vel": float(metrics.get("eval/episode_reward/tracking_lin_vel", float("nan"))),
+               # what each part of the reward paid over a practice run, for the app
+               "parts": {k: round(float(metrics[f"eval/episode_reward/{k}"]), 3)
+                         for k in env._config.reward_config.scales.keys() if f"eval/episode_reward/{k}" in metrics}}
         log.append(rec)
         print(json.dumps(rec), flush=True)
 
-    train = functools.partial(ppo.train, **kw, seed=a.seed, progress_fn=progress,
+    snaps = out / "snapshots"
+
+    def snapshot(step, _make_policy, params):  # the app plays each one, so you can watch it learn to walk
+        d = snaps / f"step_{int(step):012d}"
+        d.mkdir(parents=True, exist_ok=True)
+        export_numpy(params, d / "walk_policy.npz")
+        (d / "train_meta.json").write_text(json.dumps({"setup": asdict(setup)}))
+        for old in snaps.iterdir():
+            if old != d:
+                shutil.rmtree(old, ignore_errors=True)
+        print(json.dumps({"checkpoint": str(d), "step": int(step), "kind": "walk"}), flush=True)
+
+    train = functools.partial(ppo.train, **kw, seed=a.seed, progress_fn=progress, policy_params_fn=snapshot,
                               network_factory=functools.partial(ppo_networks.make_ppo_networks, **net))
     make_inference_fn, params, _ = train(environment=env, eval_env=eval_env,
                                          wrap_env_fn=wrapper.wrap_for_brax_training)
@@ -280,8 +305,9 @@ def main() -> None:
     meta = {"robot": setup.name, "model": setup.model_path, "setup": asdict(setup), "steps": a.steps,
             "num_envs": a.envs, "wall_s": round(wall, 1), "steps_per_s": round(a.steps / wall),
             "gpu": str(jax.devices()[0]), "network": shapes, "curve": log,
-            "obs": "local_linvel(3) gyro(3) gravity(3) q-default(n) qd(n) last_action(n) command(3)"}
+            "obs": "local_linvel(3) gyro(3) gravity(3) q-default(n) qd(n) last_action(legs) command(3)"}
     (out / "train_meta.json").write_text(json.dumps(meta, indent=2))
+    shutil.rmtree(snaps, ignore_errors=True)
     print(json.dumps({k: v for k, v in meta.items() if k not in ("curve", "setup")}, indent=2))
 
 

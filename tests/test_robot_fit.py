@@ -90,3 +90,58 @@ def test_practice_is_plain_until_it_succeeds(tmp_path):
     p.write_text(json.dumps(task))
     assert _vary_now(p, log=lambda s: None) and not json.loads(p.read_text())["plain_practice"]
     assert not _vary_now(p, log=lambda s: None)  # only once
+
+
+def test_between_the_fingers():
+    import numpy as np
+    from morph.task_model import between_terms
+    pen, pair = (0.05, 0.006, 0.006), np.array([[0, 1]])
+
+    def between(a, b):
+        return float(between_terms(np, np.array([a, b], float), np.zeros(3), np.eye(3), pen, pair)[0])
+    assert between([0.03, -0.02, 0], [0.03, 0.02, 0])  # either side, off its middle
+    assert not between([0, 0.02, 0], [0, 0.06, 0])  # both on one side
+    assert not between([0, 0.007, 0], [0, 0.05, 0.03])  # one touching it, the other away
+    assert not between([0, 0.025, 0], [0.04, 0.025, 0])  # beside it: near isn't between
+
+
+def test_the_step_before_the_grasp_needs_it_between_the_fingers():
+    from morph.plan_check import between_first, require_grip
+    task = {"gripper": {"actuator": "grip"}, "steps": [
+        {"name": "down", "done_when": "touch_dist < 0.02 and closure < 0.1"},
+        {"name": "close", "done_when": "grip_gap < 0.04 and held == 1"}]}
+    assert between_first(task["steps"], task)
+    assert "between" in require_grip(task) and task["steps"][0]["done_when"].endswith("between == 1")
+    assert not between_first(task["steps"], task) and require_grip(task) is None
+
+
+def test_rounds_are_ranked_by_the_steps_reached_too(tmp_path):
+    import json
+    from morph.learn_task import _fitness
+    steps = [{"done_when": "hand_dist < 0.1"}, {"done_when": "held == 1"}]
+    for name, done, dist in (("idle", 0.0, 148.0), ("grasping", 1.5, 157.0)):  # (nudging it left it further away)
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "task.json").write_text(json.dumps({"steps": steps}))
+        (tmp_path / name / "train_meta.json").write_text(json.dumps({"kept": {"steps_done": done, "dist": dist}}))
+    res = {"success": 0}
+    assert _fitness(tmp_path / "grasping", res) > _fitness(tmp_path / "idle", res)
+
+
+def test_a_closed_gripper_beside_it_is_not_between():
+    import numpy as np
+    from morph.task_model import between_terms
+    pen, pair = (0.0525, 0.00625, 0.00625), np.array([[0, 1]])
+
+    def between(a, b):
+        return float(between_terms(np, np.array([a, b], float) / 100, np.zeros(3), np.eye(3), pen, pair)[0])
+    assert not between([3.5, 1.6, 0.2], [2.8, -0.3, 5.5])  # one tip on the floor beside it, the other above (cm)
+    assert between([3.0, -3.0, 0.2], [3.0, 3.0, 0.2])  # the jaws open around it
+
+
+def test_a_wobble_is_not_getting_better():
+    from morph.learn_task import _improved
+    last = (0, 0.0, 0.0, 0.17, -155.4)
+    assert not _improved((0, 0.0, 0.0, 0.18, -153.9), last)  # 0.70 of a step against 0.68, 1.5 cm closer
+    assert _improved((0, 0.0, 0.0, 0.3, -160.0), last)  # half a step further on
+    assert _improved((1, 0.0, 0.0, 0.0, -170.0), last) and _improved((0, 0.0, 0.0, 0.17, -140.0), last)
+    assert not _improved((0, 0.0, 0.0, 0.05, -100.0), last)  # closer, but by giving up steps

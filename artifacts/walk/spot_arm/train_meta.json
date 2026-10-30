@@ -1,0 +1,240 @@
+{
+  "robot": "spot_arm",
+  "model": "/home/Ridwanul/hackathon/Morph/third_party/mujoco_menagerie/boston_dynamics_spot/spot_arm.xml",
+  "setup": {
+    "model_path": "/home/Ridwanul/hackathon/Morph/third_party/mujoco_menagerie/boston_dynamics_spot/spot_arm.xml",
+    "name": "spot_arm",
+    "torso": "body",
+    "joints": [
+      "fl_hx",
+      "fl_hy",
+      "fl_kn",
+      "fr_hx",
+      "fr_hy",
+      "fr_kn",
+      "hl_hx",
+      "hl_hy",
+      "hl_kn",
+      "hr_hx",
+      "hr_hy",
+      "hr_kn",
+      "arm_sh0",
+      "arm_sh1",
+      "arm_el0",
+      "arm_el1",
+      "arm_wr0",
+      "arm_wr1",
+      "arm_f1x"
+    ],
+    "feet": [
+      {
+        "body": "fl_lleg",
+        "geom": "FL",
+        "geom_id": 9,
+        "pos": [
+          0.0,
+          0.0,
+          -0.3365
+        ],
+        "radius": 0.036
+      },
+      {
+        "body": "fr_lleg",
+        "geom": "FR",
+        "geom_id": 16,
+        "pos": [
+          0.0,
+          0.0,
+          -0.3365
+        ],
+        "radius": 0.036
+      },
+      {
+        "body": "hl_lleg",
+        "geom": "HL",
+        "geom_id": 23,
+        "pos": [
+          0.0,
+          0.0,
+          -0.3365
+        ],
+        "radius": 0.036
+      },
+      {
+        "body": "hr_lleg",
+        "geom": "HR",
+        "geom_id": 30,
+        "pos": [
+          0.0,
+          0.0,
+          -0.3365
+        ],
+        "radius": 0.036
+      }
+    ],
+    "default_pose": [
+      0.0,
+      1.04,
+      -1.8,
+      0.0,
+      1.04,
+      -1.8,
+      0.0,
+      1.04,
+      -1.8,
+      0.0,
+      1.04,
+      -1.8,
+      0.0,
+      -3.14,
+      3.06,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "stand_height": 0.46,
+    "kp": 267.94378673616507,
+    "kd": 3.827768381945215,
+    "action_scale": 0.5,
+    "torque_limits": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "notes": [
+      "4 feet from introspection: fl_lleg, fr_lleg, hl_lleg, hr_lleg",
+      "servo gains scaled x7.66 from the Go1's by weight x leg length (56.4 kg, 0.73 m legs)",
+      "standing pose from the model's keyframe",
+      "walking moves the 12 leg joints; the other 7 (arm_sh0, arm_sh1, arm_el0, arm_el1, arm_wr0, arm_wr1, arm_f1x) hold their resting pose"
+    ],
+    "driven": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "steps": 300000000,
+  "num_envs": 4096,
+  "wall_s": 2437.7,
+  "steps_per_s": 123066,
+  "gpu": "cuda:0",
+  "network": {
+    "layers": [
+      [
+        62,
+        512
+      ],
+      [
+        512,
+        256
+      ],
+      [
+        256,
+        128
+      ],
+      [
+        128,
+        24
+      ]
+    ]
+  },
+  "curve": [
+    {
+      "step": 0,
+      "wall_s": 23.0,
+      "reward": 8.936024823924527e-05,
+      "episode_length": 76.2421875,
+      "tracking_lin_vel": 13.770065307617188
+    },
+    {
+      "step": 34406400,
+      "wall_s": 335.1,
+      "reward": 11.464668273925781,
+      "episode_length": 983.6875,
+      "tracking_lin_vel": 391.1856994628906
+    },
+    {
+      "step": 68812800,
+      "wall_s": 614.8,
+      "reward": 14.708245277404785,
+      "episode_length": 986.0390625,
+      "tracking_lin_vel": 442.2408447265625
+    },
+    {
+      "step": 103219200,
+      "wall_s": 887.7,
+      "reward": 14.829106330871582,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 430.5296630859375
+    },
+    {
+      "step": 137625600,
+      "wall_s": 1159.8,
+      "reward": 15.722146987915039,
+      "episode_length": 994.6875,
+      "tracking_lin_vel": 456.6352844238281
+    },
+    {
+      "step": 172032000,
+      "wall_s": 1417.5,
+      "reward": 16.339393615722656,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 498.71258544921875
+    },
+    {
+      "step": 206438400,
+      "wall_s": 1658.8,
+      "reward": 15.843851089477539,
+      "episode_length": 992.5390625,
+      "tracking_lin_vel": 507.91119384765625
+    },
+    {
+      "step": 240844800,
+      "wall_s": 1903.4,
+      "reward": 16.574054718017578,
+      "episode_length": 1000.0,
+      "tracking_lin_vel": 560.3935546875
+    },
+    {
+      "step": 275251200,
+      "wall_s": 2171.2,
+      "reward": 17.987728118896484,
+      "episode_length": 992.421875,
+      "tracking_lin_vel": 697.8871459960938
+    },
+    {
+      "step": 309657600,
+      "wall_s": 2437.1,
+      "reward": 20.738628387451172,
+      "episode_length": 994.734375,
+      "tracking_lin_vel": 857.7828369140625
+    }
+  ],
+  "obs": "local_linvel(3) gyro(3) gravity(3) q-default(n) qd(n) last_action(legs) command(3)"
+}
