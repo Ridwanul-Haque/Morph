@@ -1,4 +1,4 @@
-"""Goals that start with the object in the hand (GoalSpec.start == "in_hand"): spinning a pencil, rolling a ball in
+"""Goals that start with the object in the hand (GoalSpec.start == "in_hand"): spinning a pen, rolling a ball in
 the palm. Morph puts it there before every try instead of on the floor.
 
   setup(task, goal)   turns a hand robot palm up and raises it (mount_pose), then drops the object onto the palm or

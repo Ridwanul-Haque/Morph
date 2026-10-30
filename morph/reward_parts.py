@@ -14,7 +14,8 @@ REWARD_PARTS: dict[str, tuple[str, float, float]] = {
     "near": ("the object being close to where it must end up, with the checklist met", 0.5, 2.0),
     "success": ("a bonus every moment the whole checklist is met", 0.5, 2.0),
     "reach": ("the hand getting to the object (to Morph's planned grip, when there is one)", 0.0, 2.0),
-    "heading": ("the object facing the way the goal asks", 0.0, 2.0),
+    "heading": ("the object facing the way the goal asks, while it is held or near where it must end up", 0.0, 2.0),
+    "open_till_there": ("keeping the gripper open until it is at the grip (a penalty for closing it early)", 0.0, 2.0),
     "upright": ("keeping the object upright (a penalty for tilting it)", 0.0, 2.0),
     "smooth": ("smooth motion (a penalty for jerky moves)", 0.0, 3.0),
     "fling": ("not flinging the object (a penalty when it moves faster than 0.5 m/s)", 0.0, 3.0),
@@ -26,7 +27,7 @@ REWARD_PARTS: dict[str, tuple[str, float, float]] = {
 
 # key -> a short name for the app (the plain words above go under it)
 SHORT = {"toward": "Moving it towards the goal", "near": "Being at the goal", "success": "Checklist met",
-         "reach": "Reaching the object", "heading": "Facing the right way", "upright": "Keeping it upright",
+         "reach": "Reaching the object", "heading": "Facing the right way", "open_till_there": "Open until lined up", "upright": "Keeping it upright",
          "smooth": "Smooth motion", "fling": "Not flinging it", "standing": "Staying on its feet",
          "copy": "Copying the program", "steps": "Following the plan's steps"}
 

@@ -14,6 +14,8 @@ without training. Two of them:
 - a grasp set up by being near the object. The Stretch's step before closing was "hand_dist <= 0.06": done with its
   hand resting on top of the parcel, so practice learned to rest it there and never had its fingers either side of it.
   With Morph's own grip known (task["grasp"]), the step before the grasp has to have the hand there (grip_gap)
+- a measured value asked to be exactly a number. The Stretch's first step had "base_tilt_deg == 0": its body sits tilted
+  about 0.2 degrees, so the step could never be done and every plan showed 0% of its steps
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .goal_terms import normalize, parse, violation
+from .goal_terms import FLAGS, normalize, parse, violation
 
 # conditions judged once things settle (the ones the last step should lead to); "ever" and "always" ones aren't
 END = ("end", "last", "release", None)
@@ -147,6 +149,31 @@ def between_first(steps: list[dict], task: dict) -> list[str]:
     return [f"step {g}, \"{st['name']}\" ({st['done_when']}), sets up the grasp in step {g + 1} without the object "
             "being between the fingers: a gripper can only grab what is between them, and near it isn't enough. Add "
             "between == 1"]
+
+
+def exact_values(steps: list[dict]) -> list[str]:
+    """No step may ask for a measured value (a position, an angle, a distance) to be exactly a number: physics never
+    lands on it. Only the yes/no ones (held, between, ...) can be compared with ==."""
+    out = []
+    for k, st in enumerate(steps):
+        for rule in ("done_when", "keep"):
+            try:
+                tree = ast.parse(normalize(st[rule]), mode="eval") if st.get(rule) else None
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree) if tree else ():
+                if not isinstance(node, ast.Compare):
+                    continue
+                sides = [node.left, *node.comparators]
+                for op, a, b in zip(node.ops, sides, sides[1:]):
+                    name = next((x.id for x in (a, b) if isinstance(x, ast.Name)), None)
+                    if isinstance(op, (ast.Eq, ast.NotEq)) and name and name not in FLAGS \
+                            and any(isinstance(x, ast.Constant) for x in (a, b)):
+                        out.append(f"step {k + 1}, \"{st['name']}\": its {rule.replace('_', ' ')} asks for {name} to be "
+                                   f"exactly a number ({ast.unparse(node)}): a measured value never lands on it exactly "
+                                   "(a robot's body sits tilted a fraction of a degree), so the step can never be done. "
+                                   f"Use a range instead, e.g. {name} < a small limit")
+    return out
 
 
 def require_grip(task: dict) -> str | None:
@@ -371,6 +398,6 @@ def plan_checker(task: dict, conditions: list[dict], log=print):
 
     def check(steps: list[dict]) -> list[str]:
         return (unfinished(steps, conditions) + before_the_grasp(steps, task) + grip_first(steps, task)
-                + between_first(steps, task)
+                + between_first(steps, task) + exact_values(steps)
                 + (keep(steps) if keep else []))
     return check

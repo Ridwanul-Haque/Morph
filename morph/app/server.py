@@ -861,6 +861,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"busy": APP.busy(), "kind": j.get("kind"), "robot": j.get("robot", ""),
                             "seconds": round(time.time() - j["since"]) if APP.busy() and j.get("since") else 0,
                             "stopping": bool(APP.busy() and APP.live.cancel)})
+            elif u.path == "/api/cam":  # which way the view looks (the page's compass)
+                from ..sim import LAST_CAM
+                self._json({"az": LAST_CAM["az"], "el": LAST_CAM["el"]})
             elif u.path == "/api/costs":
                 from .compute import nemotron_cost
                 self._json({"llm_cost": nemotron_cost(APP.llm.records if APP.llm else []), "renderer": APP.live.renderer_name})

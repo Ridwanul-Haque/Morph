@@ -197,3 +197,15 @@ def test_a_plan_in_the_hand_asks_for_it_kept_up_not_pinched():
             "conditions": [{"kind": "expression", "expr": "held == 1", "when": "always"}]}
     assert in_hand_steps(firm) is None  # the goal asks for the pinch: the plan keeps it
     assert in_hand_steps({"steps": [{"name": "a", "done_when": "held == 1"}], "conditions": []}) is None  # from the floor
+
+
+def test_a_step_never_asks_a_measured_value_to_be_exact():
+    """The Stretch's first step had "base_tilt_deg == 0": its body sits tilted about 0.2 degrees, so the step could
+    never be done. Yes/no values (held, between) can still be compared with ==."""
+    from morph.plan_check import exact_values
+    steps = [{"name": "approach", "done_when": "(hand_dist < 0.05 and base_tilt_deg == 0 and between == 1) and grip_gap < 0.03"},
+             {"name": "grasp", "done_when": "held == 1 and in_hand == 1", "keep": "base_tilt_deg < 5"},
+             {"name": "turn", "done_when": "abs(yaw_deg + 180) < 15", "keep": "0.0 != hand_z"}]
+    found = exact_values(steps)
+    assert len(found) == 2 and "base_tilt_deg" in found[0] and "step 1" in found[0] and "hand_z" in found[1]
+    assert exact_values(steps[1:2]) == []

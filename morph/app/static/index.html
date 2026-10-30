@@ -309,6 +309,15 @@ dl.kv dt { color: var(--faint); } dl.kv dd { margin: 0; }
 header [data-tip]:hover::after { left: auto; right: 0; }
 ::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
 
+/* compass: which way north, south, east and west are in the view (follows the camera as it's turned) */
+.compass { position: absolute; left: 14px; bottom: 14px; width: 112px; height: 112px; pointer-events: none;
+  background: rgba(13, 15, 17, .72); border: 1px solid var(--line); border-radius: 4px; }
+.compass svg { display: block; }
+.compass text { font: 600 12px var(--mono); fill: var(--dim); text-anchor: middle; dominant-baseline: central; }
+.compass text.n { fill: var(--accent); }
+.viewer.vidmode .compass { display: none; }  /* a rendered video has its own camera */
+#compassbtn.on { color: var(--accent); border-color: var(--accent); }
+
 /* ---------- motion: only where something changed that is worth seeing ---------- */
 @keyframes land { from { transform: scale(.5); } to { transform: none; } }
 .sq.fresh { animation: land .22s cubic-bezier(.2, .8, .3, 1); }  /* a try's result arriving */
@@ -424,6 +433,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <div class="hud hidden" id="hud"><span class="pill"><span class="live" id="livedot"></span><span id="hudtxt">LIVE</span></span></div>
     <div class="hud r hidden" id="hudr"><span class="pill" id="hudr1"></span></div>
     <div class="cap hidden" id="cap"></div>
+    <div class="compass hidden" id="compass" aria-label="compass"><svg id="compsvg" width="112" height="112" viewBox="0 0 112 112"></svg></div>
   </div>
 
   <div class="toolbar">
@@ -432,6 +442,7 @@ header [data-tip]:hover::after { left: auto; right: 0; }
     <span class="tlabel">View</span><div class="seg" id="camera"></div>
     <span class="tlabel" data-tip="Sharp draws at your screen's resolution (needs a GPU). Fast suits computers without one.">Quality</span><div class="seg" id="quality"></div>
     <span class="spacer"></span>
+    <button class="icon" id="compassbtn" onclick="toggleCompass()" data-tip="Show or hide the compass (which way north, south, east and west are in the view)"><svg width="18" height="18" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 5l2.6 7H9.4z" fill="currentColor"/><path d="M12 19l-2.6-7h5.2z" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></button>
     <button class="icon" id="resetview" onclick="resetView()" data-tip="Reset view. Turn it yourself: drag to rotate, right-drag (or Shift-drag) to move, scroll to zoom, double-click to reset.">⟲</button>
     <button class="icon" onclick="fullscreen()" data-tip="Full screen">⤢</button>
   </div>
@@ -630,7 +641,7 @@ async function orbitFlush(reset) {
       await api("/api/control", reset ? {orbit_reset: true, live: S.viewMode === "live"} : {orbit: d, live: S.viewMode === "live", draft});
       orbit.ver++; await refreshPreview(draft);
     }
-    orbit.moved = !reset; $("resetview").classList.toggle("on", orbit.moved);
+    orbit.moved = !reset; $("resetview").classList.toggle("on", orbit.moved); pollCam();
     if (!draft) orbit.sharpDue = false;
   } catch (e) { /* the next drag step tries again */ }
   finally { orbit.busy = false; if (orbit.pending) orbitFlush(); else if (orbit.sharpDue && !orbit.drag && !orbit.wheeling) sharpen(); }
@@ -641,6 +652,45 @@ function sharpen() {  // after the drag: the same view, drawn properly
   else if (S.viewMode === "live" && !S.running) api("/api/control", {orbit: {}, live: true}).catch(() => {});
 }
 function resetView() { orbit.pending = null; if (orbit.busy) setTimeout(resetView, 60); else orbitFlush(true); }
+// the compass: drawn from the angle of the camera the server last drew with, so it stays right however the view is turned
+const compass = {on: true, az: null, el: null, busy: false};
+try { compass.on = localStorage.getItem("morph.compass") !== "off"; } catch (e) {}
+function toggleCompass() {
+  compass.on = !compass.on;
+  try { localStorage.setItem("morph.compass", compass.on ? "on" : "off"); } catch (e) {}
+  showCompass(); if (compass.on) pollCam();
+}
+function showCompass() {
+  const visible = compass.on && $("empty").classList.contains("hidden");
+  $("compass").classList.toggle("hidden", !visible); $("compassbtn").classList.toggle("on", compass.on);
+  return visible;
+}
+function drawCompass(az, el) {
+  // MuJoCo's azimuth is the way the camera looks (0 = east, 90 = north). A direction at world angle th shows at
+  // (az - th) degrees clockwise from the top of the view; the floor is squashed by how low the camera looks
+  const c = 56, R = 40, k = Math.max(0.3, Math.sin(Math.abs(el) * Math.PI / 180));
+  const at = (th, r) => { const a = (az - th) * Math.PI / 180; return [c + Math.sin(a) * r, c - Math.cos(a) * r * k]; };
+  const ticks = [0, 45, 90, 135, 180, 225, 270, 315].map(th => {
+    const [x1, y1] = at(th, R - (th % 90 ? 3 : 6)), [x2, y2] = at(th, R);
+    return `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="var(--line2)" stroke-width="1.5"/>`;
+  }).join("");
+  const [nx, ny] = at(90, R - 10), [sx, sy] = at(270, R - 10);
+  const labels = [[90, "N", "n"], [0, "E", ""], [270, "S", ""], [180, "W", ""]].map(([th, t, cl]) => {
+    const [x, y] = at(th, R - 22 + (th === 90 ? 0 : 0)); return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" class="${cl}">${t}</text>`; }).join("");
+  $("compsvg").innerHTML = `<ellipse cx="${c}" cy="${c}" rx="${R}" ry="${(R * k).toFixed(1)}" fill="none" stroke="var(--line2)" stroke-width="1.5"/>${ticks}
+    <line x1="${c}" y1="${c}" x2="${nx.toFixed(1)}" y2="${ny.toFixed(1)}" stroke="var(--accent)" stroke-width="3" stroke-linecap="round"/>
+    <line x1="${c}" y1="${c}" x2="${sx.toFixed(1)}" y2="${sy.toFixed(1)}" stroke="var(--faint)" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="${c}" cy="${c}" r="3" fill="var(--text)"/>${labels}`;
+}
+async function pollCam() {
+  if (compass.busy || !showCompass() || document.hidden) return;
+  compass.busy = true;
+  try {
+    const v = await (await fetch("/api/cam")).json();
+    if (v.az !== compass.az || v.el !== compass.el) { compass.az = v.az; compass.el = v.el; drawCompass(v.az, v.el); }
+  } catch (e) {} finally { compass.busy = false; }
+}
+setInterval(pollCam, 200);
 
 // ---- putting the robot where you want it (Robot tab: "Place on the view")
 const place = {busy: false, pending: null};

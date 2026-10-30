@@ -118,13 +118,17 @@ def _block_xml(block: BlockSpec) -> str:
     </body>{block.fixtures_xml}"""
     if shape != "box":
         size = {"sphere": f"{hz}", "cylinder": f"{hx} {hz}", "capsule": f"{hx} {max(hz - hx, 0.001)}"}[shape]
+        if shape == "sphere":  # a painted band round its middle (a flat stripe's corners stuck out of the ball)
+            stripe = f'type="cylinder" size="{hz * 1.004} {hz * 0.14}" euler="1.5708 0 0"'
+        else:  # inside the shape: a capsule's stripe stops where its rounded ends would let the corners poke out
+            stripe = f'type="box" size="{hx * 0.9} {hx * 0.12} {hz * 0.9 if shape == "cylinder" else max(hz - hx * 0.6, 0.001)}"'
         return f"""
     <body name="block" pos="0.45 -0.15 {hz}">
       <freejoint name="block_free"/>
       <geom name="block_geom" type="{shape}" size="{size}" mass="{block.mass}"
             friction="{block.friction} 0.005 0.0001" rgba="0.95 0.75 0.2 1" condim="{6 if shape == 'sphere' else 4}"/>
       <!-- visual-only stripe, so turning and rolling show -->
-      <geom type="box" size="{hx * 0.9} {hx * 0.12} {hz * 0.9}" contype="0" conaffinity="0" mass="0" rgba="0.8 0.1 0.1 1"/>
+      <geom {stripe} contype="0" conaffinity="0" mass="0" rgba="0.8 0.1 0.1 1"/>
       <site name="block_center" pos="0 0 0" size="0.005"/>
     </body>{block.fixtures_xml}"""
     return f"""

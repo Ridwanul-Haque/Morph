@@ -1,0 +1,14 @@
+# The parcel cell with a pen instead of the parcel (a 3D model, Pen.STL). Same bin, shelf and wall.
+#
+#   morph do examples/pen "put the pen into the bin"
+#   morph do examples/pen "spin the pen around the fingers without using the thumb" \
+#     --robot third_party/mujoco_menagerie/shadow_hand/right_hand.xml
+
+[project]
+name = "pen"
+scene = "scene.xml"
+object = "pen"
+robot = "../../third_party/mujoco_menagerie/franka_emika_panda/panda.xml"
+
+[task]
+description = "put the pen into the bin"

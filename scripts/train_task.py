@@ -174,6 +174,7 @@ class TaskLearn(mjx_env.MjxEnv):
         # how much each part of the reward counts (reward_parts: 1 = Morph's default; a suggestion can change it)
         self.w = reward_weights(task)
         self.parts = ["toward", "near", "success", "reach", "smooth", "fling"] + (["heading"] if self.heading else []) \
+            + (["open_till_there"] if self.grasp is not None else []) \
             + (["upright"] if self.upright else []) + (["standing"] if self.ix.base >= 0 else []) \
             + (["steps"] if task.get("steps") else [])  # + "copy" once the demonstration is loaded (below)
         # extra shaping terms Nemotron wrote (Eureka-style), each logged on its own so it can see what they did
@@ -315,6 +316,12 @@ class TaskLearn(mjx_env.MjxEnv):
             unmet = unmet + sum(terms)
             track = {"tv": tv, "released": released, "was_held": held}
         return d + 0.3 * unmet, track
+
+    def _yaw_err(self, data):
+        """How far the object's heading is from the one the goal asks (radians, 0..pi)."""
+        R = data.xmat[self.ix.block].reshape(3, 3)
+        a = jp.arctan2(R[1, 0], R[0, 0]) - self.target[3]
+        return jp.abs(jp.arctan2(jp.sin(a), jp.cos(a)))
 
     def _broken(self, data, u=0.0, win=None):
         """Per "the whole time" condition: is it broken now (strict, as judged; by more than its slack when eased)."""
@@ -514,8 +521,7 @@ class TaskLearn(mjx_env.MjxEnv):
         bp = data.xpos[ix.block]
         R = data.xmat[ix.block].reshape(3, 3)
         tilt = jp.arccos(jp.clip(R[2, 2], -1.0, 1.0))
-        yaw_err = jp.abs(jp.arctan2(jp.sin(jp.arctan2(R[1, 0], R[0, 0]) - self.target[3]),
-                                    jp.cos(jp.arctan2(R[1, 0], R[0, 0]) - self.target[3])))
+        yaw_err = self._yaw_err(data)
         if self.push:
             to_t = jp.array([self.target[0], self.target[1]]) - bp[:2]
             u = to_t / (jp.linalg.norm(to_t) + 1e-6)
@@ -547,8 +553,19 @@ class TaskLearn(mjx_env.MjxEnv):
                 "smooth": -0.02 * jp.sum(jp.square(action - info["last_act"])),
                 # capped: a copy whose physics nearly blew up (a pen at 100 m/s) once outweighed the whole batch
                 "fling": -1.0 * jp.clip(jp.linalg.norm(data.qvel[ix.block_v:ix.block_v + 3]) - 0.5, 0.0, 5.0)}
-        if self.heading:
-            part["heading"] = 0.5 * jp.exp(-yaw_err ** 2 / 0.3) * close
+        if self.grasp is not None or self.heading:
+            v = self._measure(data, win)
+            held = jp.asarray(v["held"], jp.float32)
+        if self.heading:  # from any angle (a narrow pull gave nothing past ~45 degrees off, and only once the object sat
+            # at the place: a Stretch set the parcel in the bin but never turned it), while it's held or near the place.
+            # Not on the floor: counted there, it paid a Stretch for turning the parcel by bumping it, and it stopped
+            # reaching for it
+            part["heading"] = 1.0 * jp.square(jp.cos(yaw_err / 2)) * jp.maximum(held, 1 - jp.tanh(d / 0.1))
+        if self.grasp is not None:  # closing before the fingers are round the object shuts them on nothing (or on its
+            # top, pushing it away): a Stretch closed early every try and never got the parcel between its fingers.
+            # Nothing while far and open, nothing once there or holding it, so it never pays to stay away
+            shut = jp.asarray(v["closure"], jp.float32)
+            part["open_till_there"] = -0.5 * shut * (1 - jp.exp(-reach / 0.04)) * (1 - held)
         if self.upright:
             part["upright"] = -1.0 * tilt ** 2
         done = jp.zeros(())

@@ -73,7 +73,7 @@ def test_touching_in_formulas():
     assert float(violation(np, parse("touching('thumb')", {}), v)) > 0
     assert float(violation(np, parse("touching('index|middle')", {}), v)) == 0.0
     assert math.isnan(float(violation(np, parse("touching('little')", {}), v)))  # not on this robot: never met
-    assert describe_formula("touching('thumb') == 0", "pencil") == "the thumb not touching the pencil"
+    assert describe_formula("touching('thumb') == 0", "pen") == "the thumb not touching the pen"
 
 
 def test_goal_names_a_finger_the_robot_lacks():
@@ -83,16 +83,16 @@ def test_goal_names_a_finger_the_robot_lacks():
 
 
 def test_in_hand_requests_start_in_the_hand():
-    scene = load_scene(Path(__file__).resolve().parents[1] / "examples" / "pencil" / "scene.xml")
-    g = goal_from_description_rules("spin the pencil around the fingers without using the thumb", scene)
+    scene = load_scene(Path(__file__).resolve().parents[1] / "examples" / "pen" / "scene.xml")
+    g = goal_from_description_rules("spin the pen around the fingers without using the thumb", scene)
     assert g.start == "in_hand"
     assert {c.expr for c in g.conditions} == {"spin_dps > 180", "touching('thumb') == 0"}
     assert [c.when for c in g.conditions if "thumb" in c.expr] == ["always"]
-    assert goal_from_description_rules("push the pencil 10 cm east", scene).start == "scene"
+    assert goal_from_description_rules("push the pen 10 cm east", scene).start == "scene"
 
 
 @pytest.mark.skipif(not (MENAGERIE / "shadow_hand").exists(), reason="scripts/fetch_assets.sh --extra")
-def test_shadow_hand_is_a_hand_and_holds_a_pencil_without_the_thumb(tmp_path):
+def test_shadow_hand_is_a_hand_and_holds_a_pen_without_the_thumb(tmp_path):
     from morph.introspect import profile_robot
     from morph.learn_task import make_task
     from morph.project import load_project
@@ -100,8 +100,8 @@ def test_shadow_hand_is_a_hand_and_holds_a_pencil_without_the_thumb(tmp_path):
     prof = profile_robot(xml)
     assert prof.kind == "hand" and prof.n_arms == 0
     assert set(prof.gripper["finger_names"]) == {"thumb", "index", "middle", "ring", "little"}
-    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "pencil")
-    goal = goal_from_description_rules("spin the pencil around the fingers without using the thumb", pj.scene)
+    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "pen")
+    goal = goal_from_description_rules("spin the pen around the fingers without using the thumb", pj.scene)
     task = make_task(pj, goal, xml, plan=False, folder=tmp_path / "shadow")
     import json
     t = json.loads(task.read_text())
@@ -135,12 +135,12 @@ def test_spinning_the_whole_time_is_impossible_from_rest():
 
 
 def test_a_request_can_say_which_fingers_it_starts_on():
-    scene = load_scene(Path(__file__).resolve().parents[1] / "examples" / "pencil" / "scene.xml")
-    g = goal_from_description_rules("pass the pencil between the fingers. it starts between the index and middle "
+    scene = load_scene(Path(__file__).resolve().parents[1] / "examples" / "pen" / "scene.xml")
+    g = goal_from_description_rules("pass the pen between the fingers. it starts between the index and middle "
                                     "fingers and ends between the middle and ring fingers", scene)
     assert g.start == "in_hand" and g.start_fingers == ["index", "middle"]
     assert "index and middle" in g.start_text()
-    assert goal_from_description_rules("spin the pencil around the fingers", scene).start_fingers == []
+    assert goal_from_description_rules("spin the pen around the fingers", scene).start_fingers == []
     from morph.goal_sources import start_fingers
     assert start_fingers("start with it on the ring and pinky fingers") == ["ring", "little"]
 
@@ -165,7 +165,7 @@ def test_it_starts_on_the_fingers_the_request_names(tmp_path):
     from morph.project import load_project
     from morph.task_model import build_task_model, contact_touch, indices
     import json
-    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "pencil")
+    pj = load_project(Path(__file__).resolve().parents[1] / "examples" / "pen")
     goal = GoalSpec(object=pj.scene.object_name, start="in_hand", start_fingers=["index", "middle"],
                     conditions=[Condition(kind="expression", expr="in_hand == 1", when="always")])
     t = json.loads(make_task(pj, goal, str(MENAGERIE / "shadow_hand" / "right_hand.xml"), plan=False,

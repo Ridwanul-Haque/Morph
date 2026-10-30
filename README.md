@@ -94,6 +94,7 @@ From the command line:
 ```bash
 .venv/bin/morph do examples/parcel "put the parcel into the bin" --robot third_party/mujoco_menagerie/universal_robots_ur5e/ur5e.xml
 .venv/bin/morph do examples/ball "put the ball into the bin"          # a real sphere: it rolls
+.venv/bin/morph do examples/pen "put the pen into the bin"            # a 3D model (Pen.STL)
 .venv/bin/morph learn examples/parcel "lift the parcel 10 cm and hold it" --robot <model.xml> --rounds 4
 .venv/bin/morph export runs/learned/<robot>__<goal>                    # policy + runner + ROS 2 package
 .venv/bin/morph video runs/learned/<robot>__<goal>                     # render learning videos
@@ -299,7 +300,7 @@ touches the object: `touching('thumb') == 0` the whole time, `fingers_touching >
 contacts; the GPU learner counts a finger as touching when any part of it is within 6 mm of the surface. A robot
 without the named part is refused before anything runs.
 
-A request about handling the object in the hand ("spin the pencil around the fingers") starts with it there: Morph
+A request about handling the object in the hand ("spin the pen around the fingers") starts with it there: Morph
 turns the hand palm up, drops the object onto the palm or fingers, and tries grips (which fingers close, how far)
 until one holds it, already meets the goal's "the whole time" conditions, and keeps doing so untouched for 3 s in both
 the accurate and the learner's physics. Holding still isn't enough: early practice twitches the fingers at random, so
@@ -307,7 +308,7 @@ each grip is also tried with the object laid a few slightly different ways, ever
 whole tries, and only the sturdiest poses are kept. That grip is what the policy holds when it does nothing; tries start
 from those poses, so practice can't depend on one lucky resting pose, and isn't cut short by drops before anything is
 learned. In-hand goals
-are learned, not programmed (`examples/pencil`).
+are learned, not programmed (`examples/pen` with the Shadow Hand).
 
 ## Compute and cost
 

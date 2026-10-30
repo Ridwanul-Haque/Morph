@@ -231,8 +231,7 @@ class SimulationEnvironment:
             apply_view(cam, view)
             remember(cam)
             return cam
-        if view is not None:  # so a first drag from this camera knows which way it faces
-            remember(camera_as_free(self.model, self.data, camera))
+        remember(camera_as_free(self.model, self.data, camera))  # which way it faces: for a first drag, and the compass
         return camera
 
     def close(self) -> None:

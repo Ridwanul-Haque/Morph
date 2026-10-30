@@ -1597,13 +1597,17 @@ def _tested_revision(pj: Project, goal: GoalSpec, task_path: Path, before: str, 
     """A revision is only kept if it practises better than the plan it replaces, from the same point (Eureka judges
     every reward by training on it; Booth et al. 2023: a change that reads well can still be worse). revise_task_steps
     has written it into the task; this puts the current plan back and races the two. True if the revision won (a
-    tie goes to the current plan, unless the revision is the person's own suggestion: theirs)."""
+    tie goes to the current plan, unless the revision is the person's own suggestion: theirs). The person's suggestion
+    gets twice the practice and is judged on the goal only, not on the share of its own steps done: the current plan's
+    steps are the ones the learner has practised for rounds, and a Stretch's suggested split of its first step lost
+    to them on that share after a short practice."""
     new, old = load_task(task_path), json.loads(before)
     changed = {k: v for k, v in new.items() if k != "_dir" and v != old.get(k)}
     task_path.write_text(before)
-    chosen = search_step_plans(pj, goal, task_path, train, None, {}, history, each, tries, 0, log, emit, explore=False,
+    chosen = search_step_plans(pj, goal, task_path, train, None, {}, history, each * (2 if theirs else 1), tries, 0, log,
+                               emit, explore=False,
                                extra=[{"idea": "Nemotron's revision: " + rev["rationale"][:160], "set": changed}],
-                               prefer=1 if theirs else 0)
+                               prefer=1 if theirs else 0, goal_only=theirs)
     if chosen is None:  # neither could practise (the trainer failed): take the revision as Nemotron meant it
         t = load_task(task_path)
         t.update(changed)
@@ -2215,7 +2219,7 @@ EXPLORE = [("the current steps, exploring more", {"entropy": 2.0}),
 
 def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, diagnosis: dict, rounds: list,
                       steps_each: int, tries: int = 5, k: int = 3, log=print, emit=None, explore: bool = True,
-                      extra: list[dict] = (), prefer: int = 0) -> dict | None:
+                      extra: list[dict] = (), prefer: int = 0, goal_only: bool = False) -> dict | None:
     """A small population, one GPU: Nemotron proposes k different step plans (Eureka-style), and the current plan runs
     as it is and with different exploration settings (Population Based Training). Every variant practises briefly from
     where the learner is now, in its own folder; the weaker half is dropped there and the rest practise as long again
@@ -2224,7 +2228,8 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     learners for a detailed hand, and taking turns uses the same compute as splitting the practice copies between
     them. Returns what was chosen, or None if there was nothing to compare. explore=False leaves out the exploring
     variants; extra: more plans to compare, each {"idea", "set": task fields it changes} (a revision, against the
-    current plan). prefer: the plan that wins a tie (the current one, unless it's the person's own suggestion)."""
+    current plan). prefer: the plan that wins a tie (the current one, unless it's the person's own suggestion).
+    goal_only: rank on the goal alone, not the share of each plan's own steps (plans whose steps differ a lot)."""
     from .introspect import profile_robot
     from .skill_steps import Step, check_steps, check_terms, robot_brief, scales
     emit = emit or (lambda **e: None)
@@ -2280,6 +2285,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
     emit(type="learn_round", stage="candidates", ideas=[p["idea"] for p in plans])
     main = task_path.parent
     first = max(1_000_000, steps_each // 2)
+    score = (lambda f, r: _fitness(f, r)[:3] + (0.0,) + _fitness(f, r)[4:]) if goal_only else _fitness
     alive = []
     for i, plan in enumerate(plans):
         cdir = main / f"candidate_{i}"
@@ -2298,7 +2304,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         if not train(cdir / "task.json", first, main / "params.pkl"):
             continue
         res = try_policy(pj, goal, cdir / "task.json", n=tries, log=lambda s: None)
-        fit = _fitness(cdir, res)
+        fit = score(cdir, res)
         alive.append((fit, i, res))
         log(f"    -> {res['success']}/{res['n']} tries; {_fit_words(fit)}")
         emit(type="learn_round", stage="candidate", index=i, idea=plan["idea"], success=res["success"], n=res["n"],
@@ -2315,7 +2321,7 @@ def search_step_plans(pj: Project, goal: GoalSpec, task_path: Path, train, llm, 
         cdir = main / f"candidate_{i}"
         if len(keep) > 1 and train(cdir / "task.json", first, cdir / "params.pkl"):
             res = try_policy(pj, goal, cdir / "task.json", n=tries, log=lambda s: None)
-            fit = _fitness(cdir, res)
+            fit = score(cdir, res)
             log(f"    variant {i + 1} -> {res['success']}/{res['n']} tries; {_fit_words(fit)}")
         results.append((fit, i, res))
     fit, best, res = max(results, key=lambda r: (r[0], r[1] == prefer))
